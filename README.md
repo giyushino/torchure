@@ -1,2 +1,14 @@
 # torchure
-pure pytorch training stack
+pure pytorch training stack with minimal deps
+
+## Installation
+installation depends on whether or not you have
+uv installed on your machine. In theory you
+don't need uv, but it is a lot easier to use
+
+```bash
+conda create -n fresh python==3.14
+conda activate fresh
+pip install uv
+uv pip install -e .
+```

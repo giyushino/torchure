@@ -1,0 +1,16 @@
+[project]
+name = "torchure"
+version = "0.1.0"
+description = "training stack"
+authors = [{name="giyushino", email="allanzhang440@gmail.com" }]
+
+requires-python = "==3.14.*"
+keywords = ["pytorch", "training"]
+
+# i want minimal deps, but this will likely
+# grow considerably in the future
+dependencies = [
+    "torch==2.12",
+    "numpy==2.4.6",
+]
+
