@@ -80,7 +80,7 @@ class Qwen3GroupQueryAttention(nn.Module):
 
         self.rope = Qwen3RotaryEmbedding(self.head_dim)
 
-    def split_heads(self, x: torch.Tensor) -> torch.Tensor:
+    def split_heads_old(self, x: torch.Tensor) -> torch.Tensor:
         # reshape input tensor for multihead attention
         # x is (batch_size, seq_length, emb_dim)
         B, S, _ = x.shape
@@ -88,7 +88,10 @@ class Qwen3GroupQueryAttention(nn.Module):
         # each head should see a slice of the embeddings
         # the new shape is (batch_size, num_heads, seq_length, head_dim)
         return x.reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-
+     
+    def split_heads(self, x):
+        n_heads = x.shape[-1] // self.head_dim
+        return x.reshape(*x.shape[:2], n_heads, self.head_dim).transpose(1, 2)
     
     def split_kv_heads(self, x: torch.Tensor) -> torch.Tensor:
         B, S, _ = x.shape
@@ -275,7 +278,10 @@ if __name__ == "__main__":
 
     model = Qwen3(**config)
     print(model)
-    input_ids = torch.randint(0, config["vocab_size"], (2, 10))
-    logits = model(input_ids)
-    print(logits.shape)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(total_params)
+    #566_632_448
 
+#    input_ids = torch.randint(0, config["vocab_size"], (2, 10))
+#    logits = model(input_ids)
+#    print(logits.shape)
