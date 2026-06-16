@@ -1,6 +1,11 @@
 # torchure
 pure pytorch training stack with minimal deps
 
+want to support training AR LLMs, DLLMs, 
+continuous diffusiion LLMs, etc
+
+focus on AR for now
+
 ## Installation
 installation depends on whether or not you have
 uv installed on your machine. In theory you
