@@ -165,7 +165,6 @@ class Qwen3GroupQueryAttention(nn.Module):
         K = K.repeat_interleave(repeat_factor, dim=1)
         V = V.repeat_interleave(repeat_factor, dim=1)
 
-
         attn_output = self.scaled_self_attention(Q, K, V, attention_mask)
 
         return self.o_proj(self.combine_heads(attn_output))

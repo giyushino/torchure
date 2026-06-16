@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 
-def cross_entropy_loss(tokenized_input: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+def cross_entropy_loss(tokenized_input: torch.Tensor, logits: torch.Tensor, ignore_index: int) -> torch.Tensor:
     B, S, V = logits.shape
     # for the seq length, throw away the last token
     # since we don't have a ground truth for that
@@ -18,6 +18,7 @@ def cross_entropy_loss(tokenized_input: torch.Tensor, logits: torch.Tensor) -> t
     return F.cross_entropy(
         shifted_logits.reshape(-1, V),
         shifted_labels.reshape(-1),
+        ignore_index=ignore_index
     )
 
 
