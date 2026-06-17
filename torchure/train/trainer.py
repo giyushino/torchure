@@ -11,6 +11,7 @@ for a single gpu run _parallelize is a no-op and world_size == 1.
 """
 
 import json
+
 import torch
 import torch.nn as nn
 
@@ -19,6 +20,7 @@ from torchure.dataloader.utils import build_dataloader
 from torchure.models.utils import build_model
 from torchure.objectives.utils import build_objective
 from torchure.optim.utils import build_optimizer
+from torchure.utils import timed
 
 
 def load_json(train_config_path: str) -> dict:
@@ -40,7 +42,8 @@ class Trainer:
         self._init_weights(self.model)
         self.optimizer = self._build_optimizer(self.model)
         self.objective = self._build_objective()
-        self.dataloader = self._build_dataloader()
+        # self.dataloader = self._build_dataloader()
+        print("gpt here")
 
     def _build_model(self) -> nn.Module:
         # for single gpu right now, when we want to do
@@ -65,7 +68,7 @@ class Trainer:
         model.to(self.device)
 
     def _build_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
-        optim_cfg = self.config["optim"]
+        optim_cfg = self.config["optimizer"]
         return build_optimizer(model, optim_cfg["name"], optim_cfg["config"])
 
     def _build_objective(self):
@@ -75,7 +78,8 @@ class Trainer:
     def _build_dataloader(self) -> DataLoader:
         return build_dataloader(self.config["data"], self.rank, self.world_size)
 
-    def train_step(self, batch) -> torch.Tensor:
+    @timed
+    def train_step(self, batch: torch.Tensor | None) -> torch.Tensor:
         """
         one optimization step. rough shape:
             move batch to device -> objective.compute_loss(model, batch)
@@ -85,7 +89,13 @@ class Trainer:
         TODO: implement. grad accumulation / clipping / mixed precision slot
         in here later.
         """
-        raise NotImplementedError
+        
+        example_batch = torch.randint(1, 15000, (5, 1000)).to(self.device)
+        
+        loss = self.objective.compute_loss(self.model, example_batch)
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        return loss.detach()
 
     def train(self) -> None:
         """
@@ -95,4 +105,10 @@ class Trainer:
         raise NotImplementedError
 
 
+
+if __name__ == "__main__":
+    test = Trainer("/home/allanz/torchure/configs/qwen3_dense.json", 0, 0, 1)
+    loss, time = test.train_step(None)
+    print(f"{loss=}, {time=}")
+     
 
