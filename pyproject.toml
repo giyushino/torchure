@@ -10,7 +10,14 @@ keywords = ["pytorch", "training"]
 # i want minimal deps, but this will likely
 # grow considerably in the future
 dependencies = [
-    "torch==2.12",
+    "torch==2.10",
     "numpy==2.4.6",
 ]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["torchure*"]
 
