@@ -15,15 +15,10 @@ OPTIMIZER_REGISTRY = {
 }
 
 
-def build_optimizer(model: nn.Module, optim_config: dict) -> optim.Optimizer:
+def build_optimizer(model: nn.Module, optim_name: str, optim_config: dict) -> optim.Optimizer:
     """
-    NOTE: must be called AFTER the model is parallelized/wrapped. once
-    sharded the parameters change identity (become DTensors / get
-    flat-grouped by fsdp), so an optimizer built earlier closes over the
-    wrong tensors.
-
-    TODO: pop the optimizer "name" from optim_config, look it up in
-    OPTIMIZER_REGISTRY, and build it over model.parameters() with the
-    remaining kwargs (lr, weight_decay, betas, ...).
+    for now, we can just do a very native global optim, ie have the same
+    optimizer settings for each param. maybe want to implement a more fine 
+    grained optimizer wrapper class for different layers
     """
-    raise NotImplementedError
+    return OPTIMIZER_REGISTRY[optim_name](model.parameters(), **optim_config)

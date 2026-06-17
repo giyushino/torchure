@@ -27,14 +27,12 @@ def load_json(train_config_path: str) -> dict:
 
 
 class Trainer:
-    def __init__(self, train_config_path: str):
+    def __init__(self, train_config_path: str, rank: int, local_rank: int, world_size: int):
         self.config = load_json(train_config_path)
-
-        # single gpu runtime context. when you go distributed these come
-        # from the launcher (torchrun) + a device mesh built in core/mesh.py
-        self.rank = 0
-        self.world_size = 1
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.rank = rank
+        self.world_size = world_size
+        self.device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(local_rank)  # have the process own this specific GPU
 
         # phased setup -- order matters (see module docstring)
         self.model = self._build_model()
@@ -44,13 +42,12 @@ class Trainer:
         self.objective = self._build_objective()
         self.dataloader = self._build_dataloader()
 
-    # --- phases -----------------------------------------------------------
-
     def _build_model(self) -> nn.Module:
-        # structure only -- no device placement, no weight init here, so the
-        # model can be sharded before it is ever materialized.
-        cfg = self.config["model"]
-        return build_model(cfg["name"], cfg["config"])
+        # for single gpu right now, when we want to do
+        # sharding, we need this to be an empty init
+        # where we actually don't init any weights yet
+        model_cfg = self.config["model"]
+        return build_model(model_cfg["name"], model_cfg["config"])
 
     def _parallelize(self, model: nn.Module) -> nn.Module:
         """
@@ -62,25 +59,21 @@ class Trainer:
         return model
 
     def _init_weights(self, model: nn.Module) -> None:
-        """
-        materialize + initialize parameters, then place on device.
-
-        TODO single gpu: model.to(self.device) is enough for now.
-        TODO distributed: materialize from meta device + rank-aware seeding.
-        """
-        raise NotImplementedError
+        # single gpu again, when we init for sharding
+        # we won't have any weights
+        # model.to_empty(device=self.device)
+        model.to(self.device)
 
     def _build_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
-        return build_optimizer(model, self.config["optimizer"])
+        optim_cfg = self.config["optim"]
+        return build_optimizer(model, optim_cfg["name"], optim_cfg["config"])
 
     def _build_objective(self):
-        obj = self.config["objective"]
-        return build_objective(obj["name"], obj.get("config", {}))
+        obj_cfg = self.config["objective"]
+        return build_objective(obj_cfg["name"], obj_cfg["config"])
 
     def _build_dataloader(self) -> DataLoader:
         return build_dataloader(self.config["data"], self.rank, self.world_size)
-
-    # --- train loop -------------------------------------------------------
 
     def train_step(self, batch) -> torch.Tensor:
         """
@@ -100,3 +93,6 @@ class Trainer:
         steps/epochs, calling self.train_step and logging.
         """
         raise NotImplementedError
+
+
+

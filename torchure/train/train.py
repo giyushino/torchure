@@ -8,6 +8,7 @@ already carries rank/world_size so the launcher just fills them in.
 """
 
 import argparse
+import os
 
 from torchure.train.trainer import Trainer
 
@@ -20,8 +21,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    trainer = Trainer(args.config)
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    trainer = Trainer(args.config, rank=rank, local_rank=local_rank, world_size=world_size)
     trainer.train()
+
+
 
 
 if __name__ == "__main__":
