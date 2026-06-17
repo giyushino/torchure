@@ -1,0 +1,30 @@
+{
+  "model": {
+    "name": "qwen3_dense",
+    "config": {
+      "num_layers": 28,
+      "num_heads": 16,
+      "num_kv_heads": 8,
+      "emb_dim": 1024,
+      "head_dim": 128,
+      "vocab_size": 151936
+    }
+  },
+  "optimizer": {
+    "name": "adamw",
+    "lr": 3e-4,
+    "weight_decay": 0.1,
+    "betas": [0.9, 0.95]
+  },
+  "objective": {
+    "name": "AR",
+    "config": {
+      "ignore_index": -100
+    }
+  },
+  "data": {
+    "__todo__": "fill in once DataLoader is implemented",
+    "batch_size": 8,
+    "seq_len": 2048
+  }
+}
