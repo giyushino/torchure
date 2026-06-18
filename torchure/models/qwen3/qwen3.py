@@ -232,6 +232,31 @@ class Qwen3(nn.Module):
         self.lm_head = nn.Linear(emb_dim, vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight
 
+    def init_weights(self, std: float = 0.02) -> None:
+        """
+        gpt/llama-style init. without this, pytorch's default per-layer init
+        lets residual-stream variance compound with depth and the logits blow
+        up (fresh CE ~900 instead of ~ln(vocab)).
+
+        the key piece is scaling the projections that *write into* the residual
+        stream (attn o_proj, ffn down_proj) by 1/sqrt(2 * num_layers) so the
+        added variance per layer stays bounded as depth grows.
+        """
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+            elif isinstance(module, nn.RMSNorm) and module.weight is not None:
+                nn.init.ones_(module.weight)
+
+        residual_scale = (2 * len(self.blocks)) ** -0.5
+        for block in self.blocks:
+            block.gqa.o_proj.weight.data.mul_(residual_scale)
+            block.ffn.down_proj.weight.data.mul_(residual_scale)
+
     def forward(
         self,
         x: torch.Tensor,
