@@ -2,7 +2,7 @@
   "model": {
     "name": "qwen3_dense",
     "config": {
-      "num_layers": 28,
+      "num_layers": 10,
       "num_heads": 16,
       "num_kv_heads": 8,
       "emb_dim": 1024,
@@ -25,8 +25,16 @@
     }
   },
   "data": {
-    "__todo__": "fill in once DataLoader is implemented",
-    "batch_size": 8,
-    "seq_len": 2048
+    "name": "allenai/c4",
+    "config": "en",
+    "split": "train",
+    "tokenizer": "Qwen/Qwen3-0.6B",
+    "pad_token": "<|endoftext|>",
+    "text_field": "text",
+    "shuffle_buffer": 1000,
+    "seed": 42,
+    "num_workers": 4,
+    "batch_size": 4,
+    "seq_len": 1024
   }
 }

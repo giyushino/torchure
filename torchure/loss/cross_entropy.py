@@ -25,5 +25,5 @@ def cross_entropy_loss(tokenized_input: torch.Tensor, logits: torch.Tensor, igno
 if __name__ == "__main__":
     test_input = torch.randint(1, 1000, [2, 100])
     test_logits = torch.randn(2, 100, 2500)
-    loss = cross_entropy_loss(test_input, test_logits)
+    loss = cross_entropy_loss(test_input, test_logits, -100)
     print(loss)
