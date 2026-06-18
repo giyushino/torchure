@@ -1,0 +1,39 @@
+{
+  "model": {
+    "name": "qwen3_dense",
+    "config": {
+      "num_layers": 10,
+      "num_heads": 16,
+      "num_kv_heads": 8,
+      "emb_dim": 1024,
+      "head_dim": 128,
+      "vocab_size": 151936
+    }
+  },
+  "optimizer": {
+    "name": "adamw",
+    "config": {
+      "lr": 3e-4,
+      "weight_decay": 0.1,
+      "betas": [0.9, 0.95]
+    }
+  },
+  "objective": {
+    "name": "AR",
+    "config": {
+      "ignore_index": -100
+    }
+  },
+  "data": {
+    "name": "OptimalScale/ClimbMix",
+    "split": "train",
+    "tokenizer": "Qwen/Qwen3-0.6B",
+    "pad_token": "<|endoftext|>",
+    "text_field": "text",
+    "shuffle_buffer": 1000,
+    "seed": 42,
+    "num_workers": 4,
+    "batch_size": 1,
+    "seq_len": 4096
+  }
+}

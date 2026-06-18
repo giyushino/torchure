@@ -33,7 +33,7 @@ class Collator:
         # attention_mask is 1 for real tokens, 0 for padding
         attn = torch.tensor([e.attention_mask for e in encodings], dtype=torch.bool)
         labels = input_ids.masked_fill(~attn, self.ignore_index)
-        return {"input_ids": input_ids, "labels": labels}
+        return {"input_ids": input_ids, "labels": labels, "attn_mask": attn}
 
 
 def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int, dp_size: int):

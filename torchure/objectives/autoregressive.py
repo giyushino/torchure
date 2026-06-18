@@ -16,7 +16,7 @@ class ARObjective():
         self.ignore_index = ignore_index
 
     def compute_loss(self, model: nn.Module, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        logits = model(batch["input_ids"])
+        logits = model(batch["input_ids"], batch["attn_mask"])
         return cross_entropy_loss(batch["labels"], logits, self.ignore_index)
 
 if __name__ == "__main__":

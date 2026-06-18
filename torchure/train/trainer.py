@@ -49,6 +49,7 @@ class Trainer:
         self._init_weights(self.model)
         self.optimizer = self._build_optimizer(self.model)
         self.objective = self._build_objective()
+        # self.resume = self.config["resume_training"]
         # make the dataloader iterable
         self.dataloader = iter(self._build_dataloader())
 
@@ -100,11 +101,12 @@ class Trainer:
 
     @debug_time
     def train_n_step_test(self, n_steps: int) -> None:
-        for _ in range(n_steps):
+        for step in range(n_steps):
             batch = self.get_batch()
-            print(batch)
+            #print(batch)
             loss = self.objective.compute_loss(self.model, batch)
             loss.backward()
+            print(f"{step=} || {loss.item()=}")
             self.optimizer.step()
             self.optimizer.zero_grad()
 
@@ -134,7 +136,7 @@ class Trainer:
 
 
 if __name__ == "__main__":
-    test = Trainer("/home/allanz/torchure/configs/qwen3_dense.json", 0, 0, 1)
+    test = Trainer("/home/allanz/torchure/configs/qwen3_dense_climbmix.json", 0, 0, 1)
     loss = test.train_n_step_test(20)
     print(f"{loss=}")
      
