@@ -9,15 +9,59 @@ from datasets.distributed import split_dataset_by_node
 from tokenizers import Tokenizer
 
 
+class Packer:
+    """
+    streaming sequence packer for the .map(batched=True) step.
+
+    tokenizes a map-batch of docs, concatenates their ids into one stream with
+    an eos between docs, then slices into back-to-back seq_len blocks. every
+    emitted row is exactly seq_len, so there is no padding and no attention mask
+    downstream. the remainder (< seq_len) at the tail of each map-batch is
+    dropped.
+
+    top-level class (not a closure) so DataLoader workers can pickle it, which
+    forkserver/spawn require (py3.14 default on linux).
+
+    currently we're throwing away a fair number of tokens away, we should
+    carry the discard tokens forward to the next batch
+    """
+    def __init__(self, tokenizer: Tokenizer, seq_len: int, eos_id: int):
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.eos_id = eos_id
+
+    def __call__(self, examples: dict[str, list]) -> dict[str, list]:
+        # this might be faster to turn into 
+        # numpy array and then reshape
+        encodings = self.tokenizer.encode_batch(examples["text"])
+        stream = []
+
+        for encoding in encodings:
+            stream.extend(encoding.ids)
+            stream.append(self.eos_id)
+
+        n_blocks = len(stream) // self.seq_len
+        # measure the remainder before we slice the stream down to full blocks
+        print(f"lost {len(stream) - n_blocks * self.seq_len} tokens")
+        stream = stream[: n_blocks * self.seq_len]
+
+        blocks = [
+            stream[i * self.seq_len: (i + 1) * self.seq_len]
+            for i in range(n_blocks)
+        ]
+
+        return {"input_ids": blocks}
+
+
 class Collator:
     """
-    batch-tokenize the canonical "text" field. padding/truncation are
-    configured on the tokenizer in build_dataloader, so every encoding
-    in the batch comes out the same length and stacks cleanly.
+    stack pre-packed rows into a batch. the Packer (.map step) already emits
+    fixed-length seq_len blocks with no padding, so there's nothing to pad,
+    truncate, or mask here -- the collate just stacks ids and clones labels.
 
-    input_ids are padded with a real vocab id (see build_dataloader); labels
-    copy input_ids but set padded positions to ignore_index so the loss skips
-    them. label *shifting* is still the objective's job.
+    every position is a real token, so labels are a straight clone (no
+    ignore_index in the pretrain path). label *shifting* stays the objective's
+    job. ignore_index is kept on the constructor for SFT prompt-masking later.
 
     a top-level class (not a closure) so DataLoader workers can pickle it,
     which forkserver/spawn start methods require (py3.14 default on linux).
@@ -27,13 +71,9 @@ class Collator:
         self.ignore_index = ignore_index
 
     def __call__(self, examples):
-        texts = [ex["text"] for ex in examples]
-        encodings = self.tokenizer.encode_batch(texts)
-        input_ids = torch.tensor([e.ids for e in encodings], dtype=torch.long)
-        # attention_mask is 1 for real tokens, 0 for padding
-        attn = torch.tensor([e.attention_mask for e in encodings], dtype=torch.bool)
-        labels = input_ids.masked_fill(~attn, self.ignore_index)
-        return {"input_ids": input_ids, "labels": labels, "attn_mask": attn}
+        input_ids = torch.tensor([ex["input_ids"] for ex in examples], dtype=torch.long)
+        labels = input_ids.clone()
+        return {"input_ids": input_ids, "labels": labels}
 
 
 def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int, dp_size: int):
@@ -63,12 +103,15 @@ def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int
 
     # configure batch tokenization once; mutating here keeps the collate_fn
     # stateless and avoids reconfiguring per batch. pad with a real vocab id
-    # (Qwen3 has no <pad>, so we reuse eos); ignore_id only ever lands in
-    # labels, never in input_ids.
     pad_token = data_cfg["pad_token"]
     pad_id = tokenizer.token_to_id(pad_token)
-    tokenizer.enable_truncation(max_length=data_cfg["seq_len"])
-    tokenizer.enable_padding(pad_id=pad_id, pad_token=pad_token)
+
+    packer = Packer(tokenizer, data_cfg["seq_len"], pad_id)
+    dataset = dataset.map(
+        packer, batched=True,
+        batch_size=data_cfg.get("pack_batch", 1000),
+        remove_columns=dataset.column_names,
+    )
 
     return torch.utils.data.DataLoader(
         dataset,

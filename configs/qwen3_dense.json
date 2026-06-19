@@ -35,6 +35,7 @@
     "seed": 42,
     "num_workers": 4,
     "batch_size": 4,
-    "seq_len": 1024
+    "seq_len": 1024,
+    "pack_batch": 1000
   }
 }

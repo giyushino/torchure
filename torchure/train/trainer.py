@@ -137,7 +137,7 @@ class Trainer:
 
 if __name__ == "__main__":
     test = Trainer("/home/allanz/torchure/configs/qwen3_dense_climbmix.json", 0, 0, 1)
-    loss = test.train_n_step_test(20)
+    loss = test.train_n_step_test(100)
     print(f"{loss=}")
      
 

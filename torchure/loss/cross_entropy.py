@@ -1,7 +1,9 @@
 import torch
 import torch.nn.functional as F
 
-
+# maybe we should move the shifting out of here,
+# otherwise it would not work for other models
+# with slightly different objectives
 def cross_entropy_loss(tokenized_input: torch.Tensor, logits: torch.Tensor, ignore_index: int) -> torch.Tensor:
     B, S, V = logits.shape
     # for the seq length, throw away the last token
