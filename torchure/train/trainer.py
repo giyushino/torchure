@@ -99,16 +99,22 @@ class Trainer:
         curr_batch = next(self.dataloader)
         return {k: v.to(self.device) for k, v in curr_batch.items()}
 
-    @debug_time
-    def train_n_step_test(self, n_steps: int) -> None:
-        for step in range(n_steps):
+    @record_time
+    def train_step_test(self) -> torch.Tensor:
             batch = self.get_batch()
             #print(batch)
             loss = self.objective.compute_loss(self.model, batch)
             loss.backward()
-            print(f"{step=} || {loss.item()=}")
             self.optimizer.step()
             self.optimizer.zero_grad()
+            return loss.detach()
+
+    @debug_time
+    def train_n_step_test(self, n_steps: int) -> None:
+        for step in range(n_steps):
+            loss, time = self.train_step_test()
+            print(f"{step=} || {loss=} || tps={self.config['data']['seq_len']/time}")
+            
 
     @debug_time
     def train_step(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
