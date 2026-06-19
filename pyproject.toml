@@ -14,6 +14,7 @@ dependencies = [
     "numpy==2.4.6",
     "tokenizers",
     "datasets",
+    "torchdata",
 ]
 
 [build-system]
