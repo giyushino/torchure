@@ -17,10 +17,10 @@ import torch
 import torch.nn as nn
 from tokenizers import Tokenizer
 
-from torchure.dataloader.utils import build_dataloader
-from torchure.models.utils import build_model
-from torchure.objectives.utils import build_objective
-from torchure.optim.utils import build_optimizer
+from torchure.dataloader.builder import build_dataloader
+from torchure.models.builder import build_model
+from torchure.objectives.builder import build_objective
+from torchure.optim.builder import build_optimizer
 from torchure.utils import record_time, debug_time
 
 
