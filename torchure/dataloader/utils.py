@@ -103,6 +103,8 @@ def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int
 
     # configure batch tokenization once; mutating here keeps the collate_fn
     # stateless and avoids reconfiguring per batch. pad with a real vocab id
+
+    # for the pad tokens, maybe just set this to eos implicity
     pad_token = data_cfg["pad_token"]
     pad_id = tokenizer.token_to_id(pad_token)
 

@@ -4,8 +4,10 @@ dense qwen
 """
 
 import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class Qwen3RotaryEmbedding(nn.Module):
@@ -102,7 +104,7 @@ class Qwen3GroupQueryAttention(nn.Module):
         B, _, S, _ = x.shape
         return x.transpose(1, 2).reshape(B, S, self.num_heads * self.head_dim)
 
-    def scaled_self_attention(
+    def scaled_self_attention_naive(
         self,
         Q: torch.Tensor,
         K: torch.Tensor,
@@ -142,6 +144,22 @@ class Qwen3GroupQueryAttention(nn.Module):
         # of a token with the tokens it attended to
         return torch.matmul(attn_probs, V)
 
+    def scaled_self_attention(self, Q, K, V, attention_mask):
+        # SDPA applies 1/sqrt(head_dim) scaling itself, so don't pre-scale Q@Kᵀ.
+  
+        # fast path (packing / training): pure causal. is_causal=True lets SDPA
+        # use the flash kernel and never materialize the S×S score matrix.
+        if attention_mask is None:
+            return F.scaled_dot_product_attention(Q, K, V, is_causal=True, enable_gqa=True)
+  
+        # padding present (eval / left-pad generation): can't combine is_causal
+        # with a key-padding mask, so fold both into one boolean mask.
+        # bool semantics: True = "attend to this position".
+        S = Q.size(-2)
+        causal = torch.ones(S, S, dtype=torch.bool, device=Q.device).tril()
+        key_keep = attention_mask[:, None, None, :].bool()      # (B,1,1,S)
+        attn_mask = causal[None, None] & key_keep               # (B,1,S,S)
+        return F.scaled_dot_product_attention(Q, K, V, attn_mask=attn_mask, enable_gqa=True)
 
     def forward(
         self,
@@ -161,9 +179,9 @@ class Qwen3GroupQueryAttention(nn.Module):
         K = self.rope(K, position_ids)
 
         # GQA !! 
-        repeat_factor = self.num_heads // self.num_kv_heads
-        K = K.repeat_interleave(repeat_factor, dim=1)
-        V = V.repeat_interleave(repeat_factor, dim=1)
+        # repeat_factor = self.num_heads // self.num_kv_heads
+        # K = K.repeat_interleave(repeat_factor, dim=1)
+        # V = V.repeat_interleave(repeat_factor, dim=1)
 
         attn_output = self.scaled_self_attention(Q, K, V, attention_mask)
 

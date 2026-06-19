@@ -103,7 +103,10 @@ class Trainer:
     def train_step_test(self) -> torch.Tensor:
             batch = self.get_batch()
             #print(batch)
-            loss = self.objective.compute_loss(self.model, batch)
+            # cast to bf16 so we can take advantage of sdpa
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = self.objective.compute_loss(self.model, batch)
+
             loss.backward()
             self.optimizer.step()
             self.optimizer.zero_grad()
