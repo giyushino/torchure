@@ -15,17 +15,20 @@ ease of use then move to different profiling methods
 """
 
 import json
-import time
 
 import torch
 import torch.nn as nn
+import torchdata
 from tokenizers import Tokenizer
 
 from torchure.dataloader.builder import build_dataloader
 from torchure.models.builder import build_model
 from torchure.objectives.builder import build_objective
 from torchure.optim.builder import build_optimizer
-from torchure.utils import record_time, debug_time
+from torchure.utils import record_time, debug_time, get_project_dir
+
+
+PROJECT_DIR = get_project_dir()
 
 
 def load_json(train_config_path: str) -> dict:
@@ -55,7 +58,8 @@ class Trainer:
         self.objective = self._build_objective()
         # self.resume = self.config["resume_training"]
         # make the dataloader iterable
-        self.dataloader = iter(self._build_dataloader())
+        self.dataloader = self._build_dataloader()
+        self.dataloader_iter = iter(self.dataloader)
 
     def _build_model(self) -> nn.Module:
         # for single gpu right now, when we want to do
@@ -77,6 +81,8 @@ class Trainer:
         # single gpu again, when we init for sharding
         # we won't have any weights
         # model.to_empty(device=self.device)
+        # maybe we should make an ABC and require models
+        # to have init_weight as a function 
         model.to(self.device)
         model.init_weights()
 
@@ -88,10 +94,8 @@ class Trainer:
         obj_cfg = self.config["objective"]
         return build_objective(obj_cfg["name"], obj_cfg["config"])
     
-    # i want this to be typed, but need to import
-    # collections for iterable, do later
     @debug_time
-    def _build_dataloader(self) -> torch.utils.data.DataLoader:
+    def _build_dataloader(self) -> torchdata.stateful_dataloader.StatefulDataLoader:
         # rank/world_size are global for now; swap to the dp mesh coords
         # once core/mesh.py exists so TP/CP groups share a batch.
         return build_dataloader(
@@ -100,8 +104,14 @@ class Trainer:
     
     @debug_time
     def get_batch(self) -> dict[str, torch.Tensor]:
-        curr_batch = next(self.dataloader)
-        return {k: v.to(self.device) for k, v in curr_batch.items()}
+        curr_batch = next(self.dataloader_iter)
+        # https://docs.pytorch.org/docs/2.12/notes/cuda.html#cuda-memory-pinning
+        # note that this only works since we set pin_memory true in the constructor
+        return {k: v.to(self.device, non_blocking=True) for k, v in curr_batch.items()}
+
+    def checkpoint(self) -> None:
+        torch.utils.checkpoint
+        return
 
     @record_time
     def train_step_test(self) -> torch.Tensor:
@@ -121,7 +131,6 @@ class Trainer:
         for step in range(n_steps):
             loss, time = self.train_step_test()
             print(f"{step=} || {loss=} || tps={self.config['data']['seq_len']/time}")
-            
 
     @debug_time
     def train_step(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -136,6 +145,7 @@ class Trainer:
         """
 
         loss = self.objective.compute_loss(self.model, batch)
+        loss.backward()
         self.optimizer.step()
         self.optimizer.zero_grad()
         return loss.detach()
@@ -147,9 +157,8 @@ class Trainer:
         """
 
 
-
 if __name__ == "__main__":
-    test = Trainer("/home/allanz/torchure/configs/qwen3_dense_climbmix.json", 0, 0, 1)
+    test = Trainer(f"{PROJECT_DIR}/configs/qwen3_dense_climbmix.json", 0, 0, 1)
     loss = test.train_n_step_test(100)
     print(f"{loss=}")
      
