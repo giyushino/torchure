@@ -8,49 +8,10 @@ import torch
 from datasets.distributed import split_dataset_by_node
 from tokenizers import Tokenizer
 
-
-class Packer:
-    """
-    streaming sequence packer for the .map(batched=True) step.
-
-    tokenizes a map-batch of docs, concatenates their ids into one stream with
-    an eos between docs, then slices into back-to-back seq_len blocks. every
-    emitted row is exactly seq_len, so there is no padding and no attention mask
-    downstream. the remainder (< seq_len) at the tail of each map-batch is
-    dropped.
-
-    top-level class (not a closure) so DataLoader workers can pickle it, which
-    forkserver/spawn require (py3.14 default on linux).
-
-    currently we're throwing away a fair number of tokens away, we should
-    carry the discard tokens forward to the next batch
-    """
-    def __init__(self, tokenizer: Tokenizer, seq_len: int, eos_id: int):
-        self.tokenizer = tokenizer
-        self.seq_len = seq_len
-        self.eos_id = eos_id
-
-    def __call__(self, examples: dict[str, list]) -> dict[str, list]:
-        # this might be faster to turn into 
-        # numpy array and then reshape
-        encodings = self.tokenizer.encode_batch(examples["text"])
-        stream = []
-
-        for encoding in encodings:
-            stream.extend(encoding.ids)
-            stream.append(self.eos_id)
-
-        n_blocks = len(stream) // self.seq_len
-        # measure the remainder before we slice the stream down to full blocks
-        print(f"lost {len(stream) - n_blocks * self.seq_len} tokens")
-        stream = stream[: n_blocks * self.seq_len]
-
-        blocks = [
-            stream[i * self.seq_len: (i + 1) * self.seq_len]
-            for i in range(n_blocks)
-        ]
-
-        return {"input_ids": blocks}
+# packing strategies live in packers.py so they can be swapped/benchmarked
+# independently; see tests/dataloader_packing.py. ListPacker is the original
+# python-list implementation.
+from torchure.dataloader.packers import ListPacker
 
 
 class Collator:
@@ -108,7 +69,7 @@ def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int
     pad_token = data_cfg["pad_token"]
     pad_id = tokenizer.token_to_id(pad_token)
 
-    packer = Packer(tokenizer, data_cfg["seq_len"], pad_id)
+    packer = ListPacker(tokenizer, data_cfg["seq_len"], pad_id)
     dataset = dataset.map(
         packer, batched=True,
         batch_size=data_cfg.get("pack_batch", 1000),
