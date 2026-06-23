@@ -8,6 +8,10 @@ _init_weights rather than reordering the constructor:
     build -> parallelize -> init/materialize -> optimizer -> data
 
 for a single gpu run _parallelize is a no-op and world_size == 1.
+
+TODO:
+remove the decorators for profiling... just keep that now for
+ease of use then move to different profiling methods
 """
 
 import json

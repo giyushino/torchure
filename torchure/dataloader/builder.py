@@ -1,5 +1,7 @@
 """
 build helper for the dataloader, colocated with DataLoader
+note that testing shows numpy is faster than torch or
+python arrs, so we should move packing into the collator
 """
 
 import datasets
