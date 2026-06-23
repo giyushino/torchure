@@ -2,6 +2,9 @@
 build helper for the dataloader, colocated with DataLoader
 note that testing shows numpy is faster than torch or
 python arrs, so we should move packing into the collator
+
+but this doesn't seem to be bottleneck for throughput
+so leave for now
 """
 
 import datasets
@@ -9,6 +12,7 @@ import torch
 
 from datasets.distributed import split_dataset_by_node
 from tokenizers import Tokenizer
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 # packing strategies live in packers.py so they can be swapped/benchmarked
 # independently; see tests/dataloader_packing.py. ListPacker is the original
@@ -78,7 +82,8 @@ def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int
         remove_columns=dataset.column_names,
     )
 
-    return torch.utils.data.DataLoader(
+    #return torch.utils.data.DataLoader(
+    return StatefulDataLoader(
         dataset,
         batch_size=data_cfg["batch_size"],
         num_workers=data_cfg["num_workers"],
