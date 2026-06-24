@@ -1,4 +1,7 @@
 """
+file mostly written by claude, except for listpacker and
+the best fit
+
 packing strategies for the dataloader .map step, behind one shared interface so
 they're interchangeable and benchmarkable.
 
@@ -25,6 +28,8 @@ import numpy as np
 import torch
 
 from tokenizers import Tokenizer
+
+from torchure.utils import Node
 
 
 class Packer:
@@ -82,7 +87,6 @@ class Packer:
             lost = n_tokens - n_blocks * self.seq_len
             print(f"{type(self).__name__}: lost {lost} tokens")
 
-
 class ListPacker(Packer):
     """naive python: extend a flat list, then slice. the original implementation."""
 
@@ -99,6 +103,20 @@ class ListPacker(Packer):
             stream[i * self.seq_len: (i + 1) * self.seq_len]
             for i in range(n_blocks)
         ]
+
+class ListPackerBestFit(Packer):
+    """
+    https://arxiv.org/pdf/2404.10830
+
+    each training sequence is a bin == llm context sizes (self.seq_len)
+    assign combination of bins to mimize wasted bin capacity 
+    """
+    def pack(self, docs: list[list[int]]) -> list[list[int]]:
+        segment_tree = Node(None)
+        bin_to_item = dict()
+        space_to_bin = dict()
+
+        return
 
 
 class NumpyPacker(Packer):

@@ -26,6 +26,12 @@ def get_project_dir():
     project_root = os.path.dirname(script_dir)
     return project_root
 
+class Node:
+    def __init__(self, value):
+        self.value = value
+        self.left = None
+        self.right = None
+
 if __name__ == "__main__":
     print(get_project_dir())
 
