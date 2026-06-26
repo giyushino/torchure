@@ -45,11 +45,17 @@ class Packer:
         tokenizer: Tokenizer | None,
         seq_len: int,
         eos_id: int,
+        pad_id: int | None = None,
         verbose: bool = False,
     ):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.eos_id = eos_id
+        # eos delimits docs (real signal, trained on); pad only fills a bin's
+        # tail to seq_len. they must be *distinct* vocab ids so labels can later
+        # mask pad -> ignore_index without also masking a genuine doc-ending eos.
+        # defaults to eos_id for the stream packers, which never pad.
+        self.pad_id = pad_id if pad_id is not None else eos_id
         # the "lost N tokens" accounting prints inside the hot path, so it's off
         # by default and never runs during a benchmark.
         self.verbose = verbose
@@ -113,7 +119,8 @@ class ListPackerBestFit(Packer):
     remainder; those remainders -- together with whole short docs -- are packed
     into bins by best-fit-decreasing so we waste as little bin capacity as
     possible (the paper's "fewer truncations" goal). a bin that doesn't fill up
-    is padded to seq_len with eos_id.
+    is padded to seq_len with pad_id (distinct from eos so the filler stays
+    maskable in labels later).
 
     unlike the stream packers (ListPacker/NumpyPacker/TensorPacker) this does NOT
     drop the tail and does NOT emit identical blocks -- different output is the
@@ -172,9 +179,11 @@ class ListPackerBestFit(Packer):
                 bucket.append(bin_id)
 
         # pad each bin up to seq_len (the collator stacks fixed-length rows).
+        # pad_id is distinct from eos so these positions stay identifiable for
+        # label masking later.
         for b in bins:
             if len(b) < seq_len:
-                b.extend([self.eos_id] * (seq_len - len(b)))
+                b.extend([self.pad_id] * (seq_len - len(b)))
         return full_blocks + bins
 
 
