@@ -106,21 +106,81 @@ class ListPacker(Packer):
 
 class ListPackerBestFit(Packer):
     """
-    https://arxiv.org/pdf/2404.10830
+    best-fit-decreasing packing (https://arxiv.org/pdf/2404.10830).
 
-    each training sequence is a bin == llm context sizes (self.seq_len)
-    assign combination of bins to mimize wasted bin capacity 
+    each emitted block is one training sequence == one bin of capacity seq_len.
+    a long doc is split into full seq_len blocks (emitted as-is) plus a < seq_len
+    remainder; those remainders -- together with whole short docs -- are packed
+    into bins by best-fit-decreasing so we waste as little bin capacity as
+    possible (the paper's "fewer truncations" goal). a bin that doesn't fill up
+    is padded to seq_len with eos_id.
+
+    unlike the stream packers (ListPacker/NumpyPacker/TensorPacker) this does NOT
+    drop the tail and does NOT emit identical blocks -- different output is the
+    whole point. so it lives outside the equality group: the benchmark checks it
+    against token-conservation invariants instead (see BESTFIT_PACKERS).
+
+    a segment tree over remaining-space buckets (0..seq_len) gives O(log seq_len)
+    best fit: leaf s holds s iff some open bin has exactly s free, internal nodes
+    hold the max, so search(c) returns the smallest space >= c that fits.
     """
-    def pack(self, docs: list[list[int]]) -> list[list[int]]:
-        segment_tree = Node(None)
-        bin_to_item = dict()
-        space_to_bin = dict()
 
-        return
+    def pack(self, docs: list[list[int]]) -> list[list[int]]:
+        seq_len = self.seq_len
+
+        full_blocks: list[list[int]] = []
+        # remainders to bin-pack. each carries a trailing eos so multiple docs
+        # sharing a bin stay delimited; sized including that eos. an exact
+        # multiple has an empty remainder -> a lone [eos] that still terminates
+        # the doc and costs almost nothing.
+        items: list[list[int]] = []
+        for ids in docs:
+            n_full = len(ids) // seq_len
+            for i in range(n_full):
+                full_blocks.append(ids[i * seq_len: (i + 1) * seq_len])
+            items.append(ids[n_full * seq_len:] + [self.eos_id])
+
+        # "decreasing": place the big items first so they claim fresh bins and
+        # the small ones slot into whatever gaps are left.
+        items.sort(key=len, reverse=True)
+
+        # segment tree indexed by remaining space; space_to_bin maps a remaining
+        # space to the open bins that currently have it; bins holds contents.
+        free = Node.build(0, seq_len)
+        space_to_bin: dict[int, list[int]] = {}
+        bins: list[list[int]] = []
+
+        for item in items:
+            size = len(item)  # in [1, seq_len]
+            space = free.search(size)
+            if space is None:
+                # nothing open fits -> start a fresh bin.
+                bin_id = len(bins)
+                bins.append([])
+                space = seq_len
+            else:
+                bin_id = space_to_bin[space].pop()
+                if not space_to_bin[space]:
+                    free.update(space, available=False)
+
+            bins[bin_id].extend(item)
+            new_space = space - size
+            if new_space > 0:
+                bucket = space_to_bin.setdefault(new_space, [])
+                if not bucket:
+                    free.update(new_space, available=True)
+                bucket.append(bin_id)
+
+        # pad each bin up to seq_len (the collator stacks fixed-length rows).
+        for b in bins:
+            if len(b) < seq_len:
+                b.extend([self.eos_id] * (seq_len - len(b)))
+        return full_blocks + bins
 
 
 class NumpyPacker(Packer):
     """concatenate into one int64 array, reshape into (n_blocks, seq_len)."""
+    # this makes no sense? why are we turning this into a list again
 
     def _blocks(self, docs: list[list[int]]) -> np.ndarray:
         eos = np.array([self.eos_id], dtype=np.int64)
@@ -168,9 +228,21 @@ class TensorPacker(Packer):
         return self._blocks(docs)
 
 
-# registry so the builder and the benchmark refer to strategies by name.
+# registry so the builder and the benchmark refer to strategies by name. these
+# all emit identical blocks for identical input, so the benchmark equality-gates
+# them against each other.
 PACKERS: dict[str, type[Packer]] = {
     "list": ListPacker,
     "numpy": NumpyPacker,
     "tensor": TensorPacker,
 }
+
+# best-fit is a different algorithm with different output (no dropped tail,
+# padded bins), so it can't be equality-checked against the stream packers --
+# the benchmark times it and verifies token-conservation invariants separately.
+BESTFIT_PACKERS: dict[str, type[Packer]] = {
+    "bestfit": ListPackerBestFit,
+}
+
+
+
