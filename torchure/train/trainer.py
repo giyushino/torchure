@@ -21,6 +21,7 @@ import torch.nn as nn
 import torchdata
 from tokenizers import Tokenizer
 
+from torchure.checkpoint.checkpointer import Checkpointer
 from torchure.dataloader.builder import build_dataloader
 from torchure.models.builder import build_model
 from torchure.objectives.builder import build_objective
@@ -47,8 +48,6 @@ class Trainer:
         self.device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(local_rank)  # have the process own this specific GPU
         
-        # single source of truth: the objective owns ignore_index (loss skips
-        # it); the dataloader reuses it to mask padded label positions.
         self.ignore_index = self.config["objective"]["config"]["ignore_index"]
         self.tokenizer = Tokenizer.from_pretrained(self.config["data"]["tokenizer"])
         self.model = self._build_model()
@@ -60,6 +59,7 @@ class Trainer:
         # make the dataloader iterable
         self.dataloader = self._build_dataloader()
         self.dataloader_iter = iter(self.dataloader)
+        self.checkpointer = Checkpointer(self.config["save_path"])
 
     def _build_model(self) -> nn.Module:
         # for single gpu right now, when we want to do
@@ -109,8 +109,10 @@ class Trainer:
         # note that this only works since we set pin_memory true in the constructor
         return {k: v.to(self.device, non_blocking=True) for k, v in curr_batch.items()}
 
-    def checkpoint(self) -> None:
-        torch.utils.checkpoint
+    def checkpoint(self, step: int) -> None:
+        self.checkpointer.save_model(self.model, step)
+        self.checkpointer.save_dataloader(self.dataloader, step)
+        self.checkpointer.save_optimizer(self.optimizer, step)
         return
 
     @record_time

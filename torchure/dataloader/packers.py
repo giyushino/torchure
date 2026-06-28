@@ -1,6 +1,7 @@
 """
-file mostly written by claude, except for listpacker and
-the best fit
+some food for thought: current tests show that best fit bin packing
+only save ~0.04% of tokens, but this could be an artifact of climbmix
+not having very long documents
 
 packing strategies for the dataloader .map step, behind one shared interface so
 they're interchangeable and benchmarkable.

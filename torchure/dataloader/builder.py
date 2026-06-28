@@ -5,6 +5,10 @@ python arrs, so we should move packing into the collator
 
 but this doesn't seem to be bottleneck for throughput
 so leave for now
+
+we also need to consider if we want to use unique ids
+for padding, but with our current naive list packer,
+we do not need to take this into consideration 
 """
 
 import datasets
