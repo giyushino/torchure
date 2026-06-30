@@ -13,3 +13,6 @@ def build_optimizer(model, lr: int, weight_decay: float, betas: tuple[float | to
 
     optimizer = torch.optim.AdamW(param_groups, lr=lr, betas=betas, eps=1e-8, fused=use_fused)
     return optimizer
+
+def build_scheduler(model,):
+    pass

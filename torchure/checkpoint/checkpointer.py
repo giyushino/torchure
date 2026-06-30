@@ -7,11 +7,21 @@ the builders
 note that torch.save can save a dict
 look into torch.distributed.checkpoint
 """
+
 import torch
 
+from pathlib import Path
+
 class Checkpointer:
-    def __init__(self, checkpoint_save_path: str)
+    def __init__(self, checkpoint_save_path: str):
         self.checkpoint_save_path = checkpoint_save_path
+
+        dir_path = Path(checkpoint_save_path)
+        if dir_path.is_dir():
+            print("checkpoint folder already exists")
+        else:
+            print("checkpoint folder does not exist, saving")
+            dir_path.mkdir(parents=True, exist_ok=True)
 
     def save_model(self, model, step: int):
         model_save_path = self.checkpoint_save_path + f"/{step}/model.pt"

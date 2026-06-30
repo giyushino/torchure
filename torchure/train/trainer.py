@@ -59,7 +59,8 @@ class Trainer:
         # make the dataloader iterable
         self.dataloader = self._build_dataloader()
         self.dataloader_iter = iter(self.dataloader)
-        self.checkpointer = Checkpointer(self.config["save_path"])
+        self.checkpointer_path = f"{PROJECT_DIR}/checkpoints/{self.config['run_name']}"
+        self.checkpointer = Checkpointer(self.checkpointer_path)
 
     def _build_model(self) -> nn.Module:
         # for single gpu right now, when we want to do
