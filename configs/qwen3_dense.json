@@ -2,7 +2,7 @@
   "model": {
     "name": "qwen3_dense",
     "config": {
-      "num_layers": 10,
+      "num_layers": 28,
       "num_heads": 16,
       "num_kv_heads": 8,
       "emb_dim": 1024,
@@ -15,7 +15,14 @@
     "config": {
       "lr": 3e-4,
       "weight_decay": 0.1,
-      "betas": [0.9, 0.95]
+      "betas": [0.9, 0.95],
+      "fused": true
+    },
+    "scheduler": {
+      "type": "wsd",
+      "warmup_ratio": 0.001,
+      "decay_ratio": 0.1,
+      "total_steps": 100
     }
   },
   "objective": {
@@ -25,8 +32,7 @@
     }
   },
   "data": {
-    "name": "allenai/c4",
-    "config": "en",
+    "name": "allenai/dolma3_mix-6T",
     "split": "train",
     "tokenizer": "Qwen/Qwen3-0.6B",
     "pad_token": "<|endoftext|>",
@@ -34,8 +40,9 @@
     "shuffle_buffer": 1000,
     "seed": 42,
     "num_workers": 4,
-    "batch_size": 4,
-    "seq_len": 1024,
+    "batch_size": 2,
+    "seq_len": 4096,
     "pack_batch": 1000
-  }
+  },
+  "run_name": "dolma3_test_run_1"
 }
