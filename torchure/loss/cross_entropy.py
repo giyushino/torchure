@@ -4,7 +4,7 @@ import torch.nn.functional as F
 # maybe we should move the shifting out of here,
 # otherwise it would not work for other models
 # with slightly different objectives
-def cross_entropy_loss(tokenized_input: torch.Tensor, logits: torch.Tensor, ignore_index: int) -> torch.Tensor:
+def cross_entropy_loss_naive(tokenized_input: torch.Tensor, logits: torch.Tensor, ignore_index: int) -> torch.Tensor:
     B, S, V = logits.shape
     # for the seq length, throw away the last token
     # since we don't have a ground truth for that
@@ -24,8 +24,20 @@ def cross_entropy_loss(tokenized_input: torch.Tensor, logits: torch.Tensor, igno
     )
 
 
+def cross_entropy_loss(tokenized_input: torch.Tensor, logits: torch.Tensor, ignore_index: int) -> torch.Tensor:
+    B, S, V = logits.shape
+    labels = torch.full_like(tokenized_input, ignore_index)
+    labels[:, :-1] = tokenized_input[:, 1:]
+    return F.cross_entropy(
+        logits.reshape(-1, V),
+        labels.reshape(-1),
+        ignore_index=ignore_index
+    )
+
 if __name__ == "__main__":
     test_input = torch.randint(1, 1000, [2, 100])
     test_logits = torch.randn(2, 100, 2500)
     loss = cross_entropy_loss(test_input, test_logits, -100)
     print(loss)
+
+
