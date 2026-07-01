@@ -20,7 +20,7 @@ class Checkpointer:
             print("checkpoint folder already exists")
         else:
             print("checkpoint folder does not exist, writing")
-            os.mkdir(self.checkpoint_save_path)
+            os.makedirs(self.checkpoint_save_path)
 
     def save_model(self, model, step: int):
         model_save_path = self.checkpoint_save_path + f"/{step}/model.pt"
