@@ -141,7 +141,8 @@ class Trainer:
     def train_n_step_test(self, n_steps: int) -> None:
         for step in range(n_steps):
             loss, time = self.train_step_test()
-            print(f"{step=} || {loss=} || tps={self.config['data']['seq_len']/time}")
+            # hard code batch size for debugging for now
+            print(f"{step=} || {loss=} || tps={self.config['data']['seq_len'] * 2/time}")
 
     @debug_time
     def train_step(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
