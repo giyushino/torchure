@@ -2,7 +2,7 @@
   "model": {
     "name": "qwen3_dense",
     "config": {
-      "num_layers": 8,
+      "num_layers": 28,
       "num_heads": 16,
       "num_kv_heads": 8,
       "emb_dim": 1024,
