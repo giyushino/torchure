@@ -16,6 +16,12 @@
       "lr": 3e-4,
       "weight_decay": 0.1,
       "betas": [0.9, 0.95]
+    },
+    "scheduler": {
+      "type": "wsd",
+      "warmup_ratio": 0.001,
+      "decay_ratio": 0.1,
+      "total_steps": 100
     }
   },
   "objective": {

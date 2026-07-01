@@ -25,7 +25,7 @@ from torchure.checkpoint.checkpointer import Checkpointer
 from torchure.dataloader.builder import build_dataloader
 from torchure.models.builder import build_model
 from torchure.objectives.builder import build_objective
-from torchure.optim.builder import build_optimizer
+from torchure.optimizer.builder import build_optimizer, build_scheduler
 from torchure.utils import record_time, debug_time, get_project_dir
 
 
@@ -53,8 +53,9 @@ class Trainer:
         self.model = self._build_model()
         self.model = self._parallelize(self.model)
         self._init_weights(self.model)
-        self.optimizer = self._build_optimizer(self.model)
         self.objective = self._build_objective()
+        self.optimizer = self._build_optimizer(self.model)
+        self.scheduler = self._build_scheduler(self.optimizer)
         # self.resume = self.config["resume_training"]
         # make the dataloader iterable
         self.dataloader = self._build_dataloader()
@@ -90,6 +91,12 @@ class Trainer:
     def _build_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
         optim_cfg = self.config["optimizer"]
         return build_optimizer(model, optim_cfg["name"], optim_cfg["config"])
+
+    def _build_scheduler(self, optimizer: torch.optim.Optimizer) -> torch.optim.lr_scheduler.LRScheduler:
+        # currently we set last_epoch to -1 by default for a fresh training
+        # run, we need to change this when we do resumption
+        scheduler_cfg = self.config["optimizer"]["scheduler"]
+        return build_scheduler(optimizer, scheduler_cfg)
 
     def _build_objective(self):
         obj_cfg = self.config["objective"]
@@ -127,6 +134,7 @@ class Trainer:
             loss.backward()
             self.optimizer.step()
             self.optimizer.zero_grad()
+            self.scheduler.step()
             return loss.detach()
 
     @debug_time
