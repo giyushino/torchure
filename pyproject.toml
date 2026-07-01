@@ -9,6 +9,7 @@ keywords = ["pytorch", "training"]
 
 # i want minimal deps, but this will likely
 # grow considerably in the future
+# scalene -> for gpu + cpu profiling
 dependencies = [
     "torch==2.10",
     "numpy==2.4.6",

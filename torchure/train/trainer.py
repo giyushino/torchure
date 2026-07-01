@@ -50,9 +50,12 @@ class Trainer:
         
         self.ignore_index = self.config["objective"]["config"]["ignore_index"]
         self.tokenizer = Tokenizer.from_pretrained(self.config["data"]["tokenizer"])
+
         self.model = self._build_model()
         self.model = self._parallelize(self.model)
         self._init_weights(self.model)
+        # self.model.compile()
+
         self.objective = self._build_objective()
         self.optimizer = self._build_optimizer(self.model)
         self.scheduler = self._build_scheduler(self.optimizer)
