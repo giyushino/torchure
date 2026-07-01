@@ -10,6 +10,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """
+    tensor = [a, b, c, d, e, f, g, h]
+    rotate_half(tensor) = [-e, -f, -g, -h, a, b, c, d]
+    """
+    x1 = x[...,:x.shape[-1] // 2]
+    x2 = x[...,x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    cos = cos.to(x.dtype)
+    sin = sin.to(x.dtype)
+    return (x * cos) + (rotate_half(x) * sin)
+
+
 class Qwen3RotaryEmbedding(nn.Module):
     """
     The goal of this is to encode position by
@@ -26,17 +42,8 @@ class Qwen3RotaryEmbedding(nn.Module):
         )
         self.register_buffer("inv_freq", inv_freq, False)
 
-    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        tensor = [a, b, c, d, e, f, g, h]
-        rotate_half(tensor) = [-e, -f, -g, -h, a, b, c, d]
-        """
-        x1 = x[...,:x.shape[-1] // 2]
-        x2 = x[...,x.shape[-1] // 2:]
 
-        return torch.cat((-x2, x1), dim=-1)
-
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor):
+    def forward(self, position_ids: torch.Tensor):
         # add new dimension to end of position ids, get (B, S, 1)
         # add 2 new dimentions to inv_freq, get (1, 1, D/2)
         freqs = position_ids.float()[:, :, None] * self.inv_freq[None, None, :]
@@ -44,12 +51,12 @@ class Qwen3RotaryEmbedding(nn.Module):
         # freqs shape: (B, S, D/2)
         emb = torch.cat([freqs, freqs], dim=-1)
 
-        # cos/sin shape: (B, 1, S, D), broadcast over heads
-        cos = emb.cos()[:, None, :, :].to(dtype=x.dtype)
-        sin = emb.sin()[:, None, :, :].to(dtype=x.dtype)
+        # cos/sin shape: (B, 1, S, D), broadcast over heads. kept in fp32 here;
+        # apply_rotary casts to the Q/K dtype at use-time.
+        cos = emb.cos()[:, None, :, :]
+        sin = emb.sin()[:, None, :, :]
 
-        # exactly just the rotation matrix
-        return (x * cos) + (self.rotate_half(x) * sin)
+        return cos, sin
 
 class Qwen3GroupQueryAttention(nn.Module):
     def __init__(
@@ -80,7 +87,7 @@ class Qwen3GroupQueryAttention(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim)
         self.k_norm = nn.RMSNorm(self.head_dim)
 
-        self.rope = Qwen3RotaryEmbedding(self.head_dim)
+        # self.rope = Qwen3RotaryEmbedding(self.head_dim)
 
     def split_heads_old(self, x: torch.Tensor) -> torch.Tensor:
         # reshape input tensor for multihead attention
@@ -164,19 +171,16 @@ class Qwen3GroupQueryAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         Q = self.q_norm(self.split_heads(self.q_proj(x)))
         K = self.k_norm(self.split_kv_heads(self.k_proj(x)))
         V = self.split_kv_heads(self.v_proj(x))
 
-        if position_ids is None:
-            S = x.size(1)
-            position_ids = torch.arange(S, device=x.device).unsqueeze(0)
-
-        Q = self.rope(Q, position_ids)
-        K = self.rope(K, position_ids)
+        Q = apply_rotary(Q, cos, sin)
+        K = apply_rotary(K, cos, sin)
 
         # GQA !! 
         # repeat_factor = self.num_heads // self.num_kv_heads
@@ -220,11 +224,12 @@ class Qwen3TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
 
-        x = x + self.gqa(self.norm1(x), attention_mask, position_ids)
+        x = x + self.gqa(self.norm1(x), cos, sin, attention_mask)
         x = x + self.ffn(self.norm2(x))
 
         return x
@@ -242,6 +247,7 @@ class Qwen3(nn.Module):
     ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, emb_dim)
+        self.rope = Qwen3RotaryEmbedding(head_dim)
         self.blocks = nn.ModuleList(
             Qwen3TransformerBlock(num_heads, emb_dim, num_kv_heads, head_dim)
             for _ in range(num_layers)
@@ -291,12 +297,13 @@ class Qwen3(nn.Module):
             attention_mask = attention_mask.bool()
             position_ids = attention_mask.long().cumsum(dim=1) - 1
             position_ids = position_ids.masked_fill(~attention_mask, 0)
-
+    
         x = self.token_emb(x)
+        cos, sin = self.rope(position_ids)
         hidden_states: list[torch.Tensor] = [x] if return_hidden_states else []
 
         for block in self.blocks:
-            x = block(x, attention_mask, position_ids)
+            x = block(x, cos, sin, attention_mask)
             if return_hidden_states:
                 hidden_states.append(x)
         
