@@ -3,13 +3,24 @@ from __future__ import annotations
 import os
 import time
 
+import torch
+
 # this should change to
 # just record everything
-# slightly in a debug log 
+# slightly in a debug log
 def record_time(func):
     def wrapper(*args, **kwargs):
+        # CUDA kernels are async, so a bare perf_counter around a GPU step only
+        # times kernel *launch*, not execution. synchronize on both ends so the
+        # elapsed time (and any tps derived from it) reflects real GPU work.
+        # guarded by is_available so cpu-only paths stay no-ops.
+        cuda = torch.cuda.is_available()
+        if cuda:
+            torch.cuda.synchronize()
         t0 = time.perf_counter()
         result = func(*args, **kwargs)
+        if cuda:
+            torch.cuda.synchronize()
         t1 = time.perf_counter()
         return result, t1 - t0
     return wrapper
