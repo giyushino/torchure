@@ -53,6 +53,9 @@ def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int
     # split_dataset_by_node rejects it). `config` is the dataset's subset
     # name (e.g. "en" for c4); pass None for datasets without subsets.
     # TODO: a dataset registry once per-dataset split/field quirks pile up.
+
+    # when the dataset is in json format on huggingface, this no longer 
+    # works and we'll need to change the format
     dataset = datasets.load_dataset(
         data_cfg["name"],
         data_cfg.get("config"),

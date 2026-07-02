@@ -12,9 +12,11 @@ for a single gpu run _parallelize is a no-op and world_size == 1.
 TODO:
 remove the decorators for profiling... just keep that now for
 ease of use then move to different profiling methods
+
 """
 
 import json
+import os
 
 import torch
 import torch.nn as nn
@@ -23,12 +25,14 @@ from tokenizers import Tokenizer
 
 from torchure.checkpoint.checkpointer import Checkpointer
 from torchure.dataloader.builder import build_dataloader
+from torchure.dataloader.prefetcher import CUDAPrefetcher
 from torchure.models.builder import build_model
 from torchure.objectives.builder import build_objective
 from torchure.optimizer.builder import build_optimizer, build_scheduler
 from torchure.utils import record_time, debug_time, get_project_dir
 
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 PROJECT_DIR = get_project_dir()
 
 
@@ -63,6 +67,10 @@ class Trainer:
         # make the dataloader iterable
         self.dataloader = self._build_dataloader()
         self.dataloader_iter = iter(self.dataloader)
+
+        # prefetch batch N+1's host->device copy on a side stream while step N
+        # computes; see torchure/dataloader/prefetcher.py.
+        self.prefetcher = CUDAPrefetcher(iter(self.dataloader), self.device)
         self.checkpointer_path = f"{PROJECT_DIR}/checkpoints/{self.config['run_name']}"
         self.checkpointer = Checkpointer(self.checkpointer_path)
 
@@ -114,6 +122,13 @@ class Trainer:
         )
     
     @debug_time
+    def get_batch_prefetcher(self) -> dict[str, torch.Tensor]:
+        # the prefetcher already queued this batch's copy on a side stream last
+        # step; this waits for it and kicks off the next one. pin_memory=True on
+        # the DataLoader is what makes the async copy actually overlap.
+        # https://docs.pytorch.org/docs/2.12/notes/cuda.html#cuda-memory-pinning
+        return next(self.prefetcher)
+    
     def get_batch(self) -> dict[str, torch.Tensor]:
         curr_batch = next(self.dataloader_iter)
         # https://docs.pytorch.org/docs/2.12/notes/cuda.html#cuda-memory-pinning
@@ -128,7 +143,7 @@ class Trainer:
 
     @record_time
     def train_step_test(self) -> torch.Tensor:
-            batch = self.get_batch()
+            batch = self.get_batch_prefetcher()
             #print(batch)
             # cast to bf16 so we can take advantage of sdpa
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
