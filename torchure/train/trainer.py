@@ -33,6 +33,14 @@ from torchure.utils import record_time, debug_time, get_project_dir
 
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# allow tf32 for the fp32 matmuls that autocast leaves alone (rope, some
+# reductions) and for cudnn. bf16 autocast already covers the big matmuls, so
+# this is a small but free win and is orthogonal to distributed.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
 PROJECT_DIR = get_project_dir()
 
 
@@ -58,7 +66,7 @@ class Trainer:
         self.model = self._build_model()
         self.model = self._parallelize(self.model)
         self._init_weights(self.model)
-        # self.model.compile()
+        self._compile(self.model)
 
         self.objective = self._build_objective()
         self.optimizer = self._build_optimizer(self.model)
@@ -89,6 +97,25 @@ class Trainer:
         single gpu: no-op. fill in once core/mesh.py + parallelism/ exist.
         """
         return model
+
+    def _compile(self, model: nn.Module) -> None:
+        """
+        compile per transformer block rather than the whole model.
+
+        this is the same granularity FSDP2 wants: each block becomes one
+        compiled region, so the graph is captured once and reused for all
+        identical blocks (fast warmup, no giant whole-model graph), and it
+        composes with per-block FSDP wrapping/activation-checkpointing later.
+        gated by config so eager stays available for debugging.
+        """
+        if not self.config.get("compile", True):
+            return
+        # "default" is the sweet spot here; "max-autotune-no-cudagraphs" buys a
+        # few % more at the cost of a much longer warmup (which multiplies once
+        # every rank compiles), so it's opt-in via config.
+        mode = self.config.get("compile_mode", "default")
+        for block in model.blocks:
+            block.compile(mode=mode)
 
     def _init_weights(self, model: nn.Module) -> None:
         # single gpu again, when we init for sharding
@@ -189,7 +216,7 @@ class Trainer:
 
 if __name__ == "__main__":
     test = Trainer(f"{PROJECT_DIR}/configs/qwen3_dense_climbmix.json", 0, 0, 1)
-    loss = test.train_n_step_test(100)
+    loss = test.train_n_step_test(10)
     print(f"{loss=}")
      
 

@@ -42,8 +42,14 @@ class Qwen3RotaryEmbedding(nn.Module):
         )
         self.register_buffer("inv_freq", inv_freq, False)
 
+        # cache for the packed-training path: with no padding mask every step
+        # sees position_ids = arange(seq_len), so cos/sin are identical across
+        # steps. cache them per (seq_len, device) so the eager rope math (which
+        # runs outside the per-block compiled regions) happens once, not every
+        # forward. keyed by seq_len; the padded/eval path recomputes.
+        self._cache: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
 
-    def forward(self, position_ids: torch.Tensor):
+    def _cos_sin(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # add new dimension to end of position ids, get (B, S, 1)
         # add 2 new dimentions to inv_freq, get (1, 1, D/2)
         freqs = position_ids.float()[:, :, None] * self.inv_freq[None, None, :]
@@ -57,6 +63,23 @@ class Qwen3RotaryEmbedding(nn.Module):
         sin = emb.sin()[:, None, :, :]
 
         return cos, sin
+
+    def forward(
+        self, position_ids: torch.Tensor, cacheable: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # `cacheable` is set by the caller only when position_ids is the plain
+        # arange(seq_len) broadcast over the batch (the packed, no-mask training
+        # path), so the result depends solely on seq_len and can be reused.
+        if not cacheable:
+            return self._cos_sin(position_ids)
+
+        key = (position_ids.shape[1], position_ids.device)
+        cached = self._cache.get(key)
+        if cached is None:
+            cached = self._cos_sin(position_ids)
+            self._cache[key] = cached
+        return cached
+
 
 class Qwen3GroupQueryAttention(nn.Module):
     def __init__(
@@ -293,13 +316,15 @@ class Qwen3(nn.Module):
         # non-pad tokens.
         if attention_mask is None:
             position_ids = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
+            cacheable = True
         else:
             attention_mask = attention_mask.bool()
             position_ids = attention_mask.long().cumsum(dim=1) - 1
             position_ids = position_ids.masked_fill(~attention_mask, 0)
-    
+            cacheable = False
+
         x = self.token_emb(x)
-        cos, sin = self.rope(position_ids)
+        cos, sin = self.rope(position_ids, cacheable=cacheable)
         hidden_states: list[torch.Tensor] = [x] if return_hidden_states else []
 
         for block in self.blocks:
