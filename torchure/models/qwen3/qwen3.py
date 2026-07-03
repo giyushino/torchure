@@ -309,6 +309,7 @@ class Qwen3(nn.Module):
         x: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         return_hidden_states: bool = False,
+        return_final_hidden: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         B, S = x.shape
 
@@ -331,7 +332,13 @@ class Qwen3(nn.Module):
             x = block(x, cos, sin, attention_mask)
             if return_hidden_states:
                 hidden_states.append(x)
-        
+
+        # skip the head: lets the objective fuse lm_head + cross-entropy
+        # (see torchure/loss/fused_linear_ce.py) without materializing the
+        # (B, S, vocab) logits.
+        if return_final_hidden:
+            return self.norm(x)
+
         # (batch_size, seq_lenth, vocab_size)
         logits = self.lm_head(self.norm(x))
         if return_hidden_states:
