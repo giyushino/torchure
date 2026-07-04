@@ -1,11 +1,6 @@
 # torchure
 pure pytorch training stack with minimal deps
 
-want to support training AR LLMs, DLLMs,
-continuous diffusiion LLMs, etc
-
-focus on AR for now
-
 ## what's here
 - `torchure/models/` — self-contained qwen3 dense (GQA + RoPE + SwiGLU, tied embeddings), llama3 stubbed
 - `torchure/dataloader/` — streaming HF datasets, sequence packing, stateful dataloader, CUDA prefetcher (overlaps h2d copy with compute)
@@ -32,10 +27,9 @@ tokens/sec for qwen3 0.6B dense, seq_len 4096, batch size 2, bf16:
 uv run torchure/train/trainer.py
 ```
 
-## Installation
-installation depends on whether or not you have
-uv installed on your machine. In theory you
-don't need uv, but it is a lot easier to use
+## installation
+if you have uv on your machine, no need
+to create the conda env
 
 ```bash
 conda create -n fresh python==3.14
@@ -43,3 +37,9 @@ conda activate fresh
 pip install uv
 uv pip install -e .
 ```
+
+## future plans
+support training AR LLMs, DLLMs,
+continuous diffusion LLMs, etc
+
+focusing on AR for now
