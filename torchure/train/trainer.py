@@ -64,8 +64,8 @@ class Trainer:
         self.tokenizer = Tokenizer.from_pretrained(self.config["data"]["tokenizer"])
 
         self.model = self._build_model()
-        self.model = self._parallelize(self.model)
         self._init_weights(self.model)
+        self.model = self._parallelize(self.model)
         self._compile(self.model)
 
         self.objective = self._build_objective()

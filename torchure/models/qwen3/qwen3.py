@@ -1,6 +1,8 @@
 """
 self contained qwen3 arch llm
-dense qwen
+dense qwen -> maybe remove
+the cached rope, doesn't seem
+to give any speedups
 """
 
 import math
