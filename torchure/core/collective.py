@@ -1,4 +1,5 @@
 """
+https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html
 mesh-aware collective wrappers over torch.distributed.
 
 the only module in the repo that calls torch.distributed comm ops directly;
@@ -122,7 +123,7 @@ def broadcast(
     group = mesh.get_group(dim)
     # where
     work = dist.broadcast(tensor, src=None, group=group, async_op=async_op, group_src=src)
-    return tensor
+    return (tensor, work) if async_op else tensor
 
 
 
@@ -146,7 +147,18 @@ def all_gather(
       after. inputs must be contiguous -- either .contiguous() or assert,
       never silently corrupt.
     """
-    raise NotImplementedError
+    group = mesh.get_group(dim)
+    group_size = mesh.size(dim)
+    input_tensor = tensor.movedim(gather_dim, 0).contiguous()
+    output_tensor = torch.empty((group_size * input_tensor.size(0), *input_tensor.size()[1:]), 
+                                dtype=tensor.dtype, device=tensor.device
+    )
+    work = dist.all_gather_into_tensor(output_tensor=output_tensor, input_tensor=input_tensor, 
+                                       group=group, async_op = async_op
+    )
+    out = output_tensor.movedim(0, gather_dim)
+    return (out, work) if async_op else out
+
 
 
 def reduce_scatter(
@@ -231,3 +243,5 @@ def barrier(mesh: MeshLike | None = None, dim: str | None = None) -> None:
     don't sprinkle it through the training loop.
     """
     raise NotImplementedError
+
+
