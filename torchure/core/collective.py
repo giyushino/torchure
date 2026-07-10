@@ -35,6 +35,15 @@ import torch.distributed as dist
 
 ReduceOpName = Literal["sum", "avg", "max", "min"]
 
+# shared by all_reduce / reduce_scatter. "avg" is resolved per-backend at the
+# call site (nccl has ReduceOp.AVG, gloo needs sum + local divide).
+_OPS = {
+    "sum": dist.ReduceOp.SUM,
+    "avg": dist.ReduceOp.AVG,
+    "max": dist.ReduceOp.MAX,
+    "min": dist.ReduceOp.MIN,
+}
+
 
 class MeshLike(Protocol):
     """what collectives need from core/mesh.py (or any test stand-in)."""
@@ -68,14 +77,28 @@ def all_reduce(
     """
     reduce `tensor` across the `dim` group, in place; every rank in the group
     ends up with the same reduced values. returns the input tensor.
-
-    impl notes:
-    - "avg" on gloo: sum, then tensor /= mesh.size(dim). in the async case
-      the divide must happen AFTER work.wait() -- either return a small
-      wrapper whose .wait() does sum-wait-then-divide, or (fine for v0)
-      assert not (async_op and op == "avg" and backend lacks AVG).
     """
-    raise NotImplementedError
+    # 1. resolve WHERE: mesh dim name -> the ProcessGroup this rank reduces in
+    group = mesh.get_group(dim)
+
+    # 2. resolve WHAT: "avg" needs a per-backend decision, everything else is
+    #    a straight enum lookup
+    if op == "avg" and dist.get_backend(group) != "nccl":
+        # no ReduceOp.AVG here: sum, then divide locally. the divide must
+        # happen after the sum completes, so no async on this path (v0);
+        # revisit with a Work wrapper if a consumer ever needs it.
+        assert not async_op, "async 'avg' unsupported on backends without ReduceOp.AVG"
+        dist.all_reduce(tensor, _OPS["sum"], group=group)
+        tensor /= mesh.size(dim)
+        return tensor
+
+    # 3. communicate: the backend runs the actual ring/tree exchange and
+    #    mutates `tensor` in place on every rank
+    work = dist.all_reduce(tensor, _OPS[op], group=group, async_op=async_op)
+
+    # 4. no fix-up needed on this path
+    # 5. return the input tensor (in-place contract), plus the handle if async
+    return (tensor, work) if async_op else tensor
 
 
 def broadcast(
@@ -95,7 +118,12 @@ def broadcast(
     through happens to work on a 1-d mesh and silently breaks on any real
     one; tests/collective.py uses src=1 to catch exactly this.
     """
-    raise NotImplementedError
+    # what
+    group = mesh.get_group(dim)
+    # where
+    work = dist.broadcast(tensor, src=None, group=group, async_op=async_op, group_src=src)
+    return tensor
+
 
 
 def all_gather(
