@@ -153,6 +153,7 @@ def all_gather(
     output_tensor = torch.empty((group_size * input_tensor.size(0), *input_tensor.size()[1:]), 
                                 dtype=tensor.dtype, device=tensor.device
     )
+
     work = dist.all_gather_into_tensor(output_tensor=output_tensor, input_tensor=input_tensor, 
                                        group=group, async_op = async_op
     )
@@ -183,7 +184,28 @@ def reduce_scatter(
     no padding. wrap dist.reduce_scatter_tensor; same movedim/contiguity
     story as all_gather. same gloo-"avg" caveat as all_reduce.
     """
-    raise NotImplementedError
+    group = mesh.get_group(dim)
+    group_size = mesh.size(dim)
+    assert tensor.shape[scatter_dim] % group_size == 0, f"shape[{scatter_dim}]={tensor.shape[scatter_dim]} not divisible by group size {group_size}"
+    input_tensor = tensor.movedim(scatter_dim, 0).contiguous()
+    output_tensor = torch.empty((input_tensor.size(0) // group_size, *input_tensor.size()[1:]), 
+                                dtype=tensor.dtype, device=tensor.device
+    )
+
+    if op == "avg" and dist.get_backend(group) != "nccl":
+        # no ReduceOp.AVG here: sum, then divide locally. the divide must
+        # happen after the sum completes, so no async on this path (v0);
+        # revisit with a Work wrapper if a consumer ever needs it.
+        assert not async_op, "async 'avg' unsupported on backends without ReduceOp.AVG"
+        dist.reduce_scatter_tensor(output=output_tensor, input=input_tensor, op=_OPS["sum"], group=group)
+        out = output_tensor.movedim(0, scatter_dim)
+        out /= group_size
+        return out
+
+    work = dist.reduce_scatter_tensor(output=output_tensor, input=input_tensor, op=_OPS[op], group=group, async_op=async_op)
+    out = output_tensor.movedim(0, scatter_dim)
+    return (out, work) if async_op else out
+
 
 
 def all_to_all(
