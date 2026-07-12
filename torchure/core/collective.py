@@ -27,6 +27,22 @@ decisions baked into the signatures (so the call sites don't churn later):
   same signatures -- they are functional-shaped on purpose.
 
 run tests with: uv run tests/collective.py  (gloo/cpu, no gpus needed)
+
+┌────────────────┬───────────────────┬─────────────────────────────────────────┐
+│   collective   │   per-rank size   │                   why                   │
+├────────────────┼───────────────────┼─────────────────────────────────────────┤
+│ all_reduce     │ same (in place)   │ combines values, doesn't move ownership │
+├────────────────┼───────────────────┼─────────────────────────────────────────┤
+│ broadcast      │ same (in place)   │ overwrites with src's values            │
+├────────────────┼───────────────────┼─────────────────────────────────────────┤
+│ all_gather     │ × g               │ you keep yours and gain everyone else's │
+├────────────────┼───────────────────┼─────────────────────────────────────────┤
+│ reduce_scatter │ ÷ g               │ everything combined, you keep one shard │
+├────────────────┼───────────────────┼─────────────────────────────────────────┤
+│ all_to_all     │ same (new tensor) │ trade, row-for-row — a transpose        │
+├────────────────┼───────────────────┼─────────────────────────────────────────┤
+│ ring_send_recv │ same (new tensor) │ one chunk out, one chunk in             │
+└────────────────┴───────────────────┴─────────────────────────────────────────┘
 """
 
 from typing import Literal, Protocol
@@ -150,12 +166,14 @@ def all_gather(
     group = mesh.get_group(dim)
     group_size = mesh.size(dim)
     input_tensor = tensor.movedim(gather_dim, 0).contiguous()
-    output_tensor = torch.empty((group_size * input_tensor.size(0), *input_tensor.size()[1:]), 
-                                dtype=tensor.dtype, device=tensor.device
+    output_tensor = torch.empty(
+        (group_size * input_tensor.size(0), *input_tensor.size()[1:]), 
+        dtype=tensor.dtype, device=tensor.device
     )
 
-    work = dist.all_gather_into_tensor(output_tensor=output_tensor, input_tensor=input_tensor, 
-                                       group=group, async_op = async_op
+    work = dist.all_gather_into_tensor(
+        output_tensor=output_tensor, input_tensor=input_tensor, 
+        group=group, async_op = async_op
     )
     out = output_tensor.movedim(0, gather_dim)
     return (out, work) if async_op else out
@@ -229,7 +247,17 @@ def all_to_all(
     input_splits/output_splits -- add those kwargs when a consumer exists,
     not now.
     """
-    raise NotImplementedError
+    group = mesh.get_group(dim)
+    group_size = mesh.size(dim)
+    assert tensor.shape[split_dim] % group_size == 0
+    assert async_op == False
+    input_tensor = tensor.movedim(split_dim, 0).contiguous()
+    output_tensor = torch.empty_like(input_tensor, dtype=tensor.dtype, device=tensor.device)
+    dist.all_to_all_single(output=output_tensor, input=input_tensor, group=group)
+    chunks = output_tensor.chunk(group_size, dim=0)
+    chunks = [c.movedim(0, split_dim) for c in chunks]
+    return torch.cat(chunks, dim=concat_dim)
+
 
 
 def ring_send_recv(
