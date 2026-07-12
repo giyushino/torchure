@@ -116,6 +116,10 @@ class Trainer:
         mode = self.config.get("compile_mode", "default")
         for block in model.blocks:
             block.compile(mode=mode)
+        # the final norm otherwise runs eager with a bf16 input vs fp32 weight
+        # dtype mismatch (no fused kernel); compiling it is free and keeps the
+        # block-level granularity FSDP2 wants.
+        model.norm.compile(mode=mode)
 
     def _init_weights(self, model: nn.Module) -> None:
         # single gpu again, when we init for sharding
@@ -184,10 +188,11 @@ class Trainer:
 
     @debug_time
     def train_n_step_test(self, n_steps: int) -> None:
+        tokens_per_step = self.config["data"]["seq_len"] * self.config["data"]["batch_size"]
         for step in range(n_steps):
             loss, time = self.train_step_test()
-            # hard code batch size for debugging for now
-            print(f"{step=} || {loss=} || tps={self.config['data']['seq_len'] * 2/time}")
+            print(f"{step=} || {loss=} || tps={tokens_per_step / time}")
+        print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
     @debug_time
     def train_step(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:

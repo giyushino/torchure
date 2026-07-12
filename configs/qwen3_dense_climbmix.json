@@ -28,7 +28,9 @@
   "objective": {
     "name": "AR",
     "config": {
-      "ignore_index": -100
+      "ignore_index": -100,
+      "fused_linear_ce": true,
+      "ce_chunk_size": 4096
     }
   },
   "data": {
