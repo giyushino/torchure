@@ -147,6 +147,14 @@ def test_reduce_scatter(mesh, dim, device):
     assert out.shape == (4, 3), f"shape {tuple(out.shape)} != (4, 3)"
     torch.testing.assert_close(out, summed[4 * c : 4 * c + 4])
 
+    # "avg" goes through the same emulation decision as all_reduce, but the
+    # divide is per-function logic -- cover it here too
+    out = C.reduce_scatter(rank_pattern((4 * g, 3), c, device), mesh, dim, "avg", scatter_dim=0)
+    avged = rank_pattern((4 * g, 3), 0, device) * ((g + 1) / 2)
+    torch.testing.assert_close(
+        out, avged[4 * c : 4 * c + 4], msg="'avg' result is wrong (missing divide?)"
+    )
+
     # the loud-assert contract: shape[scatter_dim] % g != 0 must raise
     if g > 1:
         bad = rank_pattern((4 * g + 1, 3), c, device)
@@ -300,6 +308,13 @@ def _worker(rank: int, world_size: int, backend: str, only: str | None = None):
             err = f"SKIP: {e}"
         except AssertionError as e:
             err = f"FAIL: {e}"
+        except Exception as e:
+            # unexpected crash inside a collective (bad shapes, backend
+            # errors, timeouts): report and keep going rather than nuking
+            # the whole run with a spawn traceback. note a timeout may
+            # leave the process group wedged, in which case later tests
+            # will error too -- trust the FIRST error line.
+            err = f"ERROR: {type(e).__name__}: {e}"
         dist.barrier()
         if rank == 0:
             print(f"[{test.__name__}] {err or 'PASS'}")
