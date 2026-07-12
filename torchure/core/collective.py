@@ -275,15 +275,37 @@ def ring_send_recv(
     this is the cp ring-attention primitive (and the building block of the
     educational ring all-reduce).
 
-    impl notes:
-    - every rank doing send() then recv() deadlocks on an unbuffered
-      backend. use dist.batch_isend_irecv([P2POp(dist.isend, ...),
-      P2POp(dist.irecv, ...)]) and wait the returned reqs, or stagger by
-      coordinate parity.
-    - P2POp also wants GLOBAL ranks: same dist.get_global_rank conversion
-      as broadcast.
+    sync-only for v0 (same reasoning as all_to_all: no consumer overlaps it
+    yet). when cp wants comm/compute overlap, lift the assert and return the
+    recv req as the work handle.
     """
-    raise NotImplementedError
+    assert not async_op, "ring_send_recv is sync-only (v0)"
+    group = mesh.get_group(dim)
+    group_size = mesh.size(dim)
+    coord = mesh.coordinate(dim)
+    if group_size == 1:
+        # a 1-rank ring is a self-loop; backends don't support self
+        # send/recv, and the semantics are just "a copy of my own tensor"
+        return tensor.clone()
+
+    # P2POp wants GLOBAL ranks: same coordinate conversion as broadcast
+    dst = dist.get_global_rank(group, (coord + 1) % group_size)
+    src = dist.get_global_rank(group, (coord - 1) % group_size)
+
+    send_tensor = tensor.contiguous()
+    recv_tensor = torch.empty_like(send_tensor)
+    # submit the send and recv as one batch: every rank doing a blocking
+    # send() then recv() deadlocks (all ranks stuck sending, nobody
+    # receiving). batching lets the backend interleave both directions.
+    reqs = dist.batch_isend_irecv(
+        [
+            dist.P2POp(dist.isend, send_tensor, dst, group=group),
+            dist.P2POp(dist.irecv, recv_tensor, src, group=group),
+        ]
+    )
+    for req in reqs:
+        req.wait()
+    return recv_tensor
 
 
 def barrier(mesh: MeshLike | None = None, dim: str | None = None) -> None:
@@ -292,6 +314,6 @@ def barrier(mesh: MeshLike | None = None, dim: str | None = None) -> None:
     world if mesh is None). for fencing checkpoint saves and test output --
     don't sprinkle it through the training loop.
     """
-    raise NotImplementedError
+    dist.barrier(group=None if mesh is None else mesh.get_group(dim))
 
 
