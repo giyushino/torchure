@@ -18,8 +18,9 @@ class WarmupStableDecaySchedulder(LRScheduler):
         step = self.last_epoch
         decay_phase_start = self.total_steps * (1 - self.decay_ratio)
 
-        if step <= self.total_steps * self.warmup_ratio:
-            scale = (step + 1) / (self.total_steps * self.warmup_ratio)
+        warmup_steps = max(1, round(self.total_steps * self.warmup_ratio))
+        if step <= warmup_steps:
+            scale = (step + 1) / warmup_steps
 
         elif step >= decay_phase_start:
             num_decay_steps = self.decay_ratio * self.total_steps
