@@ -171,7 +171,7 @@ class Trainer:
         self.checkpointer.save_model(self.model, step)
         self.checkpointer.save_dataloader(self.dataloader, step)
         self.checkpointer.save_optimizer(self.optimizer, step)
-        return
+        self.checkpointer.save_scheduler(self.scheduler, step)
 
     @record_time
     def train_step_test(self) -> torch.Tensor:
