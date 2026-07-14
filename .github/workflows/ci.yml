@@ -1,0 +1,53 @@
+# minimal ci: ruff + the cpu-runnable test suites.
+#
+# deliberately excluded:
+# - tests/fused_linear_ce.py (needs cuda; runs on the dev box instead)
+# - throughput benchmarks (CHANGES.md numbers come from real gpus, never ci)
+#
+# torch is installed from the pytorch cpu index (--torch-backend=cpu) so the
+# job pulls ~200MB instead of the multi-GB cuda wheels the lockfile pins for
+# dev boxes. tradeoff: ci resolves from pyproject (exact-pinned anyway), not
+# uv.lock. if that drift ever bites, swap the install step for
+# `uv sync --frozen` and eat the bigger download.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # rule selection lives in [tool.ruff] in pyproject.toml
+      - run: uvx ruff@0.14.0 check .
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          # ci installs from pyproject (not uv.lock), so key the cache on it
+          cache-dependency-glob: "pyproject.toml"
+      - name: install (cpu torch)
+        run: |
+          uv venv -p 3.14
+          uv pip install --torch-backend=cpu -e .
+      - name: collective ops (gloo, 4 ranks)
+        run: uv run --no-sync tests/collective.py --world-size 4
+      - name: packing correctness
+        run: uv run --no-sync tests/dataloader_packing.py --check
+      - name: checkpointer roundtrip
+        run: uv run --no-sync tests/checkpointer.py
