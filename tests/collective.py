@@ -29,6 +29,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from torchure.core import collective as C
+from torchure.core.mesh import Mesh
 
 
 class Skip(Exception):
@@ -238,14 +239,13 @@ def test_subgroup_isolation(mesh, dim, device):
     # must only combine ranks in that dim's subgroup. runs against the real
     # core/mesh.py, not the FlatMesh passed in.
     try:
-        # adjust this import to whatever core/mesh.py ends up exporting
-        from torchure.core.mesh import init_mesh
+        from torchure.core.mesh import Mesh
     except ImportError:
         raise Skip("core/mesh.py not implemented yet")
     if dist.get_world_size() != 4:
         raise Skip("needs exactly 4 ranks (2x2 mesh); rerun with --world-size 4")
 
-    m = init_mesh({"dp": 2, "tp": 2})
+    m = Mesh({"dp": 2, "tp": 2})
     rank = dist.get_rank()
     # powers of two: every subset of ranks has a unique sum, so any wrong
     # grouping is unambiguous
@@ -293,7 +293,15 @@ def _worker(rank: int, world_size: int, backend: str, only: str | None = None):
     else:
         device = torch.device("cpu")
 
-    mesh, dim = FlatMesh(), "dp"
+    # exercise the real N-d Mesh instead of FlatMesh: a 2-d (dp x tp) layout so
+    # `dp` is a genuine subgroup, not the whole world -- that's what catches
+    # wrong-group bugs. the tp groups get built too, exercising the multi-axis
+    # new_group loop (the "all ranks create every group" deadlock trap).
+    if world_size % 2 == 0 and world_size >= 4:
+        spec = {"dp": world_size // 2, "tp": 2}
+    else:
+        spec = {"dp": world_size, "tp": 1}
+    mesh, dim = Mesh(spec), "dp"
     tests = [t for t in TESTS if only is None or only in t.__name__]
     if not tests:
         raise SystemExit(f"--only {only!r} matched no tests")
