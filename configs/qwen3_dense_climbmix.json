@@ -22,7 +22,7 @@
       "type": "wsd",
       "warmup_ratio": 0.001,
       "decay_ratio": 0.1,
-      "total_steps": 10
+      "total_steps": 1000
     }
   },
   "objective": {
