@@ -19,7 +19,9 @@ class WarmupStableDecaySchedulder(LRScheduler):
         decay_phase_start = self.total_steps * (1 - self.decay_ratio)
 
         warmup_steps = max(1, round(self.total_steps * self.warmup_ratio))
-        if step <= warmup_steps:
+        # strict <: with the +1 numerator, step W-1 already hits scale 1.0;
+        # letting step == W in here would overshoot to (W+1)/W
+        if step < warmup_steps:
             scale = (step + 1) / warmup_steps
 
         elif step >= decay_phase_start:

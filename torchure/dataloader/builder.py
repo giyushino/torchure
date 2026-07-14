@@ -6,9 +6,9 @@ python arrs, so we should move packing into the collator
 but this doesn't seem to be bottleneck for throughput
 so leave for now
 
-we also need to consider if we want to use unique ids
-for padding, but with our current naive list packer,
-we do not need to take this into consideration 
+eos vs pad: eos (doc separator, trained on) and pad (bin filler,
+maskable) are looked up separately from config and must be distinct
+vocab ids -- see the contract in packers.py
 """
 
 import datasets
@@ -65,24 +65,30 @@ def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int
     print(f"num shards: {dataset.num_shards}")
 
     # normalize whatever the source calls its text column to "text" so the
-    # collate_fn stays dataset-agnostic. cheap: applied lazily per element.
+    # collate_fn stays dataset-agnostic. rename_column, NOT a lambda .map:
+    # the dataset is pickled to DataLoader workers under forkserver/spawn
+    # (py3.14 default on linux) and lambdas don't pickle -- same reason
+    # Packer/Collator are top-level classes.
     text_field = data_cfg["text_field"]
     if text_field != "text":
-        dataset = dataset.map(lambda ex: {"text": ex[text_field]})
+        dataset = dataset.rename_column(text_field, "text")
 
     dataset = dataset.shuffle(buffer_size=data_cfg["shuffle_buffer"], seed=data_cfg["seed"])
     # split by the data-parallel mesh coordinate: ranks in the same TP/CP
     # group share a dp_rank and so deterministically read the same shards.
     dataset = split_dataset_by_node(dataset, rank=dp_rank, world_size=dp_size)
 
-    # configure batch tokenization once; mutating here keeps the collate_fn
-    # stateless and avoids reconfiguring per batch. pad with a real vocab id
+    # eos delimits documents in the packed stream (real, trained-on signal);
+    # pad only fills bestfit bins and must be a DIFFERENT vocab id so labels
+    # can mask filler later without masking genuine doc boundaries (see
+    # packers.py). token_to_id returns None for tokens missing from the
+    # vocab -- fail here, loudly, not as a TypeError inside a worker.
+    eos_id = tokenizer.token_to_id(data_cfg["eos_token"])
+    pad_id = tokenizer.token_to_id(data_cfg["pad_token"])
+    assert eos_id is not None, f"eos_token {data_cfg['eos_token']!r} not in tokenizer vocab"
+    assert pad_id is not None, f"pad_token {data_cfg['pad_token']!r} not in tokenizer vocab"
 
-    # for the pad tokens, maybe just set this to eos implicity
-    pad_token = data_cfg["pad_token"]
-    pad_id = tokenizer.token_to_id(pad_token)
-
-    packer = ListPacker(tokenizer, data_cfg["seq_len"], pad_id)
+    packer = ListPacker(tokenizer, data_cfg["seq_len"], eos_id, pad_id)
     dataset = dataset.map(
         packer, batched=True,
         batch_size=data_cfg.get("pack_batch", 1000),
