@@ -20,7 +20,7 @@ tokens/sec for qwen3 0.6B dense, seq_len 4096, batch size 2, bf16:
 | hardware | tps |
 |----------|-----|
 | 1x A40 | ~12.7k |
-| 1x H100 | |
+| 1x H100 | ~48.2k |
 
 ## running
 ```bash
