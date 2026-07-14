@@ -242,8 +242,9 @@ class Qwen3TransformerBlock(nn.Module):
         self.gqa = Qwen3GroupQueryAttention(num_heads, emb_dim, num_kv_heads, head_dim)
         self.norm1 = nn.RMSNorm(emb_dim)
         self.norm2 = nn.RMSNorm(emb_dim)
-
-        ffn_dim = int(emb_dim * 8/ 3) # hard coded in qwen3
+        
+        # round up dim to more hardware friendly number
+        ffn_dim = 256 * ((int(8 * emb_dim / 3) + 255) // 256)
         self.ffn  = SwiGLU(emb_dim, ffn_dim)
 
     def forward(

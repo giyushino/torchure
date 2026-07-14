@@ -20,6 +20,7 @@ import os
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import torchdata
 from tokenizers import Tokenizer
 
@@ -78,7 +79,7 @@ class Trainer:
 
         # prefetch batch N+1's host->device copy on a side stream while step N
         # computes; see torchure/dataloader/prefetcher.py.
-        self.prefetcher = CUDAPrefetcher(iter(self.dataloader), self.device)
+        self.prefetcher = CUDAPrefetcher(self.dataloader_iter, self.device)
         self.checkpointer_path = f"{PROJECT_DIR}/checkpoints/{self.config['run_name']}"
         self.checkpointer = Checkpointer(self.checkpointer_path)
 
@@ -217,11 +218,12 @@ class Trainer:
         TODO: main loop over self.dataloader for the configured number of
         steps/epochs, calling self.train_step and logging.
         """
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     test = Trainer(f"{PROJECT_DIR}/configs/qwen3_dense_climbmix.json", 0, 0, 1)
-    loss = test.train_n_step_test(10)
+    loss = test.train_n_step_test(1000)
     print(f"{loss=}")
      
 

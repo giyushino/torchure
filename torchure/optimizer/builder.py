@@ -49,6 +49,9 @@ def build_optimizer(model: nn.Module, optim_name: str, optim_config: dict) -> op
 def build_scheduler(optimizer: optim.Optimizer, scheduler_config: dict) -> optim.lr_scheduler.LRScheduler:
     scheduler_cfg = dict(scheduler_config)
     schedulder_type = scheduler_cfg["type"]
+    if schedulder_type == "cosine":
+        raise NotImplemented
+
     scheduler_cfg.pop("type")
     scheduler_cfg["optimizer"] = optimizer
     return SCHEDULER_REGISTRY[schedulder_type](**scheduler_cfg)
