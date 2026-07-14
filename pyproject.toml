@@ -25,3 +25,12 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["torchure*"]
 
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# defaults (E4/E7/E9 pycodestyle errors + F pyflakes) plus B bugbear, which
+# catches real bugs (mutable defaults, raise NotImplemented, silent zips).
+# ratchet more rules in over time; don't add formatting churn retroactively.
+extend-select = ["B"]
+

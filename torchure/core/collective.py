@@ -250,7 +250,7 @@ def all_to_all(
     group = mesh.get_group(dim)
     group_size = mesh.size(dim)
     assert tensor.shape[split_dim] % group_size == 0
-    assert async_op == False
+    assert not async_op, "all_to_all is sync-only (v0)"
     input_tensor = tensor.movedim(split_dim, 0).contiguous()
     output_tensor = torch.empty_like(input_tensor, dtype=tensor.dtype, device=tensor.device)
     dist.all_to_all_single(output=output_tensor, input=input_tensor, group=group)

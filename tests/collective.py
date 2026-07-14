@@ -241,7 +241,7 @@ def test_subgroup_isolation(mesh, dim, device):
     try:
         from torchure.core.mesh import Mesh
     except ImportError:
-        raise Skip("core/mesh.py not implemented yet")
+        raise Skip("core/mesh.py not implemented yet") from None
     if dist.get_world_size() != 4:
         raise Skip("needs exactly 4 ranks (2x2 mesh); rerun with --world-size 4")
 

@@ -50,7 +50,9 @@ def build_scheduler(optimizer: optim.Optimizer, scheduler_config: dict) -> optim
     scheduler_cfg = dict(scheduler_config)
     schedulder_type = scheduler_cfg["type"]
     if schedulder_type == "cosine":
-        raise NotImplemented
+        # NotImplementedError, not the NotImplemented sentinel: raising the
+        # sentinel is a TypeError, which would mask the real message
+        raise NotImplementedError("cosine scheduler is a stub (get_lr returns 0); use wsd")
 
     scheduler_cfg.pop("type")
     scheduler_cfg["optimizer"] = optimizer
