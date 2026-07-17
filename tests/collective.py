@@ -259,6 +259,56 @@ def test_subgroup_isolation(mesh, dim, device):
         torch.testing.assert_close(out, torch.full((4,), expected, device=device))
 
 
+def test_mesh_flatten(mesh, dim, device):
+    # flatten(("dp_replicate", "dp_shard"), "dp") is the "which batch shard
+    # am i" helper: tp peers must land in DIFFERENT flat groups but share the
+    # SAME flat coordinate, and coordinate == index in group rank order (the
+    # all_gather-order invariant). dp_shard=1 also covers a size-1 axis
+    # inside the flatten.
+    if dist.get_world_size() != 4:
+        raise Skip("needs exactly 4 ranks; rerun with --world-size 4")
+
+    m = Mesh({"dp_replicate": 2, "dp_shard": 1, "tp": 2})
+    m.flatten(("dp_replicate", "dp_shard"), name="dp")
+    rank = dist.get_rank()
+
+    assert m.size("dp") == 2, f'size("dp") == {m.size("dp")} != 2'
+    # row-major over (dp_replicate, dp_shard)
+    expected_coord = m.coordinate("dp_replicate") * m.size("dp_shard") + m.coordinate("dp_shard")
+    assert m.coordinate("dp") == expected_coord, (
+        f'coordinate("dp") == {m.coordinate("dp")} != {expected_coord}'
+    )
+
+    # my flat group = ranks that differ only in the flattened axes, i.e. my
+    # tp coordinate (rank % 2 here, tp innermost) stays fixed
+    members = dist.get_process_group_ranks(m.get_group("dp"))
+    expected_members = [r for r in range(4) if r % 2 == rank % 2]
+    assert members == expected_members, f"{members} != {expected_members}"
+    assert members.index(rank) == m.coordinate("dp"), (
+        "flat coordinate must equal my index in group rank order"
+    )
+
+    # collectives along the flat axis only touch its subgroup (powers of two:
+    # any wrong grouping gives an unambiguous sum)
+    out = C.all_reduce(torch.full((4,), 2.0**rank, device=device), m, "dp", "sum")
+    expected = sum(2.0**r for r in members)
+    torch.testing.assert_close(out, torch.full((4,), expected, device=device))
+
+    # gather order along the flat axis follows the coordinate
+    out = C.all_gather(torch.full((1,), float(rank), device=device), m, "dp", gather_dim=0)
+    torch.testing.assert_close(out, torch.tensor([float(r) for r in members], device=device))
+
+    # axes out of spec order must be rejected loudly (the coordinate/rank-
+    # order invariant would silently break otherwise). the assert fires
+    # before any new_group call, so raising on all ranks is collective-safe.
+    try:
+        m.flatten(("tp", "dp_replicate"), name="bad")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("flatten accepted axes out of spec order")
+
+
 TESTS = [
     test_all_reduce_sum,
     test_all_reduce_avg,
@@ -271,6 +321,7 @@ TESTS = [
     test_ring_send_recv,
     test_async_matches_sync,
     test_subgroup_isolation,
+    test_mesh_flatten,
 ]
 
 
