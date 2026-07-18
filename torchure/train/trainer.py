@@ -12,7 +12,6 @@ for a single gpu run _parallelize is a no-op and world_size == 1.
 TODO:
 remove the decorators for profiling... just keep that now for
 ease of use then move to different profiling methods
-
 """
 
 import json
@@ -75,16 +74,21 @@ class Trainer:
         self.optimizer = self._build_optimizer(self.model)
         self.scheduler = self._build_scheduler(self.optimizer)
         self.num_train_steps = self.config["optimizer"]["scheduler"]["total_steps"]
-        # self.resume = self.config["resume_training"]
-        # make the dataloader iterable
-        self.dataloader = self._build_dataloader()
-        self.dataloader_iter = iter(self.dataloader)
 
+        self.dataloader = self._build_dataloader()
+
+        self.checkpointer_path = f"{PROJECT_DIR}/checkpoints/{self.config['run_name']}"
+        self.checkpointer = Checkpointer(self.checkpointer_path)
+        self.resume = self.config["checkpointing"]["resume"]
+        self.save_steps = self.config["checkpointing"]["save_steps"]
+        self.start_step = self._resume()
+
+        # make the dataloader iterable, has to be after
+        # checkpointing resumption logic 
+        self.dataloader_iter = iter(self.dataloader)
         # prefetch batch N+1's host->device copy on a side stream while step N
         # computes; see torchure/dataloader/prefetcher.py.
         self.prefetcher = CUDAPrefetcher(self.dataloader_iter, self.device)
-        self.checkpointer_path = f"{PROJECT_DIR}/checkpoints/{self.config['run_name']}"
-        self.checkpointer = Checkpointer(self.checkpointer_path)
 
     def _build_model(self) -> nn.Module:
         # for single gpu right now, when we want to do
@@ -173,6 +177,43 @@ class Trainer:
         self.checkpointer.save_dataloader(self.dataloader, step)
         self.checkpointer.save_optimizer(self.optimizer, step)
         self.checkpointer.save_scheduler(self.scheduler, step)
+        # written AFTER completing `step`, so _resume returns step + 1. rng
+        # capture is what keeps resume exact once anything samples per step
+        # (dropout, masked diffusion); the config snapshot is provenance for
+        # init_from and future drift warnings.
+        self.checkpointer.save_trainer(
+            {
+                "step": step,
+                "cpu_rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state(self.device),
+                "config": self.config,
+            },
+            step,
+        )
+
+    def _resume(self) -> int:
+        if self.resume is None:
+            return 0
+        if self.resume == "auto":
+            step = self.checkpointer.latest()
+            if step is None:
+                return 0
+        elif type(self.resume) == int:
+            step = self.checkpointer.valid_step(self.resume)
+            assert step is not None, "non valid step to resume from"
+        else:
+            raise ValueError("invalid value for resume, must be either None, 'auto', or valid integer training step")
+
+
+        self.checkpointer.load_model(self.model, step)
+        self.checkpointer.load_optimizer(self.optimizer, step)
+        self.checkpointer.load_scheduler(self.scheduler, step)
+        self.checkpointer.load_dataloader(self.dataloader, step)
+        state = self.checkpointer.load_trainer(step)
+        torch.set_rng_state(state["cpu_rng"])
+        torch.cuda.set_rng_state(state["cuda_rng"], self.device)
+        return state["step"] + 1
+    
 
     @record_time
     def train_step(self) -> torch.Tensor:
