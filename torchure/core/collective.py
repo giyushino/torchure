@@ -142,7 +142,6 @@ def broadcast(
     return (tensor, work) if async_op else tensor
 
 
-
 def all_gather(
     tensor: torch.Tensor,
     mesh: MeshLike,
@@ -177,7 +176,6 @@ def all_gather(
     )
     out = output_tensor.movedim(0, gather_dim)
     return (out, work) if async_op else out
-
 
 
 def reduce_scatter(
@@ -225,7 +223,6 @@ def reduce_scatter(
     return (out, work) if async_op else out
 
 
-
 def all_to_all(
     tensor: torch.Tensor,
     mesh: MeshLike,
@@ -257,7 +254,6 @@ def all_to_all(
     chunks = output_tensor.chunk(group_size, dim=0)
     chunks = [c.movedim(0, split_dim) for c in chunks]
     return torch.cat(chunks, dim=concat_dim)
-
 
 
 def ring_send_recv(
@@ -315,5 +311,4 @@ def barrier(mesh: MeshLike | None = None, dim: str | None = None) -> None:
     don't sprinkle it through the training loop.
     """
     dist.barrier(group=None if mesh is None else mesh.get_group(dim))
-
 

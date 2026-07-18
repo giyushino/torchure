@@ -236,6 +236,7 @@ class Trainer:
             print(f"{step=} || {loss=} || tps={tokens_per_step / time}")
         print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
+
     def train(self) -> None:
         """
         we currently operate in a step regime, not epoch
