@@ -25,7 +25,7 @@
       "type": "wsd",
       "warmup_ratio": 0.001,
       "decay_ratio": 0.1,
-      "total_steps": 1000
+      "total_steps": 100
     }
   },
   "objective": {
@@ -41,7 +41,7 @@
     "split": "train",
     "tokenizer": "Qwen/Qwen3-0.6B",
     "eos_token": "<|endoftext|>",
-    "pad_token": "<|im_pad|>",
+    "pad_token": "<|fim_pad|>",
     "text_field": "text",
     "shuffle_buffer": 1000,
     "seed": 42,
@@ -51,8 +51,8 @@
     "pack_batch": 1000
   },
   "checkpointing": {
-    "save_steps": 500,
-    "resume": 100
+    "save_steps": 25,
+    "resume": null
   },
   "run_name": "climbmix_test_run_1"
 }
