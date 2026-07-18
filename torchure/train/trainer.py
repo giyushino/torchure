@@ -212,7 +212,7 @@ class Trainer:
         state = self.checkpointer.load_trainer(step)
         torch.set_rng_state(state["cpu_rng"])
         torch.cuda.set_rng_state(state["cuda_rng"], self.device)
-        return state["step"] + 1
+        return state["step"]
     
 
     @record_time
@@ -245,7 +245,7 @@ class Trainer:
         for step in range(self.start_step, self.num_train_steps):
             loss, time = self.train_step()
             if (step + 1) % self.save_steps == 0 and step != 0:
-                self.checkpoint(step)
+                self.checkpoint(step + 1)
             print(f"{step=} || {loss=} || tps={tokens_per_step / time}")
 
         print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")

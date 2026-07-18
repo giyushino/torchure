@@ -37,7 +37,6 @@ def main() -> None:
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    print(world_size)
 
     # bind to my gpu BEFORE init: nccl allocates communicator state on
     # the current device, and this keeps rank0's gpu from collecting

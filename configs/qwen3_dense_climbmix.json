@@ -51,7 +51,7 @@
     "pack_batch": 1000
   },
   "checkpointing": {
-    "save_steps": 25,
+    "save_steps": 10000,
     "resume": null
   },
   "run_name": "climbmix_test_run_1"
