@@ -19,7 +19,6 @@ import os
 
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 import torchdata
 from tokenizers import Tokenizer
 
@@ -171,7 +170,8 @@ class Trainer:
         # https://docs.pytorch.org/docs/2.12/notes/cuda.html#cuda-memory-pinning
         # note that this only works since we set pin_memory true in the constructor
         return {k: v.to(self.device, non_blocking=True) for k, v in curr_batch.items()}
-
+    
+    @debug_time
     def checkpoint(self, step: int) -> None:
         self.checkpointer.save_model(self.model, step)
         self.checkpointer.save_dataloader(self.dataloader, step)
@@ -198,7 +198,7 @@ class Trainer:
             step = self.checkpointer.latest()
             if step is None:
                 return 0
-        elif type(self.resume) == int:
+        elif isinstance(self.resume, int):
             step = self.checkpointer.valid_step(self.resume)
             assert step is not None, "non valid step to resume from"
         else:
@@ -232,7 +232,7 @@ class Trainer:
     def train_n_step_test(self, n_steps: int) -> None:
         tokens_per_step = self.config["data"]["seq_len"] * self.config["data"]["batch_size"]
         for step in range(n_steps):
-            loss, time = self.train_step_test()
+            loss, time = self.train_step()
             print(f"{step=} || {loss=} || tps={tokens_per_step / time}")
         print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
@@ -242,8 +242,10 @@ class Trainer:
         we could switch, but maybe no need
         """
         tokens_per_step = self.config["data"]["seq_len"] * self.config["data"]["batch_size"]
-        for step in range(self.num_train_steps):
+        for step in range(self.start_step, self.num_train_steps):
             loss, time = self.train_step()
+            if (step + 1) % self.save_steps == 0 and step != 0:
+                self.checkpoint(step)
             print(f"{step=} || {loss=} || tps={tokens_per_step / time}")
 
         print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")

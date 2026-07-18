@@ -102,6 +102,23 @@ def main() -> None:
         resumed_next = next(iter(loader2))
         torch.testing.assert_close(resumed_next, expected_next)
 
+        # trainer state: a plain dict (step, rng, config snapshot), no
+        # state_dict holder. cpu-only here; the trainer adds cuda_rng on
+        # real runs. rng restore must reproduce the exact next draw.
+        torch.manual_seed(7)
+        trainer_state = {
+            "step": step,
+            "cpu_rng": torch.get_rng_state(),
+            "config": {"run_name": "test", "lr": 1e-3},
+        }
+        expected_draw = torch.randn(4)
+        ckpt.save_trainer(trainer_state, step)
+        loaded = ckpt.load_trainer(step)
+        assert loaded["step"] == step
+        assert loaded["config"] == trainer_state["config"]
+        torch.set_rng_state(loaded["cpu_rng"])
+        torch.testing.assert_close(torch.randn(4), expected_draw)
+
         print("all checkpointer roundtrip checks passed")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

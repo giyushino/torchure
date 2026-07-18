@@ -59,6 +59,14 @@ class Checkpointer:
     def save_dataloader(self, dataloader, step: int) -> None:
         self._save(dataloader, step, "dataloader.pt")
 
+    def save_trainer(self, state: dict, step: int) -> None:
+        # trainer state is already a plain dict (step, rng states, config
+        # snapshot), not a state_dict() holder, so it bypasses _save
+        torch.save(state, os.path.join(self._step_dir(step, create=True), "trainer.pt"))
+
+    def load_trainer(self, step: int) -> dict:
+        return self._load(step, "trainer.pt")
+
     def load_model(self, model: nn.Module, step: int) -> None:
         model.load_state_dict(self._load(step, "model.pt"))
 
