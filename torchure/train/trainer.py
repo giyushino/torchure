@@ -23,12 +23,14 @@ import torchdata
 from tokenizers import Tokenizer
 
 from torchure.checkpoint.checkpointer import Checkpointer
+from torchure.core.collective import all_reduce, barrier
+from torchure.core.mesh import Mesh
 from torchure.dataloader.builder import build_dataloader
 from torchure.dataloader.prefetcher import CUDAPrefetcher
-from torchure.core.mesh import Mesh
 from torchure.models.builder import build_model
 from torchure.objectives.builder import build_objective
 from torchure.optimizer.builder import build_optimizer, build_scheduler
+from torchure.parallelism.data_parallel import DDP
 from torchure.utils import record_time, debug_time, get_project_dir
 
 
@@ -60,7 +62,8 @@ class Trainer:
         self.device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(local_rank)  # have the process own this specific GPU
         self.mesh = Mesh(self.config["mesh"])
-        
+        self.dp_size = self.mesh.size("dp")
+
         self.ignore_index = self.config["objective"]["config"]["ignore_index"]
         self.tokenizer = Tokenizer.from_pretrained(self.config["data"]["tokenizer"])
 
@@ -98,11 +101,22 @@ class Trainer:
 
     def _parallelize(self, model: nn.Module) -> nn.Module:
         """
-        apply tensor/expert/context parallel + fsdp2 here, driven by the
-        device mesh + a per-model plan in torchure/parallelism/.
+        ddp for now: replicate along the dp axis, bucketed grad sync
+        overlapped with backward. tensor/expert/context parallel + fsdp2
+        slot in here later, driven by the same mesh.
 
-        single gpu: no-op. fill in once core/mesh.py + parallelism/ exist.
+        runs before _compile on purpose: the grad hooks sit on params at the
+        AccumulateGrad boundary, outside the compiled regions. at dp=1 the
+        DDP ctor is a complete no-op (no hooks, no groups touched).
         """
+        ddp_cfg = self.config.get("ddp", {})
+        self.ddp = DDP(
+            model,
+            self.mesh,
+            dim="dp",
+            bucket_mb=ddp_cfg.get("bucket_mb", 25),
+            overlap=ddp_cfg.get("overlap", True),
+        )
         return model
 
     def _compile(self, model: nn.Module) -> None:
@@ -173,23 +187,29 @@ class Trainer:
     
     @debug_time
     def checkpoint(self, step: int) -> None:
-        self.checkpointer.save_model(self.model, step)
-        self.checkpointer.save_dataloader(self.dataloader, step)
-        self.checkpointer.save_optimizer(self.optimizer, step)
-        self.checkpointer.save_scheduler(self.scheduler, step)
-        # written AFTER completing `step`, so _resume returns step + 1. rng
-        # capture is what keeps resume exact once anything samples per step
-        # (dropout, masked diffusion); the config snapshot is provenance for
-        # init_from and future drift warnings.
-        self.checkpointer.save_trainer(
-            {
-                "step": step,
-                "cpu_rng": torch.get_rng_state(),
-                "cuda_rng": torch.cuda.get_rng_state(self.device),
-                "config": self.config,
-            },
-            step,
-        )
+        # model/optimizer/scheduler are replicas under ddp: rank 0 writes the
+        # single copy (sharded state is roadmap phase 3). dataloader position
+        # is per dp shard, so every dp rank writes its own file.
+        if self.rank == 0:
+            self.checkpointer.save_model(self.model, step)
+            self.checkpointer.save_optimizer(self.optimizer, step)
+            self.checkpointer.save_scheduler(self.scheduler, step)
+            # written AFTER completing `step`, so _resume returns step + 1. rng
+            # capture is what keeps resume exact once anything samples per step
+            # (dropout, masked diffusion); the config snapshot is provenance for
+            # init_from and future drift warnings.
+            self.checkpointer.save_trainer(
+                {
+                    "step": step,
+                    "cpu_rng": torch.get_rng_state(),
+                    "cuda_rng": torch.cuda.get_rng_state(self.device),
+                    "config": self.config,
+                },
+                step,
+            )
+        self.checkpointer.save_dataloader(self.dataloader, step, self.mesh.coordinate("dp"))
+        # fence: no rank moves on (or exits) while writers are mid-file
+        barrier()
 
     def _resume(self) -> int:
         if self.resume is None:
@@ -205,11 +225,19 @@ class Trainer:
             raise ValueError("invalid value for resume, must be either None, 'auto', or valid integer training step")
 
 
+        state = self.checkpointer.load_trainer(step)
+        # a different dp size would silently misread the per-rank dataloader
+        # files (subset of shards, wrong global batch) -- refuse instead
+        assert state["config"]["mesh"] == self.config["mesh"], (
+            f"resume across a mesh change is unsupported: checkpoint has "
+            f"{state['config']['mesh']}, config has {self.config['mesh']}"
+        )
         self.checkpointer.load_model(self.model, step)
         self.checkpointer.load_optimizer(self.optimizer, step)
         self.checkpointer.load_scheduler(self.scheduler, step)
-        self.checkpointer.load_dataloader(self.dataloader, step)
-        state = self.checkpointer.load_trainer(step)
+        self.checkpointer.load_dataloader(self.dataloader, step, self.mesh.coordinate("dp"))
+        # rank 0's rng lands on every rank; harmless while nothing samples
+        # per step, revisit with per-rank seed derivation (roadmap 0.3)
         torch.set_rng_state(state["cpu_rng"])
         torch.cuda.set_rng_state(state["cuda_rng"], self.device)
         return state["step"]
@@ -223,18 +251,31 @@ class Trainer:
                 loss = self.objective.compute_loss(self.model, batch)
 
             loss.backward()
+            # wait for the grad all-reduces launched during backward; grads
+            # must be fully averaged before the optimizer reads them
+            self.ddp.sync()
             self.optimizer.step()
             self.optimizer.zero_grad()
             self.scheduler.step()
-            return loss.detach()
+            loss = loss.detach()
+            if self.dp_size > 1:
+                # dp-averaged loss for readable curves; a scalar all-reduce
+                # is noise next to the step, and the print syncs anyway
+                all_reduce(loss, self.mesh, "dp", "avg")
+            return loss
 
     @debug_time
     def train_n_step_test(self, n_steps: int) -> None:
-        tokens_per_step = self.config["data"]["seq_len"] * self.config["data"]["batch_size"]
+        # global tokens: every dp rank pushes its own batch through per step
+        tokens_per_step = (
+            self.config["data"]["seq_len"] * self.config["data"]["batch_size"] * self.dp_size
+        )
         for step in range(n_steps):
             loss, time = self.train_step()
-            print(f"{step=} || {loss=} || tps={tokens_per_step / time}")
-        print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
+            if self.rank == 0:
+                print(f"{step=} || {loss=} || tps={tokens_per_step / time}")
+        if self.rank == 0:
+            print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
 
     def train(self) -> None:
@@ -242,14 +283,18 @@ class Trainer:
         we currently operate in a step regime, not epoch
         we could switch, but maybe no need
         """
-        tokens_per_step = self.config["data"]["seq_len"] * self.config["data"]["batch_size"]
+        tokens_per_step = (
+            self.config["data"]["seq_len"] * self.config["data"]["batch_size"] * self.dp_size
+        )
         for step in range(self.start_step, self.num_train_steps):
             loss, time = self.train_step()
             if (step + 1) % self.save_steps == 0 and step != 0:
                 self.checkpoint(step + 1)
-            print(f"{step=} || {loss=} || tps={tokens_per_step / time}")
+            if self.rank == 0:
+                print(f"{step=} || {loss=} || tps={tokens_per_step / time}")
 
-        print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
+        if self.rank == 0:
+            print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
 
 if __name__ == "__main__":

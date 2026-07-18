@@ -30,7 +30,10 @@ def debug_time(func):
         t0 = time.perf_counter()
         result = func(*args, **kwargs)
         t1 = time.perf_counter()
-        print(f"{func.__name__} took {t1 - t0} seconds to run")
+        # rank 0 only under torchrun (RANK unset == single process == print):
+        # 8 ranks x one line per step is unreadable
+        if os.environ.get("RANK", "0") == "0":
+            print(f"{func.__name__} took {t1 - t0} seconds to run")
         return result
     return wrapper
 

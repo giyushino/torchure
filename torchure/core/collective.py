@@ -101,13 +101,13 @@ def all_reduce(
     # 2. resolve WHAT: "avg" needs a per-backend decision, everything else is
     #    a straight enum lookup
     if op == "avg" and dist.get_backend(group) != "nccl":
-        # no ReduceOp.AVG here: sum, then divide locally. the divide must
-        # happen after the sum completes, so no async on this path (v0);
-        # revisit with a Work wrapper if a consumer ever needs it.
-        assert not async_op, "async 'avg' unsupported on backends without ReduceOp.AVG"
-        dist.all_reduce(tensor, _OPS["sum"], group=group)
+        # no ReduceOp.AVG here: pre-divide, then sum. dividing before the
+        # reduce gives the same mean (group size is fixed) and, unlike
+        # sum-then-divide, needs no post-wait fixup -- which is what lets
+        # async_op work: ddp grad overlap wants (tensor, work) back from an
+        # "avg" on gloo too (see parallelism/data_parallel.py + its tests).
         tensor /= mesh.size(dim)
-        return tensor
+        op = "sum"
 
     # 3. communicate: the backend runs the actual ring/tree exchange and
     #    mutates `tensor` in place on every rank

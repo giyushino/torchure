@@ -67,7 +67,7 @@ def main() -> None:
         ckpt.save_scheduler(scheduler, step)
         ckpt.save_dataloader(loader, step)
 
-        for name in ("model.pt", "optimizer.pt", "scheduler.pt", "dataloader.pt"):
+        for name in ("model.pt", "optimizer.pt", "scheduler.pt", "dataloader_dp0.pt"):
             path = os.path.join(tmp, "run", str(step), name)
             assert os.path.isfile(path), f"missing {path}"
 

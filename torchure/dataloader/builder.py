@@ -62,7 +62,8 @@ def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int
         split=data_cfg.get("split", "train"),
         streaming=True,
     )
-    print(f"num shards: {dataset.num_shards}")
+    if dp_rank == 0:
+        print(f"num shards: {dataset.num_shards}")
 
     # normalize whatever the source calls its text column to "text" so the
     # collate_fn stays dataset-agnostic. rename_column, NOT a lambda .map:
