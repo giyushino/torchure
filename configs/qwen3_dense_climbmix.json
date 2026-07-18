@@ -10,6 +10,9 @@
       "vocab_size": 151936
     }
   },
+  "mesh": {
+    "dp": 1
+  },
   "optimizer": {
     "name": "adamw",
     "config": {

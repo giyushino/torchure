@@ -9,6 +9,7 @@ class Mesh:
     def __init__(self, spec: dict[str, int]):
         assert dist.is_initialized(), "init_process_group() must be called before building a Mesh"
         self.world_size = dist.get_world_size()
+
         stride_world_size = 1
         for i in spec.values():
             stride_world_size *= i
@@ -101,13 +102,13 @@ class Mesh:
             flat_size *= self.sizes[ax]
         self.sizes[name] = flat_size
 
-    def size(self, dim: str) -> int:        # extent of that axis
+    def size(self, dim: str) -> int:
         return self.sizes[dim]
 
-    def get_group(self, dim: str) -> dist.ProcessGroup:  # MY group along that axis
+    def get_group(self, dim: str) -> dist.ProcessGroup:
         return self.groups[dim]
 
-    def coordinate(self, dim: str) -> int:  # MY index within that group
+    def coordinate(self, dim: str) -> int:
         if dim in self._flat_coords:
             return self._flat_coords[dim]
         return (dist.get_rank() // self.strides[dim]) % self.sizes[dim]

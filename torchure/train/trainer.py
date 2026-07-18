@@ -27,6 +27,7 @@ from tokenizers import Tokenizer
 from torchure.checkpoint.checkpointer import Checkpointer
 from torchure.dataloader.builder import build_dataloader
 from torchure.dataloader.prefetcher import CUDAPrefetcher
+from torchure.core.mesh import Mesh
 from torchure.models.builder import build_model
 from torchure.objectives.builder import build_objective
 from torchure.optimizer.builder import build_optimizer, build_scheduler
@@ -60,6 +61,7 @@ class Trainer:
         self.world_size = world_size
         self.device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(local_rank)  # have the process own this specific GPU
+        self.mesh = Mesh(self.config["mesh"])
         
         self.ignore_index = self.config["objective"]["config"]["ignore_index"]
         self.tokenizer = Tokenizer.from_pretrained(self.config["data"]["tokenizer"])
@@ -72,6 +74,7 @@ class Trainer:
         self.objective = self._build_objective()
         self.optimizer = self._build_optimizer(self.model)
         self.scheduler = self._build_scheduler(self.optimizer)
+        self.num_train_steps = self.config["optimizer"]["scheduler"]["total_steps"]
         # self.resume = self.config["resume_training"]
         # make the dataloader iterable
         self.dataloader = self._build_dataloader()
@@ -147,10 +150,9 @@ class Trainer:
     
     @debug_time
     def _build_dataloader(self) -> torchdata.stateful_dataloader.StatefulDataLoader:
-        # rank/world_size are global for now; swap to the dp mesh coords
-        # once core/mesh.py exists so TP/CP groups share a batch.
         return build_dataloader(
-            self.config["data"], self.tokenizer, self.ignore_index, self.rank, self.world_size
+            self.config["data"], self.tokenizer, self.ignore_index, 
+            self.mesh.coordinate("dp"), self.mesh.size("dp")
         )
     
     @debug_time
@@ -158,7 +160,6 @@ class Trainer:
         # the prefetcher already queued this batch's copy on a side stream last
         # step; this waits for it and kicks off the next one. pin_memory=True on
         # the DataLoader is what makes the async copy actually overlap.
-        # https://docs.pytorch.org/docs/2.12/notes/cuda.html#cuda-memory-pinning
         return next(self.prefetcher)
     
     def get_batch(self) -> dict[str, torch.Tensor]:
@@ -174,9 +175,8 @@ class Trainer:
         self.checkpointer.save_scheduler(self.scheduler, step)
 
     @record_time
-    def train_step_test(self) -> torch.Tensor:
+    def train_step(self) -> torch.Tensor:
             batch = self.get_batch_prefetcher()
-            #print(batch)
             # cast to bf16 so we can take advantage of sdpa
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 loss = self.objective.compute_loss(self.model, batch)
@@ -195,30 +195,17 @@ class Trainer:
             print(f"{step=} || {loss=} || tps={tokens_per_step / time}")
         print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
-    @debug_time
-    def train_step(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        one optimization step. rough shape:
-            move batch to device -> objective.compute_loss(model, batch)
-            -> backward -> optimizer.step -> optimizer.zero_grad
-        return the loss (detached) for logging.
-
-        TODO: implement. grad accumulation / clipping / mixed precision slot
-        in here later.
-        """
-
-        loss = self.objective.compute_loss(self.model, batch)
-        loss.backward()
-        self.optimizer.step()
-        self.optimizer.zero_grad()
-        return loss.detach()
-
     def train(self) -> None:
         """
-        TODO: main loop over self.dataloader for the configured number of
-        steps/epochs, calling self.train_step and logging.
+        we currently operate in a step regime, not epoch
+        we could switch, but maybe no need
         """
-        dist.destroy_process_group()
+        tokens_per_step = self.config["data"]["seq_len"] * self.config["data"]["batch_size"]
+        for step in range(self.num_train_steps):
+            loss, time = self.train_step()
+            print(f"{step=} || {loss=} || tps={tokens_per_step / time}")
+
+        print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
 
 if __name__ == "__main__":
