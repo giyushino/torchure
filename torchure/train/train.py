@@ -26,6 +26,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # set defaults for single gpu python launches,
+    # maybe remove later
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -37,7 +45,7 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     # no rank/world args: env:// rendezvous reads them from torchrun.
     # explicit timeout so a wedged collective fails instead of hanging.
-    dist.init_process_group("nccl", timeout=timedelta(minutes=10))
+    dist.init_process_group(timeout=timedelta(minutes=10))
 
     try:
         trainer = Trainer(args.config, rank=rank, local_rank=local_rank, world_size=world_size)
@@ -45,8 +53,6 @@ def main() -> None:
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
-
-
 
 
 if __name__ == "__main__":
