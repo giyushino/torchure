@@ -19,6 +19,14 @@ class Checkpointer:
     def __init__(self, checkpoint_save_path: str):
         self.checkpoint_save_path = checkpoint_save_path
         os.makedirs(self.checkpoint_save_path, exist_ok=True)
+    
+    def latest(self) -> int | None:
+        steps = [int(d) for d in os.listdir(self.checkpoint_save_path) if d.isdigit()]
+        return max(steps, default=None)
+    
+    def valid_step(self, step: int) -> int | None:
+        steps = [int(d) for d in os.listdir(self.checkpoint_save_path) if d.isdigit()]
+        return step if step in steps else None
 
     def _step_dir(self, step: int, create: bool = False) -> str:
         step_dir = os.path.join(self.checkpoint_save_path, str(step))

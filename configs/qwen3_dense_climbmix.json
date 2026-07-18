@@ -41,7 +41,7 @@
     "split": "train",
     "tokenizer": "Qwen/Qwen3-0.6B",
     "eos_token": "<|endoftext|>",
-    "pad_token": "<|fim_pad|>",
+    "pad_token": "<|im_pad|>",
     "text_field": "text",
     "shuffle_buffer": 1000,
     "seed": 42,
@@ -49,6 +49,10 @@
     "batch_size": 2,
     "seq_len": 4096,
     "pack_batch": 1000
+  },
+  "checkpointing": {
+    "save_steps": 500,
+    "resume": 100
   },
   "run_name": "climbmix_test_run_1"
 }

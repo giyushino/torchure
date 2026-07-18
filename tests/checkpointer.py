@@ -40,7 +40,7 @@ def build_state(seed: int):
 
 
 def train_steps(model, optimizer, scheduler, n: int) -> None:
-    torch.manual_seed(1234)
+    torch.manual_seed(42)
     for _ in range(n):
         model(torch.randn(4, 8)).pow(2).mean().backward()
         optimizer.step()
