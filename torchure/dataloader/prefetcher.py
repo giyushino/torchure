@@ -7,6 +7,9 @@ the host->device copy: by default it runs on the compute stream and blocks the
 next step. CUDAPrefetcher issues that copy on a side stream so it overlaps the
 previous step's kernels, and only makes the compute stream wait right before it
 needs the batch.
+
+there's a problem with how we save/load for checkpoining, will skip one batch
+if we naively resume with N + 1
 """
 
 import torch
