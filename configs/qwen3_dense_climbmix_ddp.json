@@ -11,7 +11,7 @@
     }
   },
   "mesh": {
-    "dp": 8
+    "dp": 4
   },
   "optimizer": {
     "name": "adamw",
@@ -46,7 +46,7 @@
     "shuffle_buffer": 1000,
     "seed": 42,
     "num_workers": 4,
-    "batch_size": 2,
+    "batch_size": 8,
     "seq_len": 4096,
     "pack_batch": 1000
   },
