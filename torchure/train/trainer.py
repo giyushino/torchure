@@ -150,6 +150,9 @@ class Trainer:
         # to have init_weight as a function 
         model.to(self.device)
         model.init_weights()
+        for module in model.modules():
+            if isinstance(module, nn.RMSNorm) and module.weight is not None:
+                module.weight.data = module.weight.data.to(torch.bfloat16)
 
     def _build_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
         optim_cfg = self.config["optimizer"]

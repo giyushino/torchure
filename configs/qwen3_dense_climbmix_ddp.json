@@ -11,7 +11,7 @@
     }
   },
   "mesh": {
-    "dp": 8
+    "dp": 2
   },
   "optimizer": {
     "name": "adamw",
