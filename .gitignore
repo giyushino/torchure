@@ -219,3 +219,4 @@ __marimo__/
 
 # Custom project ignores
 *.pyc
+*.pt
