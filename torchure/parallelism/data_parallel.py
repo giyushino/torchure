@@ -51,19 +51,22 @@ class DDP:
 
         self.bucket_mb = bucket_mb
         self.overlap = overlap
+        self._replicate(model)
 
     def _replicate(self, model: nn.Module):
         for tensor in [*model.parameters(), *model.buffers()]:
             broadcast(tensor.detach(), self.mesh, self.dim, src=0)
 
-    def sync(self, model: nn.Module):
+    def sync(self):
         if self.group_size == 1:
             return
 
-        for tensor in [*model.parameters(), *model.buffers()]:
-            all_reduce(tensor.grad, self.mesh, self.dim, op="avg")
+        for param in self.model.parameters():
+            if param.requires_grad:
+                all_reduce(param.grad, self.mesh, self.dim, "avg")
 
 
 
-if __name__ == "__main__":R
+
+if __name__ == "__main__":
     print("1")
