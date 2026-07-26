@@ -18,10 +18,9 @@ box is the whole ballgame):
   all-reduced in place via its `.grad` directly: no buffer, no copy. this is
   the tied-embedding grad (622MB fp32 at qwen3-0.6B), where a staging copy
   would cost real time and transient memory.
-- `sync()` (call between backward and optimizer.step) waits on all handles;
-  with overlap=False it instead launches every bucket back-to-back there --
-  the roadmap 1.1 correctness baseline, kept as the ablation knob for
-  measuring what overlap buys.
+- `sync()` (call between backward and optimizer.step) waits on all handles.
+  there is no non-overlap mode: launching from hooks is the only thing that
+  makes grad sync affordable on this box, so it is not a knob.
 
 zero_grad interplay: the trainer's `optimizer.zero_grad()` (set_to_none=True)
 drops the buffer views, so each backward the engine allocates fresh grads and
@@ -38,21 +37,83 @@ import torch
 import torch.nn as nn
 
 from torchure.core.collective import MeshLike, all_reduce, broadcast
-from torchure.core.mesh import Mesh
+
+
+class _Bucket:
+    def __init__(self, params: list[nn.Parameter]):
+        self.params = params
+        self.pending = len(params)
+        self.flat = None
+        self.views = None
+        if len(params) > 1:
+            numel = sum(p.numel() for p in params)
+            self.flat = torch.empty(numel, dtype=params[0].dtype, device=params[0].device)
+            self.views = []
+            offset = 0
+            for p in params:
+                self.views.append(self.flat[offset: offset + p.numel()].view_as(p))
+                offset += p.numel()
+
 
 class DDP:
-    def __init__(self, model: nn.Module, mesh: Mesh, dim="dp", bucket_mb=25, overlap=True):
-        self.model = model
+    def __init__(self, model: nn.Module, mesh: MeshLike, dim="dp", bucket_mb=25):
         self.mesh = mesh
         self.dim = dim
         self.group_size = mesh.size(dim)
+        self._works = []
+
         if self.group_size == 1:
             return
 
-        self.bucket_mb = bucket_mb
-        self.overlap = overlap
         self._replicate(model)
+        params = [param for param in model.parameters() if param.requires_grad]
+        params.reverse()
+        # 1024 * 1024 is the number of bytes in mb
+        self._buckets = self._build_buckets(params, int(bucket_mb * 1024 * 1024))
+        self._bucket_of = {p: b for b in self._buckets for p in b.params}
+        for param in params:
+            param.register_post_accumulate_grad_hook(self._on_grad_ready)
 
+    def _build_buckets(self, params: list[nn.Parameter], max_bucket_bytes: int) -> list[_Bucket]:
+        """
+        params should already be revesed when passed into this function
+        """
+        buckets = []
+        run = []
+        run_bytes = 0
+
+        for param in params:
+            n_bytes = param.numel() * param.element_size()
+            if run and (run_bytes + n_bytes > max_bucket_bytes or param.dtype != run[0].dtype):
+                buckets.append(_Bucket(run))
+                run = []
+                run_bytes = 0
+            run.append(param) 
+            run_bytes += n_bytes
+
+        if run:
+            buckets.append(_Bucket(run))
+      
+        return buckets
+
+    def _on_grad_ready(self, param: nn.Parameter) -> None:
+        bucket = self._bucket_of[param]
+        bucket.pending -= 1
+        if bucket.pending == 0:
+            self._launch(bucket)
+
+    def _launch(self, bucket: _Bucket) -> None:
+        bucket.pending = len(bucket.params)
+        if bucket.flat is None:
+            grad = bucket.params[0].grad
+        else:
+            torch._foreach_copy_(bucket.views, [param.grad for param in bucket.params])
+            for param, view in zip(bucket.params, bucket.views, strict=True):
+                param.grad = view
+            grad = bucket.flat
+        _, work = all_reduce(grad, self.mesh, self.dim, "avg", async_op=True)
+        self._works.append(work)
+         
     def _replicate(self, model: nn.Module):
         for tensor in [*model.parameters(), *model.buffers()]:
             broadcast(tensor.detach(), self.mesh, self.dim, src=0)
@@ -60,11 +121,14 @@ class DDP:
     def sync(self):
         if self.group_size == 1:
             return
-
-        for param in self.model.parameters():
-            if param.requires_grad:
-                all_reduce(param.grad, self.mesh, self.dim, "avg")
-
+        assert len(self._works) == len(self._buckets), (
+            f"only {len(self._works)}/{len(self._buckets)} grad buckets launched -- "
+            "a param got no grad this backward (frozen params / grad "
+            "accumulation need no_sync semantics, not built yet)"
+        )
+        for work in self._works:
+            work.wait()
+        self._works.clear()            
 
 
 

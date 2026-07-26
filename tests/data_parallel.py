@@ -75,9 +75,9 @@ def test_replicate(mesh, dim):
         torch.testing.assert_close(p, p_ref, rtol=0, atol=0, msg=f"param {name} not replicated")
 
 
-def test_grad_parity(mesh, dim, overlap: bool, bucket_mb: float):
+def test_grad_parity(mesh, dim, bucket_mb: float):
     model = build_model(seed=dist.get_rank())
-    ddp = DDP(model, mesh, dim, bucket_mb=bucket_mb, overlap=overlap)
+    ddp = DDP(model, mesh, dim, bucket_mb=bucket_mb)
 
     reference = build_model(seed=0)
     batch = global_batch(mesh.size(dim))
@@ -101,13 +101,11 @@ def test_grad_parity(mesh, dim, overlap: bool, bucket_mb: float):
 TESTS = [
     ("test_replicate", test_replicate),
     # 25MB cap: the whole tiny model lands in ONE flat bucket
-    ("test_parity_one_bucket", partial(test_grad_parity, overlap=True, bucket_mb=25)),
+    ("test_parity_one_bucket", partial(test_grad_parity, bucket_mb=25)),
     # 8KB cap: many flat buckets + the embedding goes single-param/in-place
-    ("test_parity_many_buckets", partial(test_grad_parity, overlap=True, bucket_mb=0.008)),
+    ("test_parity_many_buckets", partial(test_grad_parity, bucket_mb=0.008)),
     # 0 cap: every param is "oversized" -> all in-place, no flat buffers
-    ("test_parity_inplace", partial(test_grad_parity, overlap=True, bucket_mb=0.0)),
-    # the roadmap 1.1 correctness baseline / overlap ablation path
-    ("test_parity_no_overlap", partial(test_grad_parity, overlap=False, bucket_mb=0.008)),
+    ("test_parity_inplace", partial(test_grad_parity, bucket_mb=0.0)),
 ]
 
 

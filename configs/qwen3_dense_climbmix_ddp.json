@@ -51,8 +51,7 @@
     "pack_batch": 1000
   },
   "ddp": {
-    "bucket_mb": 25,
-    "overlap": true
+    "bucket_mb": 25
   },
   "checkpointing": {
     "save_steps": 10000,

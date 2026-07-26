@@ -115,7 +115,6 @@ class Trainer:
             self.mesh,
             dim="dp",
             bucket_mb=ddp_cfg.get("bucket_mb", 25),
-            overlap=ddp_cfg.get("overlap", True),
         )
         return model
 
