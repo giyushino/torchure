@@ -33,6 +33,12 @@ def main() -> None:
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("LOCAL_RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
+    # nccl's default p2p policy stops at the host bridge, which on the a40
+    # box turns every cross-pair ring hop into 1.3 GB/s SHM staging; p2p is
+    # actually fine there at any distance (26 GB/s intra-numa, 13 cross), and
+    # allowing it is worth 8.4x on all_reduce bus bandwidth (see DDP.md).
+    # setdefault, so a box where distant p2p really is broken can override.
+    os.environ.setdefault("NCCL_P2P_LEVEL", "SYS")
 
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))

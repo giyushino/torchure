@@ -56,8 +56,10 @@ class Checkpointer:
     def save_scheduler(self, scheduler: torch.optim.lr_scheduler.LRScheduler, step: int) -> None:
         self._save(scheduler, step, "scheduler.pt")
 
-    def save_dataloader(self, dataloader, step: int) -> None:
-        self._save(dataloader, step, "dataloader.pt")
+    def save_dataloader(self, dataloader, step: int, dp_rank: int = 0) -> None:
+        # per-dp-shard state: each dp rank streams a different slice of the
+        # dataset, so each writes (and later loads) its own file
+        self._save(dataloader, step, f"dataloader_dp{dp_rank}.pt")
 
     def save_trainer(self, state: dict, step: int) -> None:
         # trainer state is already a plain dict (step, rng states, config
@@ -76,8 +78,10 @@ class Checkpointer:
     def load_scheduler(self, scheduler: torch.optim.lr_scheduler.LRScheduler, step: int) -> None:
         scheduler.load_state_dict(self._load(step, "scheduler.pt"))
 
-    def load_dataloader(self, dataloader, step: int) -> None:
+    def load_dataloader(self, dataloader, step: int, dp_rank: int = 0) -> None:
         # dataloader state carries arbitrary python from the hf dataset /
         # worker states, which weights_only rejects; we wrote this file
         # ourselves so full unpickling is fine.
-        dataloader.load_state_dict(self._load(step, "dataloader.pt", weights_only=False))
+        dataloader.load_state_dict(
+            self._load(step, f"dataloader_dp{dp_rank}.pt", weights_only=False)
+        )
