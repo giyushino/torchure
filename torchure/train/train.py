@@ -5,6 +5,9 @@ single gpu training entrypoint
 
 once distributed this is what you'd launch under torchrun; the Trainer
 already carries rank/world_size so the launcher just fills them in.
+
+multi gpu training entrypoint
+    uv torchrun --standalone --nproc_per_node=8 train.py --config configs/qwen_dense_climbmix_ddp.json
 """
 
 import argparse
