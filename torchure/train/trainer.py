@@ -146,12 +146,18 @@ class Trainer:
         # we won't have any weights
         # model.to_empty(device=self.device)
         # maybe we should make an ABC and require models
-        # to have init_weight as a function 
+        # to have init_weight as a function
         model.to(self.device)
         model.init_weights()
-        for module in model.modules():
-            if isinstance(module, nn.RMSNorm) and module.weight is not None:
-                module.weight.data = module.weight.data.to(torch.bfloat16)
+        # norm weights stay fp32 ON PURPOSE. they used to be cast to bf16 here
+        # to kill the "bf16 input vs fp32 weight" mismatch warning, but that
+        # made them bf16 *parameters*, so AdamW updated them in bf16: bf16
+        # spacing at 1.0 is 2^-8 ~ 0.0039 while a step's update is ~lr = 3e-4,
+        # so every update rounded back to the same value and the gains sat
+        # frozen at their init for the whole run -- silently, since the loss
+        # curve only degrades slightly. the mismatch is handled the right way
+        # instead: _compile covers the blocks and the final norm, and compile
+        # generates a fused kernel that takes the fp32 weight directly.
 
     def _build_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
         optim_cfg = self.config["optimizer"]
@@ -298,10 +304,8 @@ class Trainer:
         if self.rank == 0:
             print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
-
-if __name__ == "__main__":
-    test = Trainer(f"{PROJECT_DIR}/configs/qwen3_dense_climbmix.json", 0, 0, 1)
-    loss = test.train_n_step_test(1000)
-    print(f"{loss=}")
-     
+# no __main__ here on purpose: a Trainer can't be built without a process group
+# (Mesh asserts on it), so launching this file directly always crashed. the one
+# entrypoint is torchure/train/train.py, which does the rendezvous first --
+# including for the single-gpu benchmark path (--steps).
 
