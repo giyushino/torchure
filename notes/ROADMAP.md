@@ -35,28 +35,50 @@ these already shaped the code; write them down so future phases don't drift:
 6. **minimal deps.** no framework imports (megatron, deepspeed, accelerate,
    liger). optional integrations (wandb, torchao fp8) stay optional.
 
-## current state (2026-07)
+## current state (2026-07-27)
+
+phases 0 and 1.2 are done: distributed foundations + overlapped DDP. fsdp2 and
+everything after it is still ahead.
 
 | area | state |
 |------|-------|
-| `core/collective.py` | signatures + contracts done, bodies `NotImplementedError`; tests written (`tests/collective.py`) |
-| `core/mesh.py`, `core/dtensor.py`, `core/placement.py` | empty stubs |
-| `parallelism/{data_parallel,fsdp2,context_parallel,expert_parallel}.py` | empty stubs |
-| models | qwen3 dense (0.6B validated, per-block compile, ~13k tps on A40); llama3 stubbed |
-| trainer | single-gpu; lifecycle already split build → parallelize → init → optimizer → data so distributed slots in without reordering |
-| checkpointing | naive `torch.save`, has path bugs (`os.mkdir` on the `.pt` file path), no resume path wired |
-| objectives | AR CE only; fused-linear-CE **described as adopted in CHANGES.md round 2 but the implementation (`torchure/loss/fused_linear_ce.py` + `ARObjective` wiring) is not in the tree** — only `tests/fused_linear_ce.py` exists. re-land or re-do it (item P-1) |
-| dataloader | streaming HF + packing + stateful + CUDA prefetcher; takes global rank/world_size (needs mesh coords later); packing allows cross-document attention (no doc mask) |
+| `core/collective.py` | **done.** all 7 ops implemented against the documented contracts; 12 tests green on gloo (`tests/collective.py --world-size 4`, in ci). nccl sweep still owed |
+| `core/mesh.py` | **done.** named axes over the flat rank space: per-axis groups, strides, coordinates, `flatten()` for virtual axes (dataloader's dp coord). `dtensor.py` / `placement.py` not started — fsdp2 decides their shape |
+| `parallelism/data_parallel.py` | **done (phase 1.2).** bucketed grad all-reduce launched from `register_post_accumulate_grad_hook`, overlapped with backward; flat-buffer buckets with `.grad` repointed at views, oversized params (the tied embedding) reduced in place; dp=1 is a total no-op. grad parity tested on gloo (`tests/data_parallel.py`) |
+| `parallelism/{fsdp2,context_parallel,expert_parallel}.py` | empty stubs — next up |
+| models | qwen3 dense (0.6B validated, per-block compile, ~13k tps on A40, 73.5k global on 8x A40); llama3 stubbed |
+| trainer | single-gpu and dp through the same path (world_size=1 is not a special case). lifecycle build → parallelize → init → optimizer → data, so sharded init slots in without reordering. no grad clipping, no grad accumulation, no eval loop, no metrics logger yet |
+| checkpointing | per-step dirs, `resume: null \| "auto" \| <step>`, full state (model/optimizer/scheduler/dataloader/rng/config). dp-aware: rank 0 writes replicas, every dp rank writes its own dataloader file, barrier-fenced, refuses to resume across a mesh change. still unsharded (phase 3) and still missing a done marker |
+| objectives | AR CE, with the chunked fused-linear-CE landed and wired into `ARObjective` (default on). backward scales the stashed grads in place — see DEV_LOG 7/27 |
+| dataloader | streaming HF + packing (stream + best-fit-decreasing) + stateful + CUDA prefetcher; splits by the mesh's dp coordinate. packing allows cross-document attention (no doc mask); prefetcher skips one batch on resume |
+
+### known correctness debt
+
+- **prefetcher one-batch skip on resume** — the prefetcher pulls batch N+1
+  before `checkpoint()` snapshots the dataloader, so the saved position is one
+  batch ahead of what was consumed. data loss only, but "exact resume" isn't.
+- **no checkpoint done marker** — `latest()` trusts any numeric dir, including
+  a half-written one from a crash, which is the exact case `resume: "auto"`
+  exists for.
+- **rank 0's rng lands on every rank at resume** — harmless while nothing
+  samples per step, load-bearing the moment dropout or masked diffusion does
+  (needs the per-rank seed derivation in 0.3). nothing seeds torch at trainer
+  start either, so runs aren't reproducible.
+- **`tests/data_parallel.py` isn't in ci** despite being gloo/cpu and being the
+  single most valuable test in the tree.
+- fixed 7/27: norm weights were bf16 *parameters*, so AdamW's updates rounded
+  to nothing and the gains never moved. see DEV_LOG — the CHANGES.md numbers
+  were all measured with them frozen and want a re-run.
 
 ---
 
 # part 1 — parallelism
 
-## phase 0: distributed foundations
+## phase 0: distributed foundations — DONE (except the nccl sweep + 0.3 seeding)
 
 everything else stacks on this. smallest phase, highest leverage.
 
-**0.1 implement `core/collective.py`.** the contracts and tests exist; make
+**0.1 implement `core/collective.py`.** ✅ all 7 ops green on gloo, in ci. the contracts and tests exist; make
 them green. order of implementation: `all_reduce` → `broadcast` → `all_gather`
 → `reduce_scatter` (verify the fsdp identity test) → `all_to_all` →
 `ring_send_recv` → `barrier`. gloo/cpu via `uv run tests/collective.py
@@ -64,7 +86,8 @@ them green. order of implementation: `all_reduce` → `broadcast` → `all_gathe
 already documented in the docstrings (coordinate vs global rank, gloo has no
 `ReduceOp.AVG`, p2p deadlock without `batch_isend_irecv`).
 
-**0.2 `core/mesh.py`.** `init_mesh({"pp": 1, "dp_replicate": 1, "dp_shard": 2,
+**0.2 `core/mesh.py`.** ✅ built as `Mesh(spec)`, including `flatten()`.
+`init_mesh({"pp": 1, "dp_replicate": 1, "dp_shard": 2,
 "cp": 1, "tp": 2, "ep": 1})`-style constructor satisfying `MeshLike`.
 decisions:
 - **rank layout**: row-major with the *last* dim fastest-varying, and the
@@ -80,7 +103,9 @@ decisions:
   equivalent coords helper from day one — retrofitting this is painful.
 - size-1 dims must be free (no groups, collectives become no-ops or asserts).
 
-**0.3 trainer bootstrap.** torchrun entrypoint: read
+**0.3 trainer bootstrap.** ✅ except **per-dim seed derivation**, which is
+still owed (nothing seeds torch at trainer start, and resume restores rank 0's
+rng onto every rank). torchrun entrypoint: read
 `RANK/LOCAL_RANK/WORLD_SIZE` from env, `init_process_group` with an explicit
 timeout, `destroy_process_group` on exit, single-gpu path unchanged when
 `WORLD_SIZE` is absent. rank-0-only logging helper, per-dim seed derivation
@@ -92,18 +117,24 @@ of globals (the trainer TODO already notes this).
 nccl (2 gpus), including `test_subgroup_isolation` against the real mesh.
 trainer still hits ~13k tps single-gpu.
 
-## phase 1: data parallel (DDP)
+## phase 1: data parallel (DDP) — 1.1/1.2 DONE, 1.3 not started
 
 simplest parallelism, and it exercises the whole stack (mesh, seeding, data
 sharding, logging) with only one collective.
 
-**1.1 `parallelism/data_parallel.py` v0 — correctness.** replicate the model
+full work log + measurements in `notes/DDP.md`. 1.1 was skipped as a shipping
+mode and folded into 1.2 (grad sync on a pcie-only box is the whole ballgame,
+so overlap wasn't deferrable); the non-overlap path existed only as an
+ablation and was removed before merge — **there is no `overlap` config knob**,
+whatever DDP.md's prose says.
+
+**1.1 `parallelism/data_parallel.py` v0 — correctness.** ✅ replicate the model
 (broadcast params from dp-rank 0 after init so ranks agree even if RNG
 drifts); after `loss.backward()`, `all_reduce(grad, mesh, "dp", "avg")` per
 param (or one flattened buffer). loss logging averaged over dp for readable
 curves.
 
-**1.2 v1 — overlap.** bucketed gradient sync using
+**1.2 v1 — overlap.** ✅ bucketed gradient sync using
 `register_post_accumulate_grad_hook` + `async_op=True`: fill ~25MB buckets in
 reverse-parameter order, launch the all-reduce when a bucket fills, wait on
 all works before `optimizer.step()`. this is where the async `(tensor, work)`
@@ -120,6 +151,11 @@ distributed version, and it's 5 lines now vs a refactor later.
 trajectory on identical data order (this forces the dataloader sharding to be
 right); (b) scaling: tps table for 1/2/4 gpus in CHANGES.md; (c) profiler
 trace showing grad all-reduce overlapped with backward.
+
+**status:** (a) ✅ grad parity on gloo, all bucket shapes, tied embedding
+exercised. (b) ✅ 1/2/4/8 A40 table in DDP.md — 73.5k global at 8 gpus, 69%
+eff. (c) partial — quantified by ablation (+11.4% from launching inside
+backward) instead of a trace; the trace is still owed.
 
 ## phase 2: DTensor + FSDP2
 

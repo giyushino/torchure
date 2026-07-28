@@ -1,5 +1,12 @@
 # DDP — work log
 
+> **stale (as of 7/27):** this note describes an `overlap` config knob and an
+> `overlap=False` mode of `sync()`. that mode existed only as the correctness
+> baseline / ablation and was **removed before merge** — `DDP.__init__` takes
+> `(model, mesh, dim, bucket_mb)` and there is no non-overlap path. the `+11.4%`
+> ablation number below was real when measured; the knob it used is gone. left
+> as-is otherwise, it's a work log.
+
 goal: get data parallel training up and running (roadmap phase 1), tested with
 
 ```
