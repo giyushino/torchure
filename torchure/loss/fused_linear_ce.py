@@ -12,9 +12,9 @@ how: flatten to N = B*S rows and process them in chunks. per chunk:
     loss   = logsumexp - target logit   (fp32)
     and, because d(loss_sum)/d(logits) = softmax - onehot is known in closed
     form, compute grad_hidden and grad_W *in the forward pass* and stash them.
-backward then just scales the stashed grads by grad_output / n_valid. nothing
-logits-sized ever exists for more than one chunk at a time, and autograd never
-stores logits.
+backward then just scales the stashed grads by grad_output / n_valid, in place,
+and hands the same buffers straight out. nothing logits-sized ever exists for
+more than one chunk at a time, and autograd never stores logits.
 
 cost: 3 chunk GEMMs (logits, grad_h, grad_W) vs 3 for the unfused path
 (logits fwd, grad_h, grad_W bwd) -- so compute is the same; we save the full
@@ -83,16 +83,44 @@ class _FusedLinearCE(torch.autograd.Function):
 
         # mean over non-ignored tokens, matching F.cross_entropy(reduction="mean")
         n_valid = (labels != ignore_index).sum().clamp_min(1)
-        ctx.save_for_backward(grad_hidden, grad_weight, n_valid)
+        # stashed as plain ctx attributes rather than save_for_backward: these
+        # are forward *intermediates* (neither inputs nor outputs of this
+        # Function), so there is no version-counter contract to honor -- which
+        # is what lets backward scale them in place and drop them eagerly.
+        ctx.n_valid = n_valid
+        ctx.grad_hidden = grad_hidden
+        ctx.grad_weight = grad_weight
         return loss_sum / n_valid
 
     @staticmethod
     def backward(ctx, grad_out):
-        grad_hidden, grad_weight, n_valid = ctx.saved_tensors
-        scale = grad_out / n_valid
-        gh = grad_hidden * scale.to(grad_hidden.dtype)
-        gw = grad_weight * scale if grad_weight is not None else None
-        return gh, gw, None, None, None
+        if ctx.n_valid is None:
+            # the buffers are scaled in place and released below, so there is
+            # nothing left to differentiate a second time. save_for_backward
+            # would have raised this for us; since we stash on ctx, say it
+            # ourselves rather than dying on a NoneType further down.
+            raise RuntimeError(
+                "fused_linear_cross_entropy: backward called twice. the stashed "
+                "grads are consumed in place on the first call, so retain_graph "
+                "does not work through this op"
+            )
+        grad_hidden, grad_weight = ctx.grad_hidden, ctx.grad_weight
+        scale = grad_out / ctx.n_valid
+        # drop ctx's references first: once the returned tensors are consumed by
+        # the engine, nothing else holds these buffers and the allocator can
+        # reuse them immediately instead of at graph teardown.
+        ctx.grad_hidden = ctx.grad_weight = ctx.n_valid = None
+
+        # in place, both of them. the buffers were built in forward for this one
+        # backward and nobody else aliases them, so `out = buf * scale` would
+        # just allocate a second copy of each. that matters here: grad_weight is
+        # a full fp32 (V, D) -- 594 MiB at qwen3-0.6B's 151936 vocab -- so the
+        # out-of-place version doubles it at exactly the moment the rest of
+        # backward's grads are also live.
+        grad_hidden.mul_(scale.to(grad_hidden.dtype))
+        if grad_weight is not None:
+            grad_weight.mul_(scale)
+        return grad_hidden, grad_weight, None, None, None
 
 
 def fused_linear_cross_entropy(
