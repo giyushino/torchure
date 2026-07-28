@@ -35,6 +35,10 @@ uv run torchrun --nproc-per-node 8 -m torchure.train.train \
 
 # benchmark mode: N steps, no checkpointing, prints tps + peak mem
 uv run -m torchure.train.train --config configs/qwen3_dense_climbmix.json --steps 20
+
+uv run torchrun --nproc-per-node 8 -m torchure.train.train \
+    --config configs/qwen3_dense_climbmix_ddp.json --steps 20
+
 ```
 
 ## tests
@@ -62,7 +66,7 @@ global tps (tokens through the whole job per second), same per-gpu config:
 | hardware | tps | scaling eff |
 |----------|-----|-------------|
 | 8x A40 | ~73.5k | 69% |
-| 4x H100 (PCIe) | ~198k | — |
+| 4x H100 (PCIe) | ~198k | 92% |
 
 on a pcie-only box grad sync is the whole ballgame; `notes/DDP.md` has the
 `NCCL_P2P_LEVEL` investigation that took 8x A40 from 17% to 69% scaling.
