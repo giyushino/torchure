@@ -21,14 +21,28 @@ box is the whole ballgame):
 - `sync()` (call between backward and optimizer.step) waits on all handles.
   there is no non-overlap mode: launching from hooks is the only thing that
   makes grad sync affordable on this box, so it is not a knob.
+- `requires_sync` is the no_sync switch for grad accumulation (roadmap 1.3).
+  set it False for the first K-1 microbatches: the hook returns immediately,
+  without decrementing any bucket counter, so nothing is launched over a
+  partially accumulated grad and no bucket is re-armed mid-step. set it True
+  for the last microbatch, whose hooks fire over the fully accumulated grads
+  and launch the all-reduces exactly once per step. it is a plain attribute
+  rather than a context manager because the trainer's loop is the only caller
+  and the last microbatch has to sit outside any such scope anyway.
 
 zero_grad interplay: the trainer's `optimizer.zero_grad()` (set_to_none=True)
 drops the buffer views, so each backward the engine allocates fresh grads and
 the hook copies them in. set_to_none=False also works (the engine then
-accumulates straight into the views and the copy degenerates to a no-op);
-what does NOT work is multiple backwards per sync -- grad accumulation needs
-no_sync semantics (roadmap 1.3), not built yet, and sync() asserts loudly if
-a bucket never filled.
+accumulates straight into the views and the copy degenerates to a no-op).
+multiple backwards per sync is exactly the accumulation case above and needs
+`requires_sync` handled correctly -- sync() asserts loudly if a bucket never
+filled, which is what catches getting it wrong.
+
+grad clipping is deliberately NOT here: it is a per-step function over params,
+not a lifecycle hook on the model, and FSDP2/TP need the same one. it lives in
+`core/grad_helper.py` and runs after sync() (before it, the flat buffers still
+hold un-reduced local grads); it writes through the `.grad` views, which is
+what the optimizer then reads.
 
 one DDP instance per model: hooks are registered once and never removed.
 """
@@ -127,8 +141,9 @@ class DDP:
             return
         assert len(self._works) == len(self._buckets), (
             f"only {len(self._works)}/{len(self._buckets)} grad buckets launched -- "
-            "a param got no grad this backward (frozen params / grad "
-            "accumulation need no_sync semantics, not built yet)"
+            "either a param got no grad this backward (frozen param), or "
+            "requires_sync was still False on the last microbatch of an "
+            "accumulation step (it must be True for exactly the last one)"
         )
         for work in self._works:
             work.wait()
