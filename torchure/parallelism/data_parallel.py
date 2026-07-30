@@ -61,6 +61,7 @@ class DDP:
         self.dim = dim
         self.group_size = mesh.size(dim)
         self._works = []
+        self.requires_sync = True
 
         if self.group_size == 1:
             return
@@ -97,6 +98,9 @@ class DDP:
         return buckets
 
     def _on_grad_ready(self, param: nn.Parameter) -> None:
+        if not self.requires_sync:
+            return
+
         bucket = self._bucket_of[param]
         bucket.pending -= 1
         if bucket.pending == 0:
@@ -118,7 +122,7 @@ class DDP:
         for tensor in [*model.parameters(), *model.buffers()]:
             broadcast(tensor.detach(), self.mesh, self.dim, src=0)
 
-    def sync(self):
+    def sync(self) -> None:
         if self.group_size == 1:
             return
         assert len(self._works) == len(self._buckets), (
@@ -128,8 +132,7 @@ class DDP:
         )
         for work in self._works:
             work.wait()
-        self._works.clear()            
-
+        self._works.clear()
 
 
 if __name__ == "__main__":

@@ -78,6 +78,31 @@ class Trainer:
         self.num_train_steps = self.config["optimizer"]["scheduler"]["total_steps"]
 
         self.dataloader = self._build_dataloader()
+        # batch sizes are in SEQUENCES (tokens = x seq_len). global_batch_size
+        # is the training hyperparameter -- sequences per optimizer step across
+        # the whole job, invariant to how that job is split. micro_batch_size
+        # is the mechanical per-rank-per-backward split. the accumulation count
+        # is *derived* from the two, never configured, so changing dp_size or
+        # the microbatch can't silently change what's being trained.
+        #
+        # named microbatches_per_step, not grad_accum_steps: "step" means
+        # optimizer step everywhere else here (total_steps, save_steps,
+        # start_step, and the checkpoint dir convention), so this reads as the
+        # ratio it is instead of overloading the word.
+        self.global_batch_size = self.config["data"]["global_batch_size"]
+        self.micro_batch_size = self.config["data"]["micro_batch_size"]
+        # one backward consumes micro_batch_size seqs on each of the dp ranks
+        # simultaneously. identical on every rank (config + mesh only, no
+        # rank-local state), which is what keeps the collective count per step
+        # in lockstep across ranks.
+        seqs_per_backward = self.micro_batch_size * self.dp_size
+        assert self.global_batch_size % seqs_per_backward == 0, (
+            f"global_batch_size {self.global_batch_size} must be divisible by "
+            f"micro_batch_size {self.micro_batch_size} x dp {self.dp_size} "
+            f"= {seqs_per_backward}"
+        )
+        self.microbatches_per_step = self.global_batch_size // seqs_per_backward
+
 
         self.checkpointer_path = f"{PROJECT_DIR}/checkpoints/{self.config['run_name']}"
         self.checkpointer = Checkpointer(self.checkpointer_path)
@@ -251,33 +276,49 @@ class Trainer:
         return state["step"]
     
 
+    def micro_train_step(self) -> torch.Tensor:
+        batch = self.get_batch_prefetcher()
+        # cast to bf16 so we can take advantage of sdpa
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            # backward() SUMS grads across microbatches, so each must
+            # contribute 1/microbatches_per_step of the global-batch mean. the
+            # objective already divided by its own valid-token count; this
+            # divisor is only about the accumulation axis.
+            loss = self.objective.compute_loss(self.model, batch) / self.microbatches_per_step
+
+        loss.backward()
+        return loss.detach()
+
     @record_time
     def train_step(self) -> torch.Tensor:
-            batch = self.get_batch_prefetcher()
-            # cast to bf16 so we can take advantage of sdpa
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss = self.objective.compute_loss(self.model, batch)
+        loss = torch.zeros((), device=self.device)
+        self.ddp.requires_sync = False
+        for _ in range(self.microbatches_per_step - 1):
+            loss += self.micro_train_step()
 
-            loss.backward()
-            # wait for the grad all-reduces launched during backward; grads
-            # must be fully averaged before the optimizer reads them
-            self.ddp.sync()
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            self.scheduler.step()
-            loss = loss.detach()
-            if self.dp_size > 1:
-                # dp-averaged loss for readable curves; a scalar all-reduce
-                # is noise next to the step, and the print syncs anyway
-                all_reduce(loss, self.mesh, "dp", "avg")
-            return loss
+        # the last microbatch is the one whose hooks launch the bucket
+        # all-reduces, over the fully accumulated grads
+        self.ddp.requires_sync = True
+        loss += self.micro_train_step()
+        # wait for the grad all-reduces launched during backward; grads
+        # must be fully averaged before the optimizer reads them
+        self.ddp.sync()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        self.scheduler.step()
+        # loss is already detached: micro_train_step returns loss.detach() and
+        # the accumulator starts as a plain zeros(), so nothing here carries grad
+        if self.dp_size > 1:
+            # dp-averaged loss for readable curves; a scalar all-reduce
+            # is noise next to the step, and the print syncs anyway
+            all_reduce(loss, self.mesh, "dp", "avg")
+        return loss
 
     @debug_time
     def train_n_step_test(self, n_steps: int) -> None:
-        # global tokens: every dp rank pushes its own batch through per step
-        tokens_per_step = (
-            self.config["data"]["seq_len"] * self.config["data"]["batch_size"] * self.dp_size
-        )
+        # global_batch_size already spans every dp rank (and, once roadmap 1.3
+        # lands, every accumulated microbatch), so tokens/step is just it x seq
+        tokens_per_step = self.config["data"]["seq_len"] * self.global_batch_size
         for step in range(n_steps):
             loss, time = self.train_step()
             if self.rank == 0:
@@ -291,9 +332,7 @@ class Trainer:
         we currently operate in a step regime, not epoch
         we could switch, but maybe no need
         """
-        tokens_per_step = (
-            self.config["data"]["seq_len"] * self.config["data"]["batch_size"] * self.dp_size
-        )
+        tokens_per_step = self.config["data"]["seq_len"] * self.global_batch_size
         for step in range(self.start_step, self.num_train_steps):
             loss, time = self.train_step()
             if (step + 1) % self.save_steps == 0 and step != 0:

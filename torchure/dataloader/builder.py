@@ -96,10 +96,16 @@ def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int
         remove_columns=dataset.column_names,
     )
 
+    # the loader only ever sees the MICRO batch: one iteration == one
+    # forward/backward, which is also what torch's own DataLoader(batch_size=)
+    # means. how many microbatches make up an optimizer step (grad
+    # accumulation) is entirely the trainer's business -- it derives that from
+    # global_batch_size and validates divisibility against dp_size, so nothing
+    # here needs to know the global batch exists.
     #return torch.utils.data.DataLoader(
     return StatefulDataLoader(
         dataset,
-        batch_size=data_cfg["batch_size"],
+        batch_size=data_cfg["micro_batch_size"],
         num_workers=data_cfg["num_workers"],
         collate_fn=Collator(tokenizer, ignore_id),
         persistent_workers=True,

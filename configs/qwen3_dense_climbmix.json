@@ -46,7 +46,8 @@
     "shuffle_buffer": 1000,
     "seed": 42,
     "num_workers": 4,
-    "batch_size": 2,
+    "global_batch_size": 2,
+    "micro_batch_size": 2,
     "seq_len": 4096,
     "pack_batch": 1000
   },
