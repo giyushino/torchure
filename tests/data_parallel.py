@@ -10,11 +10,19 @@ mean-loss grads equals the global mean-loss grad when shards are equal sized.
 the batch is deterministic, so every rank recomputes the single-process
 reference locally and no gathers are needed for the comparison.
 
+phase 1.3 adds the same invariant one level up, for grad accumulation: N ranks
+x K microbatches of bs=1 must equal 1 process x bs=(N*K), with exactly ONE
+grad sync per step. that test also asserts directly that no collective is
+launched while `requires_sync` is False -- suppression failing is otherwise
+invisible from the outside, since the grads would still end up *close*.
+
 the model is a tiny real Qwen3, not an mlp, so the tied embedding (one param,
 two grad contributions, AccumulateGrad must fire exactly once) and the
 rmsnorm/rope structure are exercised. bucket_mb is swept to hit all three
 bucket shapes: one flat bucket, many flat buckets, and single-param
 in-place buckets (cap=0 makes every param "oversized").
+
+grad-norm clipping is tested separately in tests/grad_helper.py.
 """
 
 import argparse
@@ -49,9 +57,9 @@ def build_model(seed: int) -> Qwen3:
     return model
 
 
-def global_batch(world: int) -> torch.Tensor:
+def global_batch(n_seqs: int) -> torch.Tensor:
     g = torch.Generator().manual_seed(1234)
-    return torch.randint(0, CFG["vocab_size"], (world, SEQ), generator=g)
+    return torch.randint(0, CFG["vocab_size"], (n_seqs, SEQ), generator=g)
 
 
 def loss_fn(model: Qwen3, ids: torch.Tensor) -> torch.Tensor:
@@ -98,6 +106,59 @@ def test_grad_parity(mesh, dim, bucket_mb: float):
             p.grad = None  # what optimizer.zero_grad(set_to_none=True) does
 
 
+def test_grad_accumulation(mesh, dim, bucket_mb: float, microbatches: int):
+    """phase 1.3 no_sync semantics: K local backwards, exactly ONE grad sync.
+
+    the invariant is the same one as test_grad_parity, one level up: N ranks x
+    K microbatches of bs=1 must equal 1 process x bs=(N*K). all microbatches
+    are the same size, so a mean-of-means is the global mean and the per-
+    microbatch 1/K scaling the trainer applies is what makes it come out.
+
+    two failure modes this pins:
+    - hooks firing while requires_sync is False would all-reduce a PARTIALLY
+      accumulated grad, and the bucket would then be re-armed mid-step. checked
+      directly by asserting no work handles exist during the suppressed
+      microbatches (reaching into _works on purpose -- the whole point is that
+      no collective was launched, which is invisible from the outside).
+    - hooks not re-arming after a sync would make cycle 2 fail, so the body
+      runs twice.
+    """
+    world = mesh.size(dim)
+    model = build_model(seed=dist.get_rank())
+    ddp = DDP(model, mesh, dim, bucket_mb=bucket_mb)
+
+    reference = build_model(seed=0)
+    batch = global_batch(world * microbatches)
+    loss_fn(reference, batch).backward()
+
+    # this rank owns a contiguous block of `microbatches` sequences
+    base = mesh.coordinate(dim) * microbatches
+    for _ in range(2):
+        ddp.requires_sync = False
+        for i in range(microbatches - 1):
+            (loss_fn(model, batch[base + i].unsqueeze(0)) / microbatches).backward()
+            assert not ddp._works, (
+                f"{len(ddp._works)} collective(s) launched during microbatch {i} "
+                "-- requires_sync=False did not suppress the grad hooks"
+            )
+
+        # the last microbatch is the one whose hooks launch the all-reduces,
+        # over the fully accumulated grads
+        ddp.requires_sync = True
+        (loss_fn(model, batch[base + microbatches - 1].unsqueeze(0)) / microbatches).backward()
+        ddp.sync()
+
+        for (name, p), (_, p_ref) in zip(
+            model.named_parameters(), reference.named_parameters(), strict=True
+        ):
+            try:
+                torch.testing.assert_close(p.grad, p_ref.grad, rtol=1e-4, atol=1e-6)
+            except AssertionError as e:
+                raise AssertionError(f"param {name}: {e}") from None
+        for p in model.parameters():
+            p.grad = None  # what optimizer.zero_grad(set_to_none=True) does
+
+
 TESTS = [
     ("test_replicate", test_replicate),
     # 25MB cap: the whole tiny model lands in ONE flat bucket
@@ -106,6 +167,10 @@ TESTS = [
     ("test_parity_many_buckets", partial(test_grad_parity, bucket_mb=0.008)),
     # 0 cap: every param is "oversized" -> all in-place, no flat buffers
     ("test_parity_inplace", partial(test_grad_parity, bucket_mb=0.0)),
+    # phase 1.3: grad accumulation, across the same three bucket shapes
+    ("test_accum_2mb_one_bucket", partial(test_grad_accumulation, bucket_mb=25, microbatches=2)),
+    ("test_accum_4mb_many_buckets", partial(test_grad_accumulation, bucket_mb=0.008, microbatches=4)),
+    ("test_accum_3mb_inplace", partial(test_grad_accumulation, bucket_mb=0.0, microbatches=3)),
 ]
 
 
