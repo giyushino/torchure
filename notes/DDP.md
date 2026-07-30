@@ -195,8 +195,8 @@ budget).
   find is worth 4.2x end to end.
 - **overlap ablation (8 gpus)**: 66.0k with `"overlap": false` (buckets still
   launched back-to-back, one wait) vs 73.5k overlapped → **+11.4%** from
-  launching inside backward. this quantifies the overlap instead of the
-  roadmap's profiler-trace criterion; an actual trace is still owed.
+  launching inside backward. *(the trace that supersedes this as exit
+  criterion (c) is at the end of this note: 65–83% of comm is hidden.)*
 - memory: +1.56 GiB over single gpu = the flat grad buffers (non-embedding
   params, fp32), matching the design (the 622 MiB embedding grad has no
   buffer by construction).
@@ -206,14 +206,85 @@ budget).
   bandwidth from compute. levers, in order of expected value: bf16 grad
   compression (halves wire time, needs a loss-curve ablation), bucket-size
   sweep, profiler trace to see what's actually exposed.
+  *(7/30: the trace is now in this note. it reorders these levers — the bucket
+  sweep is worth ~8 ms/step, while at dp=8 comm no longer fits inside backward
+  at all, so only halving the payload helps. the ~105 ms tail estimate was
+  right.)*
 
 ## roadmap phase-1 exit criteria status
 
 - (a) parity: gloo tests green (grad parity N×bs1 vs 1×bsN, tied embedding
   exercised, all bucket shapes, both sync modes). ✓
 - (b) scaling table for 1/2/4(/8) gpus: above. ✓
-- (c) profiler trace showing overlap: quantified via the overlap ablation
-  instead; trace still owed. (partial)
+- (c) profiler trace showing overlap: **✓ captured 2026-07-30**, see below.
+
+## profiler trace — what's actually exposed (2026-07-30, exit criterion (c))
+
+`torch.profiler` over 2 steady-state steps (10 warmup steps first, so past
+compile), rank 0's chrome trace, on **RTX A6000** — not the A40 box the table
+above was measured on, so compare the *ratios* here, not the absolute ms
+against that table. per-rank work held constant at `micro_batch_size=2`, one
+microbatch, `bucket_mb=25`.
+
+method: split GPU kernels into comm (`ncclDevKernel_*`) and compute, take the
+union of each set's intervals, and intersect. "exposed" = comm with no compute
+kernel running concurrently — the part DDP actually *costs*, as opposed to the
+part it merely spends.
+
+| dp | compute | comm | hidden | **exposed** | exposed as % of step |
+|----|---------|------|--------|-------------|----------------------|
+| 2  | 623 ms  | 192 ms | 79.2% | **40 ms**  | 6.0%  |
+| 4  | 642 ms  | 379 ms | 82.5% | **66 ms**  | 9.3%  |
+| 8  | 614 ms  | 442 ms | 64.7% | **156 ms** | 20.2% |
+
+**Overlap works.** 65–83% of all grad communication is hidden behind backward
+compute, and GPU idle time is under 3 ms/step at every scale — the device is
+never waiting on the host. This is the direct evidence the ablation could only
+imply.
+
+Sanity check on the absolute numbers: a single A6000 runs this per-rank work in
+~570 ms unprofiled. 570 + 156 ms exposed comm = 726 ms, against 773 ms measured
+at dp=8 — so ~47 ms is profiler overhead, and the exposed-comm figure accounts
+for essentially all of the real gap. Treat the ms columns as profiler-inflated
+by ~6%; the hidden/exposed *ratios* are unaffected.
+
+**Where the exposure is.** 72 nccl kernels per step; per-kernel exposure:
+
+| dp | largest kernel | its exposure | all other exposure |
+|----|----------------|--------------|--------------------|
+| 2  | 32.2 ms | 32.2 ms (100%) | 8 ms across 71 kernels |
+| 8  | 72.8 ms | 72.8 ms (100%) | 83 ms |
+
+At **dp=2 the picture is essentially optimal**: every bucket except one is
+>97% hidden, and 80% of all exposure is the single largest reduce — the
+622 MiB tied-embedding grad, which is the *last* grad to be ready (first
+layer, and it also collects the lm_head contribution) so there is no compute
+left to hide it behind. That one is structural; it confirms the ~105 ms
+estimate guessed above.
+
+At **dp=8 the tail is only 47% of exposure** — another 83 ms/step is exposed
+across several mid-sized buckets. That is *not* a bucketing bug. Comm at dp=8
+is 442 ms while backward compute is roughly 310–400 ms (CHANGES.md's profile
+puts backward at ~68% of block time), so **the aggregate all-reduce no longer
+fits inside the backward window at all**. No launch order or bucket size can
+hide 442 ms behind ~350 ms. The box is bandwidth-starved, not badly scheduled.
+
+**What this means for the levers.** The bucket-size sweep is now the *least*
+promising of the three listed above — at dp=2 there is ~8 ms/step total to win
+from it, and at dp=8 the problem is bytes on the wire, not when they're
+launched. The two that actually attack it:
+- **bf16 grad reduction** halves the payload, which at dp=8 would bring comm
+  from 442 → ~221 ms, back inside the backward window. Still needs the
+  loss-curve ablation before adopting.
+- **FSDP2 (phase 2)** replaces all-reduce with reduce-scatter, which moves
+  `(N−1)/N·S` instead of `2(N−1)/N·S` — the same ~2x. This trace is the
+  clearest argument yet for phase 2 being the right next thing on this
+  hardware: it attacks the dominant cost at scale rather than trimming around
+  it.
+
+Repro: profile 2 steps after 10 warmup steps, export a chrome trace, union the
+`ncclDevKernel_*` intervals against everything else. Note the `__main__` guard
+— the dataloader's forkserver re-runs the launch script in each worker.
 
 ## deliberately not built (and why)
 

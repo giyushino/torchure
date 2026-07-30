@@ -38,9 +38,14 @@ these already shaped the code; write them down so future phases don't drift:
 ## current state (2026-07-30)
 
 phase 0 and all of phase 1 are done: distributed foundations, overlapped DDP,
-grad accumulation and grad-norm clipping. fsdp2 and everything after it is
-still ahead. phase 1's only outstanding exit criterion is (c), the profiler
-trace showing overlap.
+grad accumulation and grad-norm clipping, all three exit criteria met. fsdp2
+and everything after it is still ahead.
+
+the 7/30 overlap trace (DDP.md) sharpens what phase 2 is *for* on this
+hardware: at 8 gpus the grad all-reduce (442 ms/step) no longer fits inside the
+backward window (~350 ms), so 156 ms/step is exposed no matter how it is
+bucketed. FSDP2's reduce-scatter moves half the bytes of an all-reduce, which
+is the direct fix — phase 2 is a throughput lever here, not only a memory one.
 
 | area | state |
 |------|-------|
@@ -127,7 +132,7 @@ of globals (the trainer TODO already notes this).
 nccl (2 gpus), including `test_subgroup_isolation` against the real mesh.
 trainer still hits ~13k tps single-gpu.
 
-## phase 1: data parallel (DDP) — DONE (except exit criterion (c), the trace)
+## phase 1: data parallel (DDP) — DONE
 
 simplest parallelism, and it exercises the whole stack (mesh, seeding, data
 sharding, logging) with only one collective.
@@ -181,8 +186,15 @@ exercised — **but** at the grad level, not the loss-trajectory level: the
 committed test is synthetic and never touches the dataloader, so the half of
 (a) that was meant to force dp sharding to be right is still unverified.
 (b) ✅ 1/2/4/8 A40 table in DDP.md — 73.5k global at 8 gpus, 69% eff.
-(c) partial — quantified by ablation (+11.4% from launching inside backward)
-instead of a trace; the trace is still owed.
+(c) ✅ trace captured 7/30 (DDP.md): **65–83% of grad comm is hidden** behind
+backward, GPU idle < 3 ms/step at every scale. exposed comm is 40/66/156 ms per
+step at dp=2/4/8. at dp=2 that is 80% the tied-embedding tail, which is
+structural — it is the last grad ready, so nothing is left to hide it behind.
+at dp=8 the tail is only 47%: total comm (442 ms) exceeds the whole backward
+window (~350 ms), so the rest cannot be scheduled away at any bucket size.
+**this box is bandwidth-starved at 8 gpus, not badly bucketed** — which makes
+phase 2's reduce-scatter (half the bytes of an all-reduce) the lever that
+actually attacks it, ahead of any bucket tuning.
 
 1.3 tests (all gloo/cpu): accumulation parity, N ranks × K microbatches ==
 1 process × bs=(N·K), across all three bucket shapes, with a direct assert
