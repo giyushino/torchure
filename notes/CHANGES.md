@@ -200,3 +200,83 @@ Everything is accounted for; further single-GPU gains are kernel-level
 (max-autotune already gives ~+2% as an opt-in) or batch-size scaling. The
 sensible next lever is the distributed work itself.
 
+---
+
+# Methodology: throughput decays over a run (power cap) — 2026-07-30
+
+**Every TPS number above is effectively a boost-clock number.** Rounds 1–2 were
+measured with 10–30 step runs, short enough that the GPU never leaves its boost
+state. A longer run of the *same code* is 2–3% slower, for reasons that have
+nothing to do with the code. Comparing a long run against these tables reads as
+a regression that isn't one.
+
+Found while checking whether the new grad-norm clip had cost throughput: a
+75-step run reported ~13.9k TPS around step 70 vs ~14.2k at step 5, same
+config, same process.
+
+## What is actually happening
+
+Sampling `nvidia-smi` during a run (RTX A6000, 300 W cap, 1 GPU,
+`configs/qwen3_dense_climbmix.json`):
+
+| clock | temp | power | throttle reason |
+|-------|------|-------|-----------------|
+| 1665 MHz | 70 °C | 294.6 W | `SwPowerCap` |
+| 1665 MHz | 71 °C | 296.4 W | `SwPowerCap` |
+| 1620 MHz | 73 °C | 295.7 W | `SwPowerCap` |
+| 1605 MHz | 74 °C | 297.0 W | `SwPowerCap` |
+| 1590 MHz | 79 °C | 295.5 W | `SwPowerCap` |
+| 1875 MHz | 75 °C | 108.2 W | none *(idle, after the run)* |
+
+`clocks_throttle_reasons.active = 0x4` (`SwPowerCap`) is set from the first step
+onward: the card sits at its 300 W limit for the entire run. As the die heats
+70 → 79 °C it needs more voltage to hold a given clock, so the clock sustainable
+inside 300 W falls 1665 → 1590 MHz (−4.5%), which is the observed −2.8% TPS.
+Thermal slowdown (`0x20`/`0x40`) never trips — this is the power cap doing its
+job, not a cooling problem, and there is nothing to "fix".
+
+## Drift, measured
+
+75 steps, steady-state TPS averaged over three windows, with and without the
+grad-norm clip:
+
+| step window | clip on | clip off |
+|-------------|---------|----------|
+| 3–12   | 14197 | 14235 |
+| 33–42  | 14038 | 14098 |
+| 61–72  | 13828 | 13984 |
+| **drift, first 10 → last 10** | **−2.77%** | **−1.80%** |
+
+Both configurations decay. The two runs were back-to-back, so the second
+(clip off) started on an already-warm card and therefore shows *less* remaining
+drift — which is itself an illustration of the problem: **sequential A/B runs
+are confounded by the thermal state the previous run left behind.**
+
+For reference, the grad clip itself costs ~10.3 ms on a ~570 ms step (~1.8%),
+measured in isolation: `_foreach_norm` + `stack` + `vector_norm` = 3.36 ms
+(reads 2.14 GiB of fp32 grads, ~640 GB/s) and `_foreach_mul_` = 6.88 ms
+(reads+writes 4.28 GiB, ~620 GB/s). Both are at the card's memory-bandwidth
+limit, and the whole function matches `torch.nn.utils.clip_grad_norm_` to
+within 0.03 ms — so that ~1.8% is a floor, not something to optimize. The
+window deltas above (−0.3% to −1.1%) are consistent with it once clock drift is
+accounted for.
+
+## Consequences for the benchmark discipline
+
+1. **Compare like windows.** A number from steps 3–12 and a number from steps
+   61–72 are not comparable even for identical code. Pick a fixed window
+   (steps 30–50 is a reasonable compromise: past compile warmup, partway into
+   the decay) and record which window a table used.
+2. **Don't cross-compare across boxes.** Rounds 1–2 are A40 numbers; everything
+   from 2026-07-30 on is RTX A6000. The A40 has its own cap and cooling
+   behaviour, so the two sets are not on the same scale in either direction.
+3. **Interleave, or warm up, for A/B.** Back-to-back runs inherit each other's
+   thermal state. Either discard the first N steps until the clock settles, or
+   alternate A/B/A/B rather than running all of A then all of B.
+4. **This will contaminate the DDP scaling tables.** With 8 of these cards at
+   300 W each in one chassis, every GPU is power-capped harder than a single
+   one is, and inlet temperatures rise across the run. Some of the per-GPU TPS
+   loss at 8 GPUs is thermal, not comm efficiency — measure a 1-GPU run of the
+   same duration under the same box load before attributing the gap to
+   all-reduce.
+
