@@ -65,6 +65,9 @@ between `loss.backward()` and `optimizer.step()`. mechanics:
   accumulation), `sync()` asserts with a count instead of deadlocking inside
   nccl. grad accumulation needs real `no_sync` semantics — roadmap 1.3,
   deliberately not built yet.
+  *(superseded 2026-07-30: 1.3 landed. `requires_sync` provides the no_sync
+  semantics, and this assert is now what catches leaving that flag False on
+  the last microbatch. see ROADMAP phase 1.3.)*
 - **dp=1 is a complete no-op**: no hooks, no groups touched, zero per-step
   overhead. single gpu stays the same code path (principle: world_size=1 is
   not a special case).

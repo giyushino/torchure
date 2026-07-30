@@ -35,19 +35,22 @@ these already shaped the code; write them down so future phases don't drift:
 6. **minimal deps.** no framework imports (megatron, deepspeed, accelerate,
    liger). optional integrations (wandb, torchao fp8) stay optional.
 
-## current state (2026-07-27)
+## current state (2026-07-30)
 
-phases 0 and 1.2 are done: distributed foundations + overlapped DDP. fsdp2 and
-everything after it is still ahead.
+phase 0 and all of phase 1 are done: distributed foundations, overlapped DDP,
+grad accumulation and grad-norm clipping. fsdp2 and everything after it is
+still ahead. phase 1's only outstanding exit criterion is (c), the profiler
+trace showing overlap.
 
 | area | state |
 |------|-------|
 | `core/collective.py` | **done.** all 7 ops implemented against the documented contracts; 12 tests green on gloo (`tests/collective.py --world-size 4`, in ci). nccl sweep still owed |
 | `core/mesh.py` | **done.** named axes over the flat rank space: per-axis groups, strides, coordinates, `flatten()` for virtual axes (dataloader's dp coord). `dtensor.py` / `placement.py` not started — fsdp2 decides their shape |
-| `parallelism/data_parallel.py` | **done (phase 1.2).** bucketed grad all-reduce launched from `register_post_accumulate_grad_hook`, overlapped with backward; flat-buffer buckets with `.grad` repointed at views, oversized params (the tied embedding) reduced in place; dp=1 is a total no-op. grad parity tested on gloo (`tests/data_parallel.py`) |
+| `parallelism/data_parallel.py` | **done (phase 1).** bucketed grad all-reduce launched from `register_post_accumulate_grad_hook`, overlapped with backward; flat-buffer buckets with `.grad` repointed at views, oversized params (the tied embedding) reduced in place; dp=1 is a total no-op. `requires_sync` gives no_sync semantics for grad accumulation (1.3). grad parity + accumulation parity tested on gloo (`tests/data_parallel.py`) |
+| `core/grad_helper.py` | **done (phase 1.3).** `clip_grad_norm(params, mesh, max_norm, shard_dims=())` — placement-aware global grad-norm clip, returns the pre-clip norm for logging. local path matches `torch.nn.utils.clip_grad_norm_` and runs at memory-bandwidth limit (~10 ms / 2.1 GiB of grads, ~1.8% of a step); sharded path implemented and tested but unused until fsdp2. tests in `tests/grad_helper.py` |
 | `parallelism/{fsdp2,context_parallel,expert_parallel}.py` | empty stubs — next up |
 | models | qwen3 dense (0.6B validated, per-block compile, ~13k tps on A40, 73.5k global on 8x A40); llama3 stubbed |
-| trainer | single-gpu and dp through the same path (world_size=1 is not a special case). lifecycle build → parallelize → init → optimizer → data, so sharded init slots in without reordering. no grad clipping, no grad accumulation, no eval loop, no metrics logger yet |
+| trainer | single-gpu and dp through the same path (world_size=1 is not a special case). lifecycle build → parallelize → init → optimizer → data, so sharded init slots in without reordering. grad accumulation (`global_batch_size / (micro_batch_size × dp)` microbatches) and grad-norm clipping both land in `train_step`; `train_step` returns a metrics dict (loss, grad_norm). no eval loop, no metrics logger, and `self.ddp` is still a concrete attribute — the parallelism abstraction gets designed when fsdp2 gives it a second implementation |
 | checkpointing | per-step dirs, `resume: null \| "auto" \| <step>`, full state (model/optimizer/scheduler/dataloader/rng/config). dp-aware: rank 0 writes replicas, every dp rank writes its own dataloader file, barrier-fenced, refuses to resume across a mesh change. still unsharded (phase 3) and still missing a done marker |
 | objectives | AR CE, with the chunked fused-linear-CE landed and wired into `ARObjective` (default on). backward scales the stashed grads in place — see DEV_LOG 7/27 |
 | dataloader | streaming HF + packing (stream + best-fit-decreasing) + stateful + CUDA prefetcher; splits by the mesh's dp coordinate. packing allows cross-document attention (no doc mask); prefetcher skips one batch on resume |
@@ -64,8 +67,15 @@ everything after it is still ahead.
   samples per step, load-bearing the moment dropout or masked diffusion does
   (needs the per-rank seed derivation in 0.3). nothing seeds torch at trainer
   start either, so runs aren't reproducible.
-- **`tests/data_parallel.py` isn't in ci** despite being gloo/cpu and being the
-  single most valuable test in the tree.
+- **`tests/data_parallel.py` and `tests/grad_helper.py` aren't in ci** despite
+  being gloo/cpu and being the two most valuable tests in the tree.
+- **the benchmark numbers are boost-clock numbers.** throughput decays 2–3%
+  over a run as the card power-caps (measured 7/30: `SwPowerCap` from step 0,
+  clocks 1665 → 1590 MHz as it heats 70 → 79 °C). rounds 1–2 were 10–30 step
+  runs, so any longer comparison against them reads as a regression that
+  isn't one, and sequential A/B runs inherit each other's thermal state. see
+  CHANGES.md 7/30 for the methodology fix; this also means some of the 8-gpu
+  scaling gap in DDP.md is thermal, not comm.
 - fixed 7/27: norm weights were bf16 *parameters*, so AdamW's updates rounded
   to nothing and the gains never moved. see DEV_LOG — the CHANGES.md numbers
   were all measured with them frozen and want a re-run.
@@ -117,7 +127,7 @@ of globals (the trainer TODO already notes this).
 nccl (2 gpus), including `test_subgroup_isolation` against the real mesh.
 trainer still hits ~13k tps single-gpu.
 
-## phase 1: data parallel (DDP) — 1.1/1.2 DONE, 1.3 not started
+## phase 1: data parallel (DDP) — DONE (except exit criterion (c), the trace)
 
 simplest parallelism, and it exercises the whole stack (mesh, seeding, data
 sharding, logging) with only one collective.
@@ -140,12 +150,26 @@ reverse-parameter order, launch the all-reduce when a bucket fills, wait on
 all works before `optimizer.step()`. this is where the async `(tensor, work)`
 contract and the gloo-avg-after-wait caveat earn their keep.
 
-**1.3 gradient accumulation + clipping.** accumulate locally for K
-microbatches, sync grads once per optimizer step (no_sync semantics — the
-hooks must respect this). global grad-norm clipping: for pure DP the grads
-are identical post-sync so the local norm is correct, but write it against
-the mesh anyway (`all_reduce` of squared norms) — FSDP/TP will need the
-distributed version, and it's 5 lines now vs a refactor later.
+**1.3 gradient accumulation + clipping.** ✅ accumulation is a
+`DDP.requires_sync` flag the trainer drives: `False` for the first K−1
+microbatches (the post-accumulate hooks return without touching bucket
+counters, so nothing is launched over a partially accumulated grad), `True`
+for the last, whose hooks launch the all-reduces over the fully accumulated
+grads. `global_batch_size = micro_batch_size × dp × K` sets K in the trainer.
+
+clipping lives in `core/grad_helper.py`, not on DDP: it is a per-step function
+over params, not a lifecycle hook, and it has to serve DDP/FSDP/TP alike.
+`clip_grad_norm(params, mesh, max_norm, shard_dims=())` — per-tensor norms via
+`_foreach_norm`, stacked (‖concat‖_p = ‖(‖g₁‖_p,…)‖_p, so nothing gets
+flattened into one buffer), then `_foreach_mul_` by a clamped coefficient.
+`max_norm` is an `optimizer.max_norm` config knob; `null` means measure-only,
+and the returned pre-clip norm goes in the log line either way.
+
+⚠️ **`shard_dims` is the axes the grads are SHARDED over, and it is `()` for
+pure DP** — post-sync DDP grads are replicas, so the local norm is already
+global and reducing over `dp` would return √(dp) × the true norm and
+over-clip by that factor. FSDP2 passes its shard axis here; that path works
+and is tested, but nothing in the trainer uses it yet.
 
 **exit criteria:** (a) parity: 2 ranks × bs=1 matches 1 rank × bs=2 loss
 trajectory on identical data order (this forces the dataloader sharding to be
@@ -153,9 +177,22 @@ right); (b) scaling: tps table for 1/2/4 gpus in CHANGES.md; (c) profiler
 trace showing grad all-reduce overlapped with backward.
 
 **status:** (a) ✅ grad parity on gloo, all bucket shapes, tied embedding
-exercised. (b) ✅ 1/2/4/8 A40 table in DDP.md — 73.5k global at 8 gpus, 69%
-eff. (c) partial — quantified by ablation (+11.4% from launching inside
-backward) instead of a trace; the trace is still owed.
+exercised — **but** at the grad level, not the loss-trajectory level: the
+committed test is synthetic and never touches the dataloader, so the half of
+(a) that was meant to force dp sharding to be right is still unverified.
+(b) ✅ 1/2/4/8 A40 table in DDP.md — 73.5k global at 8 gpus, 69% eff.
+(c) partial — quantified by ablation (+11.4% from launching inside backward)
+instead of a trace; the trace is still owed.
+
+1.3 tests (all gloo/cpu): accumulation parity, N ranks × K microbatches ==
+1 process × bs=(N·K), across all three bucket shapes, with a direct assert
+that no collective is launched while `requires_sync` is `False`
+(`tests/data_parallel.py`); clipping vs `torch.nn.utils.clip_grad_norm_` on a
+real tied-embedding model, the sharded-norm path against a known split
+vector, and a regression test that grads below the threshold are left
+**bitwise** untouched (`tests/grad_helper.py`). both suites were
+mutation-checked — disabling the suppression or reintroducing the clamp bug
+makes them fail.
 
 ## phase 2: DTensor + FSDP2
 
