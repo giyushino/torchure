@@ -78,19 +78,9 @@ class Trainer:
         self.num_train_steps = self.config["optimizer"]["scheduler"]["total_steps"]
 
         self.dataloader = self._build_dataloader()
-        # batch sizes are in SEQUENCES (tokens = x seq_len). global_batch_size
-        # is the training hyperparameter -- sequences per optimizer step across
-        # the whole job, invariant to how that job is split. micro_batch_size
-        # is the mechanical per-rank-per-backward split. the accumulation count
-        # is *derived* from the two, never configured, so changing dp_size or
-        # the microbatch can't silently change what's being trained.
-        #
-        # named microbatches_per_step, not grad_accum_steps: "step" means
-        # optimizer step everywhere else here (total_steps, save_steps,
-        # start_step, and the checkpoint dir convention), so this reads as the
-        # ratio it is instead of overloading the word.
         self.global_batch_size = self.config["data"]["global_batch_size"]
         self.micro_batch_size = self.config["data"]["micro_batch_size"]
+
         # one backward consumes micro_batch_size seqs on each of the dp ranks
         # simultaneously. identical on every rank (config + mesh only, no
         # rank-local state), which is what keeps the collective count per step
@@ -280,10 +270,6 @@ class Trainer:
         batch = self.get_batch_prefetcher()
         # cast to bf16 so we can take advantage of sdpa
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            # backward() SUMS grads across microbatches, so each must
-            # contribute 1/microbatches_per_step of the global-batch mean. the
-            # objective already divided by its own valid-token count; this
-            # divisor is only about the accumulation axis.
             loss = self.objective.compute_loss(self.model, batch) / self.microbatches_per_step
 
         loss.backward()
@@ -300,17 +286,12 @@ class Trainer:
         # all-reduces, over the fully accumulated grads
         self.ddp.requires_sync = True
         loss += self.micro_train_step()
-        # wait for the grad all-reduces launched during backward; grads
-        # must be fully averaged before the optimizer reads them
         self.ddp.sync()
         self.optimizer.step()
         self.optimizer.zero_grad()
         self.scheduler.step()
-        # loss is already detached: micro_train_step returns loss.detach() and
-        # the accumulator starts as a plain zeros(), so nothing here carries grad
+
         if self.dp_size > 1:
-            # dp-averaged loss for readable curves; a scalar all-reduce
-            # is noise next to the step, and the print syncs anyway
             all_reduce(loss, self.mesh, "dp", "avg")
         return loss
 
