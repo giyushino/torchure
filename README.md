@@ -58,6 +58,7 @@ tokens/sec for qwen3 0.6B dense, seq_len 4096, batch size 2/gpu, bf16:
 | hardware | tps |
 |----------|-----|
 | 1x A40 | ~13.3k |
+| 1x A6000 | ~14.4k |
 | 1x H100 (PCIe) | ~54.5k |
 
 ### ddp
@@ -66,6 +67,7 @@ global tps (tokens through the whole job per second), same per-gpu config:
 | hardware | tps | scaling eff |
 |----------|-----|-------------|
 | 8x A40 | ~73.5k | 69% |
+| 8x A6000 | ~86.4 k | 60% |
 | 4x H100 (PCIe) | ~198k | 92% |
 
 on a pcie-only box grad sync is the whole ballgame; `notes/DDP.md` has the
