@@ -24,6 +24,7 @@ from tokenizers import Tokenizer
 
 from torchure.checkpoint.checkpointer import Checkpointer
 from torchure.core.collective import all_reduce, barrier
+from torchure.core.grad_helper import clip_grad_norm
 from torchure.core.mesh import Mesh
 from torchure.dataloader.builder import build_dataloader
 from torchure.dataloader.prefetcher import CUDAPrefetcher
@@ -76,6 +77,7 @@ class Trainer:
         self.optimizer = self._build_optimizer(self.model)
         self.scheduler = self._build_scheduler(self.optimizer)
         self.num_train_steps = self.config["optimizer"]["scheduler"]["total_steps"]
+        self.max_norm = self.config["optimizer"].get("max_norm")
 
         self.dataloader = self._build_dataloader()
         self.global_batch_size = self.config["data"]["global_batch_size"]
@@ -276,7 +278,7 @@ class Trainer:
         return loss.detach()
 
     @record_time
-    def train_step(self) -> torch.Tensor:
+    def train_step(self) -> dict[str, torch.Tensor]:
         loss = torch.zeros((), device=self.device)
         self.ddp.requires_sync = False
         for _ in range(self.microbatches_per_step - 1):
@@ -287,13 +289,17 @@ class Trainer:
         self.ddp.requires_sync = True
         loss += self.micro_train_step()
         self.ddp.sync()
+        grad_norm = clip_grad_norm(
+            self.model.parameters(), self.mesh, self.max_norm, shard_dims=()
+        )
         self.optimizer.step()
         self.optimizer.zero_grad()
         self.scheduler.step()
 
         if self.dp_size > 1:
             all_reduce(loss, self.mesh, "dp", "avg")
-        return loss
+
+        return {"loss": loss, "grad_norm": grad_norm}
 
     @debug_time
     def train_n_step_test(self, n_steps: int) -> None:
@@ -301,9 +307,11 @@ class Trainer:
         # lands, every accumulated microbatch), so tokens/step is just it x seq
         tokens_per_step = self.config["data"]["seq_len"] * self.global_batch_size
         for step in range(n_steps):
-            loss, time = self.train_step()
+            metrics, time = self.train_step()
             if self.rank == 0:
-                print(f"{step=} || {loss=} || tps={tokens_per_step / time}")
+                print(f"{step=} || loss={metrics['loss']:.4f} || gnorm={metrics['grad_norm']:.3f} "
+                    f"|| lr={self.scheduler.get_last_lr()[0]:.2e} || tps={tokens_per_step / time:.0f}")
+
         if self.rank == 0:
             print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
@@ -315,11 +323,12 @@ class Trainer:
         """
         tokens_per_step = self.config["data"]["seq_len"] * self.global_batch_size
         for step in range(self.start_step, self.num_train_steps):
-            loss, time = self.train_step()
+            metrics, time = self.train_step()
             if (step + 1) % self.save_steps == 0 and step != 0:
                 self.checkpoint(step + 1)
             if self.rank == 0:
-                print(f"{step=} || {loss=} || tps={tokens_per_step / time}")
+                print(f"{step=} || loss={metrics['loss']:.4f} || gnorm={metrics['grad_norm']:.3f} "
+                    f"|| lr={self.scheduler.get_last_lr()[0]:.2e} || tps={tokens_per_step / time:.0f}")
 
         if self.rank == 0:
             print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
