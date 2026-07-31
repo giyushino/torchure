@@ -21,12 +21,18 @@ class Checkpointer:
         os.makedirs(self.checkpoint_save_path, exist_ok=True)
     
     def latest(self) -> int | None:
-        steps = [int(d) for d in os.listdir(self.checkpoint_save_path) if d.isdigit()]
-        return max(steps, default=None)
-    
+        return max(self._steps(), default=None)
+
     def valid_step(self, step: int) -> int | None:
-        steps = [int(d) for d in os.listdir(self.checkpoint_save_path) if d.isdigit()]
-        return step if step in steps else None
+        return step if step in self._steps() else None
+
+    def _steps(self) -> list[int]:
+        # python if statemnts are short circuit, so
+        # passing int(d) into self.is_complete is fine
+        return [
+            int(d) for d in os.listdir(self.checkpoint_save_path)
+            if d.isdigit() and self.is_complete(int(d))
+        ]
 
     def _step_dir(self, step: int, create: bool = False) -> str:
         step_dir = os.path.join(self.checkpoint_save_path, str(step))
@@ -85,3 +91,13 @@ class Checkpointer:
         dataloader.load_state_dict(
             self._load(step, f"dataloader_dp{dp_rank}.pt", weights_only=False)
         )
+
+    def _complete_path(self, step: int) -> str:
+        return os.path.join(self._step_dir(step), ".complete")
+
+    def mark_complete(self, step: int) -> None:
+        open(self._complete_path(step), "w").close()
+
+    def is_complete(self, step: int) -> bool:
+        return os.path.exists(self._complete_path(step))
+

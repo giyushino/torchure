@@ -235,7 +235,9 @@ class Trainer:
         self.checkpointer.save_dataloader(self.dataloader, step, self.mesh.coordinate("dp"))
         # fence: no rank moves on (or exits) while writers are mid-file
         barrier()
-
+        if self.rank == 0:
+            self.checkpointer.mark_complete(step)
+            
     def _resume(self) -> int:
         if self.resume is None:
             return 0
