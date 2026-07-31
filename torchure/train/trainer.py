@@ -16,6 +16,7 @@ ease of use then move to different profiling methods
 
 import json
 import os
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -46,20 +47,35 @@ torch.set_float32_matmul_precision("high")
 
 PROJECT_DIR = get_project_dir()
 
-
 def load_json(train_config_path: str) -> dict:
     with open(train_config_path, 'r') as file:
         return json.load(file)
 
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+
 
 class Trainer:
-    def __init__(self, train_config_path: str, rank: int, local_rank: int, world_size: int):
+    def __init__(
+        self,
+        train_config_path: str,
+        rank: int,
+        local_rank: int,
+        world_size: int,
+        benchmark: bool = False,
+    ):
         # we might want to add some asserts that
         # makes sure that the model and tokenizer
-        # vocab sizes are the same 
+        # vocab sizes are the same
         self.config = load_json(train_config_path)
         self.rank = rank
         self.world_size = world_size
+        # benchmark mode (train.py --steps) is a fixed-step tps measurement,
+        # not an experiment: no checkpoints, and no wandb run either
+        self.benchmark = benchmark
         self.device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(local_rank)  # have the process own this specific GPU
         self.mesh = Mesh(self.config["mesh"])
@@ -95,12 +111,26 @@ class Trainer:
         )
         self.microbatches_per_step = self.global_batch_size // seqs_per_backward
 
-
+        
+        # two different names on purpose. the checkpoint dir is keyed on the
+        # config name alone so a relaunch lands in the SAME directory and
+        # resume="auto" can find it -- a timestamp here would hand every
+        # launch a fresh empty dir and silently restart from step 0 (and,
+        # under ddp, give each rank its own datetime.now() and its own dir).
+        # the timestamp belongs on the wandb display name, where per-launch
+        # is exactly what you want.
+        time_launched = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.run_name = f"{self.config['run_name']}_{time_launched}"
         self.checkpointer_path = f"{PROJECT_DIR}/checkpoints/{self.config['run_name']}"
         self.checkpointer = Checkpointer(self.checkpointer_path)
         self.resume = self.config["checkpointing"]["resume"]
         self.save_steps = self.config["checkpointing"]["save_steps"]
+        # set by _resume when it finds a checkpoint: the wandb run this
+        # experiment was already logging to, so we reattach instead of
+        # splitting one loss curve across a new run per restart
+        self.resume_wandb_id: str | None = None
         self.start_step = self._resume()
+        self._setup_wandb()
 
         # make the dataloader iterable, has to be after
         # checkpointing resumption logic 
@@ -108,6 +138,55 @@ class Trainer:
         # prefetch batch N+1's host->device copy on a side stream while step N
         # computes; see torchure/dataloader/prefetcher.py.
         self.prefetcher = CUDAPrefetcher(self.dataloader_iter, self.device)
+
+
+    def _setup_wandb(self) -> None:
+        """
+        rank 0 only: every rank calling init would open world_size duplicate
+        runs racing over the same name. runs after _resume so we can hand
+        wandb the run id we recovered from the checkpoint.
+        """
+        self.wandb_run = None
+        wandb_cfg = self.config.get("wandb", {})
+        if not wandb_cfg.get("enabled", False) or self.rank != 0 or self.benchmark:
+            return
+        assert HAS_WANDB, (
+            "wandb.enabled is true in the config but wandb isn't installed: "
+            "uv sync --extra wandb"
+        )
+
+        # the full config doubles as the run's searchable hyperparameters, so
+        # two runs can be diffed in the ui instead of by digging up the json
+        self.wandb_run = wandb.init(
+            project=wandb_cfg.get("project", "torchure"),
+            entity=wandb_cfg.get("entity"),
+            name=self.run_name,
+            id=self.resume_wandb_id,
+            resume="must" if self.resume_wandb_id else None,
+            config=self.config,
+        )
+
+    def _log_metrics(self, metrics: dict, step: int, tokens_per_step: int, time: float) -> None:
+        # `step` is the 1-based count of completed steps, matching what
+        # checkpoint() writes. wandb DROPS any log at a step <= the last one
+        # recorded, so a resumed run whose numbering disagrees with the
+        # pre-crash run loses steps silently -- keep the two conventions equal.
+        if self.wandb_run is None:
+            return
+        # .item() syncs on the device, but the print below already does via
+        # __format__ on a cuda tensor, so this costs nothing extra
+        self.wandb_run.log(
+            {
+                "train/loss": metrics["loss"].item(),
+                "train/grad_norm": metrics["grad_norm"].item(),
+                "train/lr": self.scheduler.get_last_lr()[0],
+                "train/tokens": step * tokens_per_step,
+                "perf/tps": tokens_per_step / time,
+                "perf/step_time": time,
+                "perf/peak_mem_gib": torch.cuda.max_memory_allocated() / 2**30,
+            },
+            step=step,
+        )
 
     def _build_model(self) -> nn.Module:
         # for single gpu right now, when we want to do
@@ -229,6 +308,9 @@ class Trainer:
                     "cpu_rng": torch.get_rng_state(),
                     "cuda_rng": torch.cuda.get_rng_state(self.device),
                     "config": self.config,
+                    # so a resume reattaches to this run instead of opening a
+                    # new one and cutting the loss curve in half
+                    "wandb_id": self.wandb_run.id if self.wandb_run else None,
                 },
                 step,
             )
@@ -267,8 +349,10 @@ class Trainer:
         # per step, revisit with per-rank seed derivation (roadmap 0.3)
         torch.set_rng_state(state["cpu_rng"])
         torch.cuda.set_rng_state(state["cuda_rng"], self.device)
+        # .get, not [...]: checkpoints written before wandb landed have no
+        # such key, and they should still resume
+        self.resume_wandb_id = state.get("wandb_id")
         return state["step"]
-    
 
     def micro_train_step(self) -> torch.Tensor:
         batch = self.get_batch_prefetcher()
@@ -324,16 +408,23 @@ class Trainer:
         we could switch, but maybe no need
         """
         tokens_per_step = self.config["data"]["seq_len"] * self.global_batch_size
-        for step in range(self.start_step, self.num_train_steps):
-            metrics, time = self.train_step()
-            if (step + 1) % self.save_steps == 0 and step != 0:
-                self.checkpoint(step + 1)
-            if self.rank == 0:
-                print(f"{step=} || loss={metrics['loss']:.4f} || gnorm={metrics['grad_norm']:.3f} "
-                    f"|| lr={self.scheduler.get_last_lr()[0]:.2e} || tps={tokens_per_step / time:.0f}")
+        try:
+            for step in range(self.start_step, self.num_train_steps):
+                metrics, time = self.train_step()
+                if (step + 1) % self.save_steps == 0 and step != 0:
+                    self.checkpoint(step + 1)
+                if self.rank == 0:
+                    self._log_metrics(metrics, step + 1, tokens_per_step, time)
+                    print(f"{step=} || loss={metrics['loss']:.4f} || gnorm={metrics['grad_norm']:.3f} "
+                        f"|| lr={self.scheduler.get_last_lr()[0]:.2e} || tps={tokens_per_step / time:.0f}")
 
-        if self.rank == 0:
-            print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
+            if self.rank == 0:
+                print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
+        finally:
+            # in a finally so a crash marks the run crashed, instead of
+            # leaving it "running" in the ui until wandb times it out
+            if self.wandb_run is not None:
+                self.wandb_run.finish()
 
 # no __main__ here on purpose: a Trainer can't be built without a process group
 # (Mesh asserts on it), so launching this file directly always crashed. the one
