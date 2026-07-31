@@ -107,6 +107,13 @@ conda activate fresh
 pip install uv
 uv pip install -e .
 ```
+### Optional: Weights & Biases logging
+
+Experiment tracking is off by default. To enable it:
+
+```bash
+uv pip install -e ".[wandb]"
+```
 
 ## future plans
 

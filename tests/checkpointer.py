@@ -53,75 +53,138 @@ def train_steps(model, optimizer, scheduler, n: int) -> None:
 
 
 def check_roundtrip(tmp: str) -> None:
-        ckpt = Checkpointer(os.path.join(tmp, "run"))
-        step = 5
+    ckpt = Checkpointer(os.path.join(tmp, "run"))
+    step = 5
 
-        # source state: a model trained a few steps + a partially consumed loader,
-        # so every component has non-trivial state to roundtrip
-        model, optimizer, scheduler, loader = build_state(seed=0)
-        it = iter(loader)
-        for _ in range(3):
-            next(it)
-        train_steps(model, optimizer, scheduler, step)
+    # source state: a model trained a few steps + a partially consumed loader,
+    # so every component has non-trivial state to roundtrip
+    model, optimizer, scheduler, loader = build_state(seed=0)
+    it = iter(loader)
+    for _ in range(3):
+        next(it)
+    train_steps(model, optimizer, scheduler, step)
 
+    ckpt.save_model(model, step)
+    ckpt.save_optimizer(optimizer, step)
+    ckpt.save_scheduler(scheduler, step)
+    ckpt.save_dataloader(loader, step)
+
+    for name in ("model.pt", "optimizer.pt", "scheduler.pt", "dataloader_dp0.pt"):
+        path = os.path.join(tmp, "run", str(step), name)
+        assert os.path.isfile(path), f"missing {path}"
+
+    # re-saving the same step must overwrite, not crash on an existing dir
+    ckpt.save_model(model, step)
+
+    # what the original loader would yield next; the restored one must match
+    expected_next = next(it)
+
+    # fresh replicas with deliberately different init, then restore
+    model2, optimizer2, scheduler2, loader2 = build_state(seed=1)
+    ckpt.load_model(model2, step)
+    ckpt.load_optimizer(optimizer2, step)
+    ckpt.load_scheduler(scheduler2, step)
+    ckpt.load_dataloader(loader2, step)
+
+    for (k1, v1), (k2, v2) in zip(
+        model.state_dict().items(), model2.state_dict().items(), strict=True
+    ):
+        assert k1 == k2, f"state_dict key mismatch: {k1} vs {k2}"
+        torch.testing.assert_close(v1, v2)
+
+    s1, s2 = optimizer.state_dict(), optimizer2.state_dict()
+    assert s1["param_groups"] == s2["param_groups"]
+    for pid, st in s1["state"].items():
+        for key, val in st.items():
+            torch.testing.assert_close(val, s2["state"][pid][key])
+
+    assert scheduler2.last_epoch == scheduler.last_epoch
+    assert scheduler2.get_last_lr() == scheduler.get_last_lr()
+
+    resumed_next = next(iter(loader2))
+    torch.testing.assert_close(resumed_next, expected_next)
+
+    # trainer state: a plain dict (step, rng, config snapshot), no
+    # state_dict holder. cpu-only here; the trainer adds cuda_rng on
+    # real runs. rng restore must reproduce the exact next draw.
+    torch.manual_seed(7)
+    trainer_state = {
+        "step": step,
+        "cpu_rng": torch.get_rng_state(),
+        "config": {"run_name": "test", "lr": 1e-3},
+    }
+    expected_draw = torch.randn(4)
+    ckpt.save_trainer(trainer_state, step)
+    loaded = ckpt.load_trainer(step)
+    assert loaded["step"] == step
+    assert loaded["config"] == trainer_state["config"]
+    torch.set_rng_state(loaded["cpu_rng"])
+    torch.testing.assert_close(torch.randn(4), expected_draw)
+
+
+def check_completion_marker(tmp: str) -> None:
+    """
+    a step dir exists from the moment its first file lands, so the dir
+    alone proves nothing. Trainer.checkpoint writes .complete last, after
+    the barrier that fences every rank's writes -- an unmarked step is one
+    we died partway through, and resume discovery has to skip it.
+    """
+    ckpt = Checkpointer(os.path.join(tmp, "marker_run"))
+    model, optimizer, scheduler, loader = build_state(seed=0)
+
+    def write_all(step: int) -> None:
         ckpt.save_model(model, step)
         ckpt.save_optimizer(optimizer, step)
         ckpt.save_scheduler(scheduler, step)
         ckpt.save_dataloader(loader, step)
 
-        for name in ("model.pt", "optimizer.pt", "scheduler.pt", "dataloader_dp0.pt"):
-            path = os.path.join(tmp, "run", str(step), name)
-            assert os.path.isfile(path), f"missing {path}"
+    assert ckpt.latest() is None, "empty run dir has nothing to resume from"
 
-        # re-saving the same step must overwrite, not crash on an existing dir
-        ckpt.save_model(model, step)
+    # every file on disk but no marker: still not resumable. this is the
+    # window between the last save and the marker write
+    write_all(10)
+    assert not ckpt.is_complete(10)
+    assert ckpt.latest() is None, "unmarked step must not be picked up"
+    assert ckpt.valid_step(10) is None
 
-        # what the original loader would yield next; the restored one must match
-        expected_next = next(it)
+    ckpt.mark_complete(10)
+    assert ckpt.is_complete(10)
+    assert ckpt.latest() == 10
+    assert ckpt.valid_step(10) == 10
 
-        # fresh replicas with deliberately different init, then restore
-        model2, optimizer2, scheduler2, loader2 = build_state(seed=1)
-        ckpt.load_model(model2, step)
-        ckpt.load_optimizer(optimizer2, step)
-        ckpt.load_scheduler(scheduler2, step)
-        ckpt.load_dataloader(loader2, step)
+    # step 20 dies after model.pt -- the torn write the marker exists for.
+    # auto-resume has to fall back to 10 rather than load a half-written 20
+    ckpt.save_model(model, 20)
+    assert not ckpt.is_complete(20)
+    assert ckpt.latest() == 10, "torn newest step must fall back to the last complete one"
+    # and naming the torn step explicitly must be refused, not honored
+    assert ckpt.valid_step(20) is None, "explicit resume must reject a torn step too"
 
-        for (k1, v1), (k2, v2) in zip(
-            model.state_dict().items(), model2.state_dict().items(), strict=True
-        ):
-            assert k1 == k2, f"state_dict key mismatch: {k1} vs {k2}"
-            torch.testing.assert_close(v1, v2)
+    # finishing 20 promotes it
+    write_all(20)
+    ckpt.mark_complete(20)
+    assert ckpt.latest() == 20
+    assert ckpt.valid_step(20) == 20
 
-        s1, s2 = optimizer.state_dict(), optimizer2.state_dict()
-        assert s1["param_groups"] == s2["param_groups"]
-        for pid, st in s1["state"].items():
-            for key, val in st.items():
-                torch.testing.assert_close(val, s2["state"][pid][key])
+    # marking an already-marked step is a no-op, not an error
+    ckpt.mark_complete(20)
+    assert ckpt.latest() == 20
 
-        assert scheduler2.last_epoch == scheduler.last_epoch
-        assert scheduler2.get_last_lr() == scheduler.get_last_lr()
+    # a step that was never written at all
+    assert not ckpt.is_complete(30)
+    assert ckpt.valid_step(30) is None
 
-        resumed_next = next(iter(loader2))
-        torch.testing.assert_close(resumed_next, expected_next)
+    # non-numeric entries in the run dir must not break the scan
+    os.makedirs(os.path.join(tmp, "marker_run", "scratch"), exist_ok=True)
+    assert ckpt.latest() == 20
 
-        # trainer state: a plain dict (step, rng, config snapshot), no
-        # state_dict holder. cpu-only here; the trainer adds cuda_rng on
-        # real runs. rng restore must reproduce the exact next draw.
-        torch.manual_seed(7)
-        trainer_state = {
-            "step": step,
-            "cpu_rng": torch.get_rng_state(),
-            "config": {"run_name": "test", "lr": 1e-3},
-        }
-        expected_draw = torch.randn(4)
-        ckpt.save_trainer(trainer_state, step)
-        loaded = ckpt.load_trainer(step)
-        assert loaded["step"] == step
-        assert loaded["config"] == trainer_state["config"]
-        torch.set_rng_state(loaded["cpu_rng"])
-        torch.testing.assert_close(torch.randn(4), expected_draw)
 
-        print("all checkpointer roundtrip checks passed")
+def main() -> None:
+    tmp = tempfile.mkdtemp(prefix="torchure_ckpt_test_")
+    try:
+        check_roundtrip(tmp)
+        check_completion_marker(tmp)
+        print("all checkpointer checks passed")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
