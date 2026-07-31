@@ -71,7 +71,13 @@ def main() -> None:
     dist.init_process_group(timeout=timedelta(minutes=10))
 
     try:
-        trainer = Trainer(args.config, rank=rank, local_rank=local_rank, world_size=world_size)
+        trainer = Trainer(
+            args.config,
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            benchmark=args.steps is not None,
+        )
         if args.steps is not None:
             trainer.train_n_step_test(args.steps)
         else:
