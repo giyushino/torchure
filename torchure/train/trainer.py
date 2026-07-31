@@ -197,7 +197,7 @@ class Trainer:
             self.mesh.coordinate("dp"), self.mesh.size("dp")
         )
     
-    @debug_time
+    # @debug_time
     def get_batch_prefetcher(self) -> dict[str, torch.Tensor]:
         # the prefetcher already queued this batch's copy on a side stream last
         # step; this waits for it and kicks off the next one. pin_memory=True on
