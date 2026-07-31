@@ -237,14 +237,16 @@ class Qwen3TransformerBlock(nn.Module):
         emb_dim: int,
         num_kv_heads: int = 8,
         head_dim: int | None = None,
+        ffn_dim: int | None = None,
     ):
         super().__init__()
         self.gqa = Qwen3GroupQueryAttention(num_heads, emb_dim, num_kv_heads, head_dim)
         self.norm1 = nn.RMSNorm(emb_dim)
         self.norm2 = nn.RMSNorm(emb_dim)
-        
-        # round up dim to more hardware friendly number
-        ffn_dim = 256 * ((int(8 * emb_dim / 3) + 255) // 256)
+
+        if ffn_dim is None:
+            # round up dim to more hardware friendly number
+            ffn_dim = 256 * ((int(8 * emb_dim / 3) + 255) // 256)
         self.ffn  = SwiGLU(emb_dim, ffn_dim)
 
     def forward(
@@ -269,13 +271,14 @@ class Qwen3(nn.Module):
         num_kv_heads: int,
         emb_dim: int,
         head_dim: int,
-        vocab_size: int
+        vocab_size: int,
+        ffn_dim: int | None = None,
     ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, emb_dim)
         self.rope = Qwen3RotaryEmbedding(head_dim)
         self.blocks = nn.ModuleList(
-            Qwen3TransformerBlock(num_heads, emb_dim, num_kv_heads, head_dim)
+            Qwen3TransformerBlock(num_heads, emb_dim, num_kv_heads, head_dim, ffn_dim)
             for _ in range(num_layers)
         )
         self.norm = nn.RMSNorm(emb_dim)
