@@ -149,11 +149,12 @@ def all_gather(
     gather_dim: int = 0,
     *,
     async_op: bool = False,
+    output_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, dist.Work]:
     """
     gather every rank's `tensor` and concatenate along `gather_dim`, ordered
     by coordinate. out.shape[gather_dim] == tensor.shape[gather_dim] * size.
-    returns a new tensor; all ranks get the same result.
+    all ranks get the same result.
 
     impl notes:
     - wrap dist.all_gather_into_tensor (single preallocated output, one
@@ -161,14 +162,43 @@ def all_gather(
     - it only stacks along dim 0: for gather_dim != 0, movedim before and
       after. inputs must be contiguous -- either .contiguous() or assert,
       never silently corrupt.
+    - `output_tensor` lets the caller own the destination instead of taking a
+      fresh allocation per call; the returned tensor then aliases it. this is
+      for fsdp2, which unshards each unit into one buffer reused every step:
+      the param views into that buffer stay the same objects across steps
+      (stable for compile guards), and freeing becomes a storage resize the
+      caller times rather than a refcount drop the allocator may reuse under
+      an in-flight collective. restricted to gather_dim == 0 -- the collective
+      always stacks along dim 0, so a buffer shaped like the *returned* view
+      at any other gather_dim passes a numel check and comes back transposed.
     """
     group = mesh.get_group(dim)
     group_size = mesh.size(dim)
     input_tensor = tensor.movedim(gather_dim, 0).contiguous()
-    output_tensor = torch.empty(
-        (group_size * input_tensor.size(0), *input_tensor.size()[1:]), 
-        dtype=tensor.dtype, device=tensor.device
-    )
+    expected_shape = (group_size * input_tensor.size(0), *input_tensor.size()[1:])
+
+    # `is None`, not truthiness: bool() on a tensor raises for anything with
+    # more than one element and reads the *value* for exactly one, so a falsy
+    # 1-element buffer would be silently thrown away and reallocated.
+    if output_tensor is None:
+        output_tensor = torch.empty(
+            expected_shape, dtype=tensor.dtype, device=tensor.device
+        )
+    else:
+        assert gather_dim == 0, (
+            f"caller-provided output_tensor requires gather_dim=0, got {gather_dim}; "
+            "the buffer is in stacked-along-0 layout, not the returned view's layout"
+        )
+        assert tuple(output_tensor.shape) == expected_shape, (
+            f"output_tensor shape {tuple(output_tensor.shape)} != expected {expected_shape}"
+        )
+        assert output_tensor.dtype == tensor.dtype, (
+            f"output_tensor dtype {output_tensor.dtype} != input dtype {tensor.dtype}"
+        )
+        assert output_tensor.device == tensor.device, (
+            f"output_tensor device {output_tensor.device} != input device {tensor.device}"
+        )
+        assert output_tensor.is_contiguous(), "output_tensor must be contiguous"
 
     work = dist.all_gather_into_tensor(
         output_tensor=output_tensor, input_tensor=input_tensor, 
