@@ -1,4 +1,5 @@
 """
+https://www.aleksagordic.com/blog/collective-operations
 https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html
 mesh-aware collective wrappers over torch.distributed.
 
@@ -216,6 +217,7 @@ def reduce_scatter(
     scatter_dim: int = 0,
     *,
     async_op: bool = False,
+    output_tensor: torch.Tensor | None = None
 ) -> torch.Tensor | tuple[torch.Tensor, dist.Work]:
     """
     reduce across the group, then each rank keeps only its coordinate-th
@@ -234,9 +236,27 @@ def reduce_scatter(
     group_size = mesh.size(dim)
     assert tensor.shape[scatter_dim] % group_size == 0, f"shape[{scatter_dim}]={tensor.shape[scatter_dim]} not divisible by group size {group_size}"
     input_tensor = tensor.movedim(scatter_dim, 0).contiguous()
-    output_tensor = torch.empty((input_tensor.size(0) // group_size, *input_tensor.size()[1:]), 
-                                dtype=tensor.dtype, device=tensor.device
-    )
+    expected_shape = (input_tensor.size(0) // group_size, *input_tensor.size()[1:])
+    if output_tensor is None:
+        output_tensor = torch.empty(
+            expected_shape, dtype=tensor.dtype, device=tensor.device
+        )
+    else:
+        assert scatter_dim == 0, (
+            f"caller-provided output_tensor requires gather_dim=0, got {scatter_dim}; "
+            "the buffer is in stacked-along-0 layout, not the returned view's layout"
+        )
+        assert tuple(output_tensor.shape) == expected_shape, (
+            f"output_tensor shape {tuple(output_tensor.shape)} != expected {expected_shape}"
+        )
+        assert output_tensor.dtype == tensor.dtype, (
+            f"output_tensor dtype {output_tensor.dtype} != input dtype {tensor.dtype}"
+        )
+        assert output_tensor.device == tensor.device, (
+            f"output_tensor device {output_tensor.device} != input device {tensor.device}"
+        )
+        assert output_tensor.is_contiguous(), "output_tensor must be contiguous"
+
 
     if op == "avg" and dist.get_backend(group) != "nccl":
         # no ReduceOp.AVG here: sum, then divide locally. the divide must
