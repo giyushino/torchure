@@ -2,9 +2,6 @@
 ddp: replicate the model along the mesh's dp axis and keep replicas in
 lockstep by averaging grads across the axis after every backward.
 
-design (roadmap phase 1.2 -- overlap version, since grad sync on a pcie-only
-box is the whole ballgame):
-
 - buckets in reverse `model.parameters()` order, which approximates backward
   completion order, so early buckets fill (and their all-reduce launches)
   while the rest of backward is still computing. bucket fill order is the
