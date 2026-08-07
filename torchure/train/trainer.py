@@ -425,7 +425,7 @@ class Trainer:
         try:
             for step in range(self.start_step, self.num_train_steps):
                 metrics, time = self.train_step()
-                if (step + 1) % self.save_steps == 0 and step != 0:
+                if ((step + 1) % self.save_steps == 0 and step != 0) or (step + 1) == self.num_train_steps:
                     self.checkpoint(step + 1)
                 if self.rank == 0:
                     self._log_metrics(metrics, step + 1, tokens_per_step, time)
