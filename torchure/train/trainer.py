@@ -125,6 +125,12 @@ class Trainer:
         self.checkpointer = Checkpointer(self.checkpointer_path)
         self.resume = self.config["checkpointing"]["resume"]
         self.save_steps = self.config["checkpointing"]["save_steps"]
+        # a "continue" run that grows total_steps past the checkpointed
+        # schedule wants the freshly-built scheduler's warmup/decay, not the
+        # old one -- loading the old scheduler state would clobber
+        # total_steps/warmup_ratio/decay_ratio right back to the prior run's
+        # values (LRScheduler.load_state_dict is a blind __dict__.update)
+        self.resume_scheduler = self.config["checkpointing"].get("resume_scheduler", True)
         # set by _resume when it finds a checkpoint: the wandb run this
         # experiment was already logging to, so we reattach instead of
         # splitting one loss curve across a new run per restart
@@ -343,7 +349,15 @@ class Trainer:
         )
         self.checkpointer.load_model(self.model, step)
         self.checkpointer.load_optimizer(self.optimizer, step)
-        self.checkpointer.load_scheduler(self.scheduler, step)
+        if self.resume_scheduler:
+            self.checkpointer.load_scheduler(self.scheduler, step)
+        else:
+            # keep this run's freshly-built scheduler (its total_steps /
+            # warmup_ratio / decay_ratio come from the current config, not
+            # the checkpointed run's) but still pick up the curve at the
+            # step the prior run left off, matching the numbering
+            # load_scheduler would otherwise have restored
+            self.scheduler.last_epoch = step
         self.checkpointer.load_dataloader(self.dataloader, step, self.mesh.coordinate("dp"))
         # rank 0's rng lands on every rank; harmless while nothing samples
         # per step, revisit with per-rank seed derivation (roadmap 0.3)
