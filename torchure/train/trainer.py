@@ -131,6 +131,13 @@ class Trainer:
         # total_steps/warmup_ratio/decay_ratio right back to the prior run's
         # values (LRScheduler.load_state_dict is a blind __dict__.update)
         self.resume_scheduler = self.config["checkpointing"].get("resume_scheduler", True)
+        # restoring a streaming IterableDataset's exact position means every
+        # dataloader worker replays (downloads + discards) everything it already
+        # consumed in its current shard -- for a resume deep into training that
+        # can take a long time with zero visible progress. false trades exact
+        # data-order continuity for an immediate start: the stream re-shuffles
+        # from the top instead of picking up mid-shard.
+        self.resume_dataloader = self.config["checkpointing"].get("resume_dataloader", True)
         # set by _resume when it finds a checkpoint: the wandb run this
         # experiment was already logging to, so we reattach instead of
         # splitting one loss curve across a new run per restart
@@ -358,7 +365,8 @@ class Trainer:
             # step the prior run left off, matching the numbering
             # load_scheduler would otherwise have restored
             self.scheduler.last_epoch = step
-        self.checkpointer.load_dataloader(self.dataloader, step, self.mesh.coordinate("dp"))
+        if self.resume_dataloader:
+            self.checkpointer.load_dataloader(self.dataloader, step, self.mesh.coordinate("dp"))
         # rank 0's rng lands on every rank; harmless while nothing samples
         # per step, revisit with per-rank seed derivation (roadmap 0.3)
         torch.set_rng_state(state["cpu_rng"])

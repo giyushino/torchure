@@ -103,12 +103,18 @@ def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int
     # global_batch_size and validates divisibility against dp_size, so nothing
     # here needs to know the global batch exists.
     #return torch.utils.data.DataLoader(
+    num_workers = data_cfg["num_workers"]
     return StatefulDataLoader(
         dataset,
         batch_size=data_cfg["micro_batch_size"],
-        num_workers=data_cfg["num_workers"],
+        num_workers=num_workers,
         collate_fn=Collator(tokenizer, ignore_id),
-        persistent_workers=True,
+        persistent_workers=num_workers > 0,
+        # spawn, not the default fork: workers otherwise inherit whatever
+        # live sockets/background threads the streaming HTTP filesystem
+        # opened in the parent (fsspec's async event-loop thread in
+        # particular), which can deadlock a worker on its first request
+        multiprocessing_context="spawn" if num_workers > 0 else None,
         pin_memory=True
     )
 
