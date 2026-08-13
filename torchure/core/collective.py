@@ -20,8 +20,10 @@ decisions baked into the signatures (so the call sites don't churn later):
   all_to_all allocate and return a NEW tensor (the output shape differs
   anyway).
 - op is a lowercase string, not dist.ReduceOp, so "avg" can be emulated on
-  gloo (which has no ReduceOp.AVG): all_reduce "sum", then divide by
-  mesh.size(dim) locally. nccl uses ReduceOp.AVG directly.
+  gloo (which has no ReduceOp.AVG): divide by mesh.size(dim) locally, then
+  reduce with "sum". pre-dividing rather than post-dividing is what keeps
+  async_op=True working on the emulated path -- there is no fixup owed after
+  the wait. nccl uses ReduceOp.AVG directly.
 - no autograd through these: they run on grads/params/buffers outside any
   compiled graph. when tp needs collectives *inside* compiled blocks, swap
   the internals to torch.distributed._functional_collectives behind these
@@ -235,6 +237,27 @@ def reduce_scatter(
     group = mesh.get_group(dim)
     group_size = mesh.size(dim)
     assert tensor.shape[scatter_dim] % group_size == 0, f"shape[{scatter_dim}]={tensor.shape[scatter_dim]} not divisible by group size {group_size}"
+
+    # no ReduceOp.AVG here: pre-divide, then sum. dividing before the reduce
+    # gives the same mean (group size is fixed) and, unlike sum-then-divide,
+    # needs no post-wait fixup -- which is what lets async_op work on this
+    # path (fsdp's backward wants this call overlapped).
+    #
+    # two things this has to get right, both of which the all_reduce version
+    # of this block gets for free and this one does NOT:
+    #   - it runs BEFORE input_tensor is built. .contiguous() below may copy
+    #     (any scatter_dim != 0, or a non-contiguous input), and a divide
+    #     applied after that copy is written to a tensor nobody reduces --
+    #     silently a plain "sum" labelled "avg", off by exactly group_size.
+    #   - `/`, not `/=`. all_reduce is documented in-place on its input, so
+    #     mutating there is the contract; reduce_scatter allocates a new
+    #     output and leaves the input alone. under fsdp the input is the
+    #     unsharded grad buffer, and scaling it in place would corrupt every
+    #     later read of it, on gloo only.
+    if op == "avg" and dist.get_backend(group) != "nccl":
+        tensor = tensor / group_size
+        op = "sum"
+
     input_tensor = tensor.movedim(scatter_dim, 0).contiguous()
     expected_shape = (input_tensor.size(0) // group_size, *input_tensor.size()[1:])
     if output_tensor is None:
@@ -256,17 +279,6 @@ def reduce_scatter(
             f"output_tensor device {output_tensor.device} != input device {tensor.device}"
         )
         assert output_tensor.is_contiguous(), "output_tensor must be contiguous"
-
-
-    if op == "avg" and dist.get_backend(group) != "nccl":
-        # no ReduceOp.AVG here: sum, then divide locally. the divide must
-        # happen after the sum completes, so no async on this path (v0);
-        # revisit with a Work wrapper if a consumer ever needs it.
-        assert not async_op, "async 'avg' unsupported on backends without ReduceOp.AVG"
-        dist.reduce_scatter_tensor(output=output_tensor, input=input_tensor, op=_OPS["sum"], group=group)
-        out = output_tensor.movedim(0, scatter_dim)
-        out /= group_size
-        return out
 
     work = dist.reduce_scatter_tensor(output=output_tensor, input=input_tensor, op=_OPS[op], group=group, async_op=async_op)
     out = output_tensor.movedim(0, scatter_dim)

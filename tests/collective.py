@@ -169,6 +169,69 @@ def test_reduce_scatter(mesh, dim, device):
             )
 
 
+def test_reduce_scatter_avg_contract(mesh, dim, device):
+    # the "avg" emulation on backends without ReduceOp.AVG pre-divides the
+    # input and reduces with "sum". every case below is one this got wrong
+    # while test_reduce_scatter above stayed green: that test only ever
+    # passes scatter_dim=0 with a contiguous throwaway tensor, which is
+    # exactly the one layout where the divide lands on the reduced tensor by
+    # accident and the mutation is invisible.
+    c, g = mesh.coordinate(dim), mesh.size(dim)
+    avged = rank_pattern((3, 4 * g), 0, device) * ((g + 1) / 2)
+
+    # scatter_dim != 0: .contiguous() copies, so a divide applied to the
+    # caller's tensor after that copy never reaches the collective
+    out = C.reduce_scatter(
+        rank_pattern((3, 4 * g), c, device), mesh, dim, "avg", scatter_dim=1
+    )
+    assert out.shape == (3, 4), f"shape {tuple(out.shape)} != (3, 4)"
+    torch.testing.assert_close(
+        out,
+        avged[:, 4 * c : 4 * c + 4],
+        msg="'avg' at scatter_dim=1 is wrong (divide applied after the "
+            "contiguous() copy? off by exactly group size)",
+    )
+
+    # non-contiguous input at scatter_dim=0: same copy, same trap, without
+    # needing a non-zero scatter_dim to trigger it
+    out = C.reduce_scatter(
+        rank_pattern((3, 4 * g), c, device).t(), mesh, dim, "avg", scatter_dim=0
+    )
+    torch.testing.assert_close(
+        out,
+        avged.t()[4 * c : 4 * c + 4],
+        msg="'avg' on a non-contiguous input is wrong (divide lost to the copy)",
+    )
+
+    # the out-of-place contract: unlike all_reduce, this op allocates its
+    # output and must leave the input untouched. under fsdp the input is the
+    # unsharded grad buffer -- scaling it in place corrupts every later read.
+    x = rank_pattern((4 * g, 3), c, device)
+    before = x.clone()
+    C.reduce_scatter(x, mesh, dim, "avg", scatter_dim=0)
+    torch.testing.assert_close(
+        x, before, msg="reduce_scatter mutated its input (in-place divide?)"
+    )
+
+    # async on the emulated path: pre-dividing (rather than dividing after
+    # the reduce) is what makes this legal, and it is the call fsdp's
+    # backward wants overlapped -- so the cpu suite has to cover it.
+    res = C.reduce_scatter(
+        rank_pattern((4 * g, 3), c, device), mesh, dim, "avg",
+        scatter_dim=0, async_op=True,
+    )
+    assert isinstance(res, tuple) and len(res) == 2, (
+        "async_op=True must return (tensor, work) on the 'avg' path too"
+    )
+    out, work = res
+    work.wait()
+    torch.testing.assert_close(
+        out,
+        (rank_pattern((4 * g, 3), 0, device) * ((g + 1) / 2))[4 * c : 4 * c + 4],
+        msg="async 'avg' disagrees with sync 'avg'",
+    )
+
+
 def test_fsdp_identity(mesh, dim, device):
     # the identity fsdp is built on:
     # all_gather(reduce_scatter(x)) == all_reduce(x)
@@ -316,6 +379,7 @@ TESTS = [
     test_broadcast,
     test_all_gather,
     test_reduce_scatter,
+    test_reduce_scatter_avg_contract,
     test_fsdp_identity,
     test_all_to_all,
     test_ring_send_recv,
