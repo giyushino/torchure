@@ -5,6 +5,57 @@ mesh
 import torch.distributed as dist
 
 
+def normalize_dp_spec(spec: dict[str, int]) -> dict[str, int]:
+    """
+    expand a config's mesh spec so the data-parallel axis is always the pair
+    (dp_replicate, dp_shard), preserving the order of every other axis.
+
+    **`dp: N` is shorthand for `dp_replicate: N`**, not dp_shard. that keeps
+    every existing ddp config bit-identical: the two axes are laid out with
+    dp_shard innermost, so at dp_shard=1 the dp_replicate groups are exactly
+    the groups the old single `dp` axis produced, and DDP (which runs on the
+    flattened `dp`) sees no change at all. an fsdp config asks for sharding
+    explicitly with `dp_shard: N`.
+
+    the flattened `dp` axis the dataloader and the loss all-reduce use is
+    registered by the caller via mesh.flatten(("dp_replicate","dp_shard"),"dp")
+    -- which is also why `dp` must not survive here as a real axis.
+    """
+    out: dict[str, int] = {}
+    for axis, size in spec.items():
+        if axis == "dp":
+            assert "dp_replicate" not in spec and "dp_shard" not in spec, (
+                "mesh spec has both `dp` and an explicit dp_replicate/dp_shard; "
+                "use one or the other"
+            )
+            out["dp_replicate"] = size
+            out["dp_shard"] = 1
+        elif axis == "dp_replicate":
+            out["dp_replicate"] = size
+            out.setdefault("dp_shard", spec.get("dp_shard", 1))
+        elif axis == "dp_shard":
+            out.setdefault("dp_replicate", spec.get("dp_replicate", 1))
+            out["dp_shard"] = size
+        else:
+            out[axis] = size
+
+    assert "dp_shard" in out, (
+        f"mesh spec {spec} has no data-parallel axis; expected one of "
+        "`dp`, `dp_replicate`, `dp_shard`"
+    )
+    # dp_replicate must precede dp_shard: Mesh.flatten requires spec order, and
+    # that order is what makes coordinate("dp") the row-major index the
+    # dataloader splits on
+    ordered = {}
+    for axis in out:
+        if axis == "dp_shard":
+            continue
+        ordered[axis] = out[axis]
+        if axis == "dp_replicate":
+            ordered["dp_shard"] = out["dp_shard"]
+    return ordered
+
+
 class Mesh:
     def __init__(self, spec: dict[str, int]):
         assert dist.is_initialized(), "init_process_group() must be called before building a Mesh"

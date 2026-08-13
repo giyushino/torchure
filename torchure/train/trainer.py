@@ -26,13 +26,14 @@ from tokenizers import Tokenizer
 from torchure.checkpoint.checkpointer import Checkpointer
 from torchure.core.collective import all_reduce, barrier
 from torchure.core.grad_helper import clip_grad_norm
-from torchure.core.mesh import Mesh
+from torchure.core.mesh import Mesh, normalize_dp_spec
 from torchure.dataloader.builder import build_dataloader
 from torchure.dataloader.prefetcher import CUDAPrefetcher
 from torchure.models.builder import build_model
 from torchure.objectives.builder import build_objective
 from torchure.optimizer.builder import build_optimizer, build_scheduler
 from torchure.parallelism.data_parallel import DDP
+from torchure.parallelism.fsdp2 import FSDP
 from torchure.utils import record_time, debug_time, get_project_dir
 
 
@@ -46,6 +47,17 @@ torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
 PROJECT_DIR = get_project_dir()
+
+# config strings -> dtypes for the fsdp mixed-precision policy. None means "no
+# cast": gathered params keep the master dtype, which is what an fp32 debug run
+# wants.
+_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+    None: None,
+    "none": None,
+}
 
 def load_json(train_config_path: str) -> dict:
     with open(train_config_path, 'r') as file:
@@ -78,8 +90,14 @@ class Trainer:
         self.benchmark = benchmark
         self.device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(local_rank)  # have the process own this specific GPU
-        self.mesh = Mesh(self.config["mesh"])
+        # `dp: N` in a config is shorthand for dp_replicate: N (see
+        # normalize_dp_spec), so every pre-fsdp config keeps its exact layout.
+        self.mesh = Mesh(normalize_dp_spec(self.config["mesh"]))
+        # one coordinate spanning both dp axes: which batch shard am i. the
+        # dataloader split, the loss all-reduce and ddp all run on this.
+        self.mesh.flatten(("dp_replicate", "dp_shard"), "dp")
         self.dp_size = self.mesh.size("dp")
+        self.dp_shard_size = self.mesh.size("dp_shard")
 
         self.ignore_index = self.config["objective"]["config"]["ignore_index"]
         self.tokenizer = Tokenizer.from_pretrained(self.config["data"]["tokenizer"])
@@ -125,6 +143,24 @@ class Trainer:
         self.checkpointer = Checkpointer(self.checkpointer_path)
         self.resume = self.config["checkpointing"]["resume"]
         self.save_steps = self.config["checkpointing"]["save_steps"]
+        # PHASE 3 GUARD. checkpointing here is replica-shaped: rank 0 writes
+        # model/optimizer/scheduler as if its tensors were the whole model.
+        # under fsdp they are rank 0's SHARD, so a save would silently produce
+        # a file that looks valid, loads without complaint into a dp_shard=1
+        # run, and contains 1/dp_shard of the weights. resume is worse -- it
+        # would load full-sized tensors into sharded params and blow up on
+        # shape, but only after the run had already been going for hours.
+        # sharded checkpointing is roadmap phase 3; until then, refuse at
+        # construction rather than at the first save_steps boundary.
+        if self.dp_shard_size > 1 and not self.benchmark:
+            assert self.save_steps is None and self.resume is None, (
+                "fsdp (dp_shard > 1) cannot checkpoint yet: saving would write "
+                "rank 0's shard as if it were the whole model, and resuming "
+                "would load a full tensor into a sharded param. set "
+                '\'checkpointing\': {"resume": null, "save_steps": null} to run '
+                "without checkpoints, or use --steps for a benchmark. sharded "
+                "checkpointing is roadmap phase 3"
+            )
         # a "continue" run that grows total_steps past the checkpointed
         # schedule wants the freshly-built scheduler's warmup/decay, not the
         # old one -- loading the old scheduler state would clobber
@@ -210,21 +246,38 @@ class Trainer:
 
     def _parallelize(self, model: nn.Module) -> nn.Module:
         """
-        ddp for now: replicate along the dp axis, bucketed grad sync
-        overlapped with backward. tensor/expert/context parallel + fsdp2
-        slot in here later, driven by the same mesh.
+        dp_shard > 1 picks fsdp2 (per-param Shard(0), hsdp when dp_replicate
+        > 1 as well); otherwise ddp replicates along the flattened dp axis.
+        tensor/expert/context parallel slot in here later, same mesh.
 
         runs before _compile on purpose: the grad hooks sit on params at the
         AccumulateGrad boundary, outside the compiled regions. at dp=1 the
-        DDP ctor is a complete no-op (no hooks, no groups touched).
+        DDP ctor and at dp_shard=1 the FSDP ctor are complete no-ops.
+
+        runs AFTER _init_weights on purpose too: fsdp v0 shards by "every rank
+        inits the full model, broadcasts, and keeps its own slice", so the
+        weights have to exist before the ctor sees them. meta-device init
+        would flip this order, which is the one thing that would.
         """
-        ddp_cfg = self.config.get("ddp", {})
-        self.ddp = DDP(
-            model,
-            self.mesh,
-            dim="dp",
-            bucket_mb=ddp_cfg.get("bucket_mb", 25),
-        )
+        if self.dp_shard_size > 1:
+            fsdp_cfg = self.config.get("fsdp", {})
+            self.dp = FSDP(
+                model,
+                self.mesh,
+                shard_dim="dp_shard",
+                replicate_dim="dp_replicate",
+                param_dtype=_DTYPES[fsdp_cfg.get("param_dtype", "bfloat16")],
+                reduce_dtype=_DTYPES[fsdp_cfg.get("reduce_dtype", "float32")],
+                prefetch=fsdp_cfg.get("prefetch", 1),
+            )
+        else:
+            ddp_cfg = self.config.get("ddp", {})
+            self.dp = DDP(
+                model,
+                self.mesh,
+                dim="dp",
+                bucket_mb=ddp_cfg.get("bucket_mb", 25),
+            )
         return model
 
     def _compile(self, model: nn.Module) -> None:
@@ -304,6 +357,10 @@ class Trainer:
     
     @debug_time
     def checkpoint(self, step: int) -> None:
+        assert self.dp_shard_size == 1, (
+            "checkpoint() under fsdp would save rank 0's shard as the model; "
+            "see the phase 3 guard in __init__"
+        )
         # model/optimizer/scheduler are replicas under ddp: rank 0 writes the
         # single copy (sharded state is roadmap phase 3). dataloader position
         # is per dp shard, so every dp rank writes its own file.
@@ -388,17 +445,22 @@ class Trainer:
     @record_time
     def train_step(self) -> dict[str, torch.Tensor]:
         loss = torch.zeros((), device=self.device)
-        self.ddp.requires_sync = False
+        self.dp.requires_sync = False
         for _ in range(self.microbatches_per_step - 1):
             loss += self.micro_train_step()
 
         # the last microbatch is the one whose hooks launch the bucket
         # all-reduces, over the fully accumulated grads
-        self.ddp.requires_sync = True
+        self.dp.requires_sync = True
         loss += self.micro_train_step()
-        self.ddp.sync()
+        self.dp.sync()
+        # under fsdp every .grad is a Shard(0) slice, so the global norm has
+        # to reduce over dp_shard. leaving this () gives a silently TOO SMALL
+        # norm (each rank measures 1/dp_shard of the squares), which under-clips
+        # rather than crashing.
         grad_norm = clip_grad_norm(
-            self.model.parameters(), self.mesh, self.max_norm, shard_dims=()
+            self.model.parameters(), self.mesh, self.max_norm,
+            shard_dims=("dp_shard",) if self.dp_shard_size > 1 else (),
         )
         self.optimizer.step()
         self.optimizer.zero_grad()
@@ -433,7 +495,10 @@ class Trainer:
         try:
             for step in range(self.start_step, self.num_train_steps):
                 metrics, time = self.train_step()
-                if ((step + 1) % self.save_steps == 0 and step != 0) or (step + 1) == self.num_train_steps:
+                if self.save_steps is not None and (
+                    ((step + 1) % self.save_steps == 0 and step != 0)
+                    or (step + 1) == self.num_train_steps
+                ):
                     self.checkpoint(step + 1)
                 if self.rank == 0:
                     self._log_metrics(metrics, step + 1, tokens_per_step, time)
