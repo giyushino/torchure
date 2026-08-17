@@ -78,8 +78,8 @@ class Trainer:
         self.benchmark = benchmark
         self.device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(local_rank)  # have the process own this specific GPU
-        self.mesh = Mesh(self.config["mesh"])
-        self.dp_size = self.mesh.size("dp")
+        self.mesh = self._build_mesh()
+        self.dp_size = self.mesh.size("dp_shard")
 
         self.ignore_index = self.config["objective"]["config"]["ignore_index"]
         self.tokenizer = Tokenizer.from_pretrained(self.config["data"]["tokenizer"])
@@ -288,6 +288,13 @@ class Trainer:
             self.config["data"], self.tokenizer, self.ignore_index, 
             self.mesh.coordinate("dp"), self.mesh.size("dp")
         )
+
+    def _build_mesh(self) -> Mesh:
+        mesh_cfg = self.config["mesh"]
+        mesh = Mesh(mesh_cfg)
+        mesh.flatten(("dp_replicate", "dp_shard"), "dp")
+        return mesh
+
     
     # @debug_time
     def get_batch_prefetcher(self) -> dict[str, torch.Tensor]:
