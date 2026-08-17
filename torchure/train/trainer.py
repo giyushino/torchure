@@ -79,7 +79,7 @@ class Trainer:
         self.device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(local_rank)  # have the process own this specific GPU
         self.mesh = self._build_mesh()
-        self.dp_size = self.mesh.size("dp_shard")
+        self.dp_size = self.mesh.size("dp")
 
         self.ignore_index = self.config["objective"]["config"]["ignore_index"]
         self.tokenizer = Tokenizer.from_pretrained(self.config["data"]["tokenizer"])
@@ -291,7 +291,16 @@ class Trainer:
 
     def _build_mesh(self) -> Mesh:
         mesh_cfg = self.config["mesh"]
-        mesh = Mesh(mesh_cfg)
+        assert not ("dp" in mesh_cfg and ("dp_replicate" in mesh_cfg or "dp_shard" in mesh_cfg)), (
+            f"mesh spec {self.config['mesh']}: `dp` is shorthand for `dp_shard`; "
+            "don't mix it with the explicit axes"
+        )
+
+        if "dp" in mesh_cfg:
+            mesh_cfg["dp_shard"] = mesh_cfg.pop("dp")
+
+        spec = {axis: mesh_cfg.pop(axis, 1) for axis in ("pp", "dp_replicate", "dp_shard", "cp", "tp", "ep")}
+        mesh = Mesh(spec)
         mesh.flatten(("dp_replicate", "dp_shard"), "dp")
         return mesh
 
