@@ -290,7 +290,28 @@ class Trainer:
         )
 
     def _build_mesh(self) -> Mesh:
-        mesh_cfg = self.config["mesh"]
+        """
+        canonicalize the config's mesh spec, then register the flattened `dp`
+        axis every consumer downstream uses (dataloader split, loss reduce,
+        ddp's grad sync).
+
+        `dp: N` is shorthand for `dp_shard: N` -- sharding is the interesting
+        axis, and plain ddp is `dp_replicate: N` spelled out.
+
+        the spec is REBUILT in a fixed axis order rather than passed through,
+        because dict order is load-bearing twice over: Mesh gives the last axis
+        stride 1 (so tp/cp innermost puts their groups on adjacent ranks, i.e.
+        the fast links), and mesh.flatten asserts its axes follow spec order --
+        which is what makes coordinate("dp") equal the row-major index
+        all_gather along that axis relies on. neither should be something a
+        config author can get wrong by typing the keys in a different order.
+        """
+        # COPY: both pops below would otherwise mutate self.config["mesh"] in
+        # place and leave it empty. that dict is snapshotted into the
+        # checkpoint by save_trainer and compared by _resume's mesh-change
+        # guard, so mutating it writes "mesh": {} into every checkpoint and
+        # turns that guard into {} == {} -- vacuously true, silently gone.
+        mesh_cfg = dict(self.config["mesh"])
         assert not ("dp" in mesh_cfg and ("dp_replicate" in mesh_cfg or "dp_shard" in mesh_cfg)), (
             f"mesh spec {self.config['mesh']}: `dp` is shorthand for `dp_shard`; "
             "don't mix it with the explicit axes"
@@ -299,7 +320,18 @@ class Trainer:
         if "dp" in mesh_cfg:
             mesh_cfg["dp_shard"] = mesh_cfg.pop("dp")
 
-        spec = {axis: mesh_cfg.pop(axis, 1) for axis in ("pp", "dp_replicate", "dp_shard", "cp", "tp", "ep")}
+        AXIS_ORDER = ("pp", "dp_replicate", "dp_shard", "cp", "tp", "ep")
+
+        spec = {}
+        for axis in AXIS_ORDER:
+            size = mesh_cfg.pop(axis, 1)
+            # size-1 axes are not free -- Mesh._group_for yields one group PER
+            # RANK for them, so each unused axis costs world_size new_group
+            # calls (22 vs 6 at 4 ranks with all six declared). the two dp axes
+            # are the exception: flatten() needs both to exist, even at size 1.
+            if size > 1 or axis in ("dp_replicate", "dp_shard"):
+                spec[axis] = size
+
         mesh = Mesh(spec)
         mesh.flatten(("dp_replicate", "dp_shard"), "dp")
         return mesh
