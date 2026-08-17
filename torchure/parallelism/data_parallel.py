@@ -129,6 +129,19 @@ class DDP:
         _, work = all_reduce(grad, self.mesh, self.dim, "avg", async_op=True)
         self._works.append(work)
          
+    @property
+    def shard_dims(self) -> tuple[str, ...]:
+        """
+        mesh axes across which this strategy shards param/grad state -- none,
+        for ddp: every rank holds a full replica and the all_reduce leaves each
+        `.grad` complete.
+
+        the trainer hands this straight to clip_grad_norm, so the parallelism
+        strategy owns the answer instead of the training loop branching on
+        which one it is. fsdp2 returns ("dp_shard",) here.
+        """
+        return ()
+
     def _replicate(self, model: nn.Module):
         for tensor in [*model.parameters(), *model.buffers()]:
             broadcast(tensor.detach(), self.mesh, self.dim, src=0)

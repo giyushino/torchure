@@ -33,6 +33,7 @@ from torchure.models.builder import build_model
 from torchure.objectives.builder import build_objective
 from torchure.optimizer.builder import build_optimizer, build_scheduler
 from torchure.parallelism.data_parallel import DDP
+from torchure.parallelism.fsdp2 import FSDP
 from torchure.utils import record_time, debug_time, get_project_dir
 
 
@@ -81,6 +82,11 @@ class Trainer:
         self.mesh = self._build_mesh()
         self.dp_size = self.mesh.size("dp")
 
+        # which data-parallel strategy _parallelize builds. read here rather
+        # than inside it because it also decides whether checkpointing is
+        # allowed at all (see the guard below).
+        self.parallelism = self.config.get("parallelism", "ddp")
+
         self.ignore_index = self.config["objective"]["config"]["ignore_index"]
         self.tokenizer = Tokenizer.from_pretrained(self.config["data"]["tokenizer"])
 
@@ -125,6 +131,18 @@ class Trainer:
         self.checkpointer = Checkpointer(self.checkpointer_path)
         self.resume = self.config["checkpointing"]["resume"]
         self.save_steps = self.config["checkpointing"]["save_steps"]
+        # sharded save/load is roadmap phase 3. until it lands, checkpoint()
+        # has rank 0 write its own tensors as if they were the whole model --
+        # under fsdp those are one rank's shards, and the file only announces
+        # itself as corrupt at resume. fail at startup rather than at the first
+        # save_steps boundary, hours in. benchmark mode never checkpoints, so
+        # `--steps` stays the way to measure an fsdp run before phase 3.
+        assert self.benchmark or not self.parallel.shard_dims, (
+            f"parallelism={self.parallelism!r} shards model state across "
+            f"{self.parallel.shard_dims} and the checkpointer is still unsharded "
+            "(roadmap phase 3). run with --steps (benchmark mode, no "
+            "checkpointing) until sharded checkpointing lands."
+        )
         # a "continue" run that grows total_steps past the checkpointed
         # schedule wants the freshly-built scheduler's warmup/decay, not the
         # old one -- loading the old scheduler state would clobber
@@ -210,21 +228,45 @@ class Trainer:
 
     def _parallelize(self, model: nn.Module) -> nn.Module:
         """
-        ddp for now: replicate along the dp axis, bucketed grad sync
-        overlapped with backward. tensor/expert/context parallel + fsdp2
-        slot in here later, driven by the same mesh.
+        select the data-parallel strategy and attach it as `self.parallel`.
+        tensor/expert/context parallel slot in here later, driven by the same
+        mesh and composing with whichever of these is chosen.
+
+        the trainer talks to the result through three things only --
+        `requires_sync`, `sync()`, and `shard_dims` -- so train_step never
+        branches on which strategy is live. that's the whole abstraction; it
+        stays this thin until something needs more.
 
         runs before _compile on purpose: the grad hooks sit on params at the
-        AccumulateGrad boundary, outside the compiled regions. at dp=1 the
-        DDP ctor is a complete no-op (no hooks, no groups touched).
+        AccumulateGrad boundary, outside the compiled regions. at dp=1 (ddp) or
+        dp_shard=1 (fsdp) the ctor is a complete no-op -- no hooks, no buffers,
+        no groups touched.
         """
-        ddp_cfg = self.config.get("ddp", {})
-        self.ddp = DDP(
-            model,
-            self.mesh,
-            dim="dp",
-            bucket_mb=ddp_cfg.get("bucket_mb", 25),
-        )
+        if self.parallelism == "ddp":
+            ddp_cfg = self.config.get("ddp", {})
+            self.parallel = DDP(
+                model,
+                self.mesh,
+                dim="dp",
+                bucket_mb=ddp_cfg.get("bucket_mb", 25),
+            )
+        elif self.parallelism == "fsdp":
+            fsdp_cfg = self.config.get("fsdp", {})
+            self.parallel = FSDP(
+                model,
+                self.mesh,
+                shard_dim="dp_shard",
+                # hsdp: reduce-scatter along dp_shard, then all_reduce the
+                # sharded grads along dp_replicate. None when there is nothing
+                # to replicate over, so the ctor doesn't build a second path
+                # for a size-1 axis.
+                replicate_dim="dp_replicate" if self.mesh.size("dp_replicate") > 1 else None,
+                prefetch_depth=fsdp_cfg.get("prefetch_depth", 1),
+            )
+        else:
+            raise ValueError(
+                f"unknown parallelism {self.parallelism!r}; expected 'ddp' or 'fsdp'"
+            )
         return model
 
     def _compile(self, model: nn.Module) -> None:
@@ -436,17 +478,20 @@ class Trainer:
     @record_time
     def train_step(self) -> dict[str, torch.Tensor]:
         loss = torch.zeros((), device=self.device)
-        self.ddp.requires_sync = False
+        self.parallel.requires_sync = False
         for _ in range(self.microbatches_per_step - 1):
             loss += self.micro_train_step()
 
         # the last microbatch is the one whose hooks launch the bucket
-        # all-reduces, over the fully accumulated grads
-        self.ddp.requires_sync = True
+        # all-reduces, over the fully accumulated grads. (fsdp accepts and
+        # ignores this: it reduce-scatters every microbatch into the sharded
+        # fp32 grad rather than holding an unsharded grad across them.)
+        self.parallel.requires_sync = True
         loss += self.micro_train_step()
-        self.ddp.sync()
+        self.parallel.sync()
         grad_norm = clip_grad_norm(
-            self.model.parameters(), self.mesh, self.max_norm, shard_dims=()
+            self.model.parameters(), self.mesh, self.max_norm,
+            shard_dims=self.parallel.shard_dims,
         )
         self.optimizer.step()
         self.optimizer.zero_grad()

@@ -405,6 +405,19 @@ class FSDP:
             return
         raise NotImplementedError
 
+    @property
+    def shard_dims(self) -> tuple[str, ...]:
+        """
+        mesh axes across which param/grad state is sharded. this is what the
+        trainer passes to clip_grad_norm -- an unsharded-shaped grad sneaking
+        through with `()` gives a silently too-large norm, not a crash.
+
+        it doubles as "is model state sharded" for the checkpoint guard, which
+        is why `dp_shard == 1` must answer `()` rather than the axis name: at
+        size 1 nothing is split and rank 0's tensors really are the model.
+        """
+        return () if self.shard_size == 1 else (self.shard_dim,)
+
     # --- setup ------------------------------------------------------------
 
     def _build_units(self, model: nn.Module) -> list[FSDPUnit]:
