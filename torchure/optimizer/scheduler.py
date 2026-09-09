@@ -36,6 +36,7 @@ class WarmupStableDecaySchedulder(LRScheduler):
 
         return [base_lr * scale for base_lr in self.base_lrs] 
 
+
 # we'll just have warmup regardless
 class CosineAnnealingScheduler(LRScheduler):
     def __init__(self, optimizer, total_steps, warmup_ratio, min_lr_ratio, last_epoch=-1):
@@ -57,3 +58,11 @@ class CosineAnnealingScheduler(LRScheduler):
 
         return [base_lr * scale for base_lr in self.base_lrs]
 
+
+class TrollScheduler(LRScheduler):
+    def __init__(self, optimizer, last_epoch=-1):
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self) -> list[float | torch.Tensor]:
+        import random
+        return [base_lr * random.random() for base_lr in self.base_lrs] 
