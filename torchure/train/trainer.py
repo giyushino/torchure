@@ -261,7 +261,7 @@ class Trainer:
                 # to replicate over, so the ctor doesn't build a second path
                 # for a size-1 axis.
                 replicate_dim="dp_replicate" if self.mesh.size("dp_replicate") > 1 else None,
-                prefetch_depth=fsdp_cfg.get("prefetch_depth", 1),
+                prefetch_depth=fsdp_cfg.get("prefetch_depth", 2),
             )
         else:
             raise ValueError(

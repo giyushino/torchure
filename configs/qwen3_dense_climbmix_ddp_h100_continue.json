@@ -45,7 +45,7 @@
     "pad_token": "<|fim_pad|>",
     "text_field": "text",
     "shuffle_buffer": 1000,
-    "seed": 42,
+    "seed": 67,
     "num_workers": 4,
     "global_batch_size": 32,
     "micro_batch_size": 4,
@@ -58,7 +58,8 @@
   "checkpointing": {
     "save_steps": 6000,
     "resume": "auto",
-    "resume_scheduler": false
+    "resume_scheduler": false,
+    "resume_dataloader": false
   },
   "run_name": "climbmix_long_test_run_ddp_h100",
   "wandb": {

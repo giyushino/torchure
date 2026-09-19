@@ -14,6 +14,7 @@
   "mesh": {
     "dp": 4
   },
+  "parallelism": "ddp",
   "optimizer": {
     "name": "adamw",
     "config": {
@@ -27,7 +28,7 @@
       "type": "wsd",
       "warmup_ratio": 0.001,
       "decay_ratio": 0.1,
-      "total_steps": 100
+      "total_steps": 10000
     }
   },
   "objective": {
@@ -60,5 +61,10 @@
     "save_steps": 10000,
     "resume": null
   },
-  "run_name": "climbmix_test_run_4b_ddp"
+  "run_name": "climbmix_test_run_4b_ddp",
+  "wandb": {
+    "enabled": true,
+    "project": "torchure",
+    "entity": null
+  }
 }
