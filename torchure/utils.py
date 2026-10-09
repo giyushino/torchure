@@ -5,15 +5,10 @@ import time
 
 import torch
 
-# this should change to
-# just record everything
-# slightly in a debug log
+# TODO: write timings to a debug log instead
 def record_time(func):
     def wrapper(*args, **kwargs):
-        # CUDA kernels are async, so a bare perf_counter around a GPU step only
-        # times kernel *launch*, not execution. synchronize on both ends so the
-        # elapsed time (and any tps derived from it) reflects real GPU work.
-        # guarded by is_available so cpu-only paths stay no-ops.
+        # sync so we time gpu execution, not just kernel launch
         cuda = torch.cuda.is_available()
         if cuda:
             torch.cuda.synchronize()
@@ -30,8 +25,7 @@ def debug_time(func):
         t0 = time.perf_counter()
         result = func(*args, **kwargs)
         t1 = time.perf_counter()
-        # rank 0 only under torchrun (RANK unset == single process == print):
-        # 8 ranks x one line per step is unreadable
+        # rank 0 only
         if os.environ.get("RANK", "0") == "0":
             print(f"{func.__name__} took {t1 - t0} seconds to run")
         return result

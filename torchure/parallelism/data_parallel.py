@@ -2,44 +2,15 @@
 ddp: replicate the model along the mesh's dp axis and keep replicas in
 lockstep by averaging grads across the axis after every backward.
 
-- buckets in reverse `model.parameters()` order, which approximates backward
-  completion order, so early buckets fill (and their all-reduce launches)
-  while the rest of backward is still computing. bucket fill order is the
-  hook firing order, which is identical across ranks (same graph, same
-  engine schedule), so nccl sees the same collective order everywhere.
-- a bucket of small params shares one preallocated flat buffer: grads are
-  copied in with a single foreach launch, `.grad` is repointed at views of
-  the buffer, and the buffer is all-reduced. the reduced values are then
-  already what the optimizer reads -- no copy back out.
-- a param at or over the bucket cap gets a bucket of its own and is
-  all-reduced in place via its `.grad` directly: no buffer, no copy. this is
-  the tied-embedding grad (622MB fp32 at qwen3-0.6B), where a staging copy
-  would cost real time and transient memory.
-- `sync()` (call between backward and optimizer.step) waits on all handles.
-  there is no non-overlap mode: launching from hooks is the only thing that
-  makes grad sync affordable on this box, so it is not a knob.
-- `requires_sync` is the no_sync switch for grad accumulation (roadmap 1.3).
-  set it False for the first K-1 microbatches: the hook returns immediately,
-  without decrementing any bucket counter, so nothing is launched over a
-  partially accumulated grad and no bucket is re-armed mid-step. set it True
-  for the last microbatch, whose hooks fire over the fully accumulated grads
-  and launch the all-reduces exactly once per step. it is a plain attribute
-  rather than a context manager because the trainer's loop is the only caller
-  and the last microbatch has to sit outside any such scope anyway.
-
-zero_grad interplay: the trainer's `optimizer.zero_grad()` (set_to_none=True)
-drops the buffer views, so each backward the engine allocates fresh grads and
-the hook copies them in. set_to_none=False also works (the engine then
-accumulates straight into the views and the copy degenerates to a no-op).
-multiple backwards per sync is exactly the accumulation case above and needs
-`requires_sync` handled correctly -- sync() asserts loudly if a bucket never
-filled, which is what catches getting it wrong.
-
-grad clipping is deliberately NOT here: it is a per-step function over params,
-not a lifecycle hook on the model, and FSDP2/TP need the same one. it lives in
-`core/grad_helper.py` and runs after sync() (before it, the flat buffers still
-hold un-reduced local grads); it writes through the `.grad` views, which is
-what the optimizer then reads.
+- buckets follow reverse `model.parameters()` order (roughly backward order),
+  so all-reduces launch from grad hooks while backward is still running.
+- small params share a flat buffer per bucket: grads are copied in, `.grad`
+  is repointed at views of it, and the buffer is all-reduced in place.
+- a param at or over the bucket cap (e.g. the tied embedding) is all-reduced
+  directly through its `.grad`, with no staging copy.
+- `sync()` waits on all handles; call it between backward and optimizer.step.
+- `requires_sync` is the no_sync switch for grad accumulation: False for the
+  first K-1 microbatches, True for the last.
 
 one DDP instance per model: hooks are registered once and never removed.
 """
@@ -80,16 +51,13 @@ class DDP:
         self._replicate(model)
         params = [param for param in model.parameters() if param.requires_grad]
         params.reverse()
-        # 1024 * 1024 is the number of bytes in mb
         self._buckets = self._build_buckets(params, int(bucket_mb * 1024 * 1024))
         self._bucket_of = {p: b for b in self._buckets for p in b.params}
         for param in params:
             param.register_post_accumulate_grad_hook(self._on_grad_ready)
 
     def _build_buckets(self, params: list[nn.Parameter], max_bucket_bytes: int) -> list[_Bucket]:
-        """
-        params should already be revesed when passed into this function
-        """
+        """params should already be reversed."""
         buckets = []
         run = []
         run_bytes = 0
@@ -131,15 +99,7 @@ class DDP:
          
     @property
     def shard_dims(self) -> tuple[str, ...]:
-        """
-        mesh axes across which this strategy shards param/grad state -- none,
-        for ddp: every rank holds a full replica and the all_reduce leaves each
-        `.grad` complete.
-
-        the trainer hands this straight to clip_grad_norm, so the parallelism
-        strategy owns the answer instead of the training loop branching on
-        which one it is. fsdp2 returns ("dp_shard",) here.
-        """
+        """mesh axes param/grad state is sharded over; none for ddp."""
         return ()
 
     def _replicate(self, model: nn.Module):

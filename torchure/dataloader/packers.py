@@ -1,26 +1,14 @@
 """
-some food for thought: current tests show that best fit bin packing
-only save ~0.04% of tokens, but this could be an artifact of climbmix
-not having very long documents
+packing strategies for the dataloader .map step.
 
-packing strategies for the dataloader .map step, behind one shared interface so
-they're interchangeable and benchmarkable.
+stream packers concatenate docs with an eos between them and slice into
+back-to-back seq_len blocks (no padding; each map-batch's tail is dropped).
+list/numpy/tensor variants emit identical blocks and differ only in speed.
 
-a packer takes a map-batch of docs, concatenates their token ids into a single
-stream with an eos between docs, then slices the stream into back-to-back
-seq_len blocks. every emitted row is exactly seq_len -- no padding, no attention
-mask downstream. the tail remainder (< seq_len) of each map-batch is dropped.
-carrying that remainder into the next batch is a separate algorithm (different
-output), so it lives in its own class rather than as a "variant" here.
+best-fit only saves ~0.04% of tokens on climbmix, possibly because its docs
+are short.
 
-the variants below differ only in *how* they concatenate + slice (python lists
-vs numpy vs torch). given the same docs they emit identical blocks, which the
-benchmark suite asserts before trusting any timing. tokenization is shared in
-the base __call__, so pack() -- the only thing that differs -- is the only axis
-under test.
-
-all packers are top-level classes (not closures) so DataLoader workers can
-pickle them, which forkserver/spawn require (py3.14 default on linux).
+top-level classes so spawn workers can pickle them.
 """
 
 from __future__ import annotations
@@ -35,11 +23,8 @@ from torchure.utils import Node
 
 class Packer:
     """
-    base packer: owns the shared tokenize step and the interface. subclasses
-    implement pack(), the concatenate-and-slice that the benchmark compares.
-
-    tokenizer is optional so the benchmark can construct a packer and exercise
-    pack() on pre-tokenized docs without standing up a real tokenizer.
+    shared tokenize step; subclasses implement pack(). tokenizer is optional
+    so benchmarks can call pack() on pre-tokenized docs.
     """
     def __init__(
         self,
@@ -52,13 +37,9 @@ class Packer:
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.eos_id = eos_id
-        # eos delimits docs (real signal, trained on); pad only fills a bin's
-        # tail to seq_len. they must be *distinct* vocab ids so labels can later
-        # mask pad -> ignore_index without also masking a genuine doc-ending eos.
-        # defaults to eos_id for the stream packers, which never pad.
+        # pad must differ from eos so pad can be masked without masking doc
+        # boundaries. stream packers never pad, so it defaults to eos.
         self.pad_id = pad_id if pad_id is not None else eos_id
-        # the "lost N tokens" accounting prints inside the hot path, so it's off
-        # by default and never runs during a benchmark.
         self.verbose = verbose
 
     def __call__(self, examples: dict[str, list]) -> dict[str, list]:
@@ -67,23 +48,11 @@ class Packer:
         return {"input_ids": self.pack(docs)}
 
     def pack(self, docs: list[list[int]]) -> list[list[int]]:
-        """
-        concatenate docs (eos-separated) and slice into seq_len blocks, as
-        nested python lists. this is the `.map`-time path: output must be
-        Arrow-serializable, so it's always lists regardless of strategy.
-        """
+        """seq_len blocks as nested lists (must be arrow-serializable for .map)."""
         raise NotImplementedError
 
     def pack_to_tensor(self, docs: list[list[int]]) -> torch.Tensor:
-        """
-        same blocks, but materialized straight into the (n_blocks, seq_len)
-        tensor a collate-time packer would feed the model -- no list round-trip.
-
-        the base impl models "list-packer + collator": build lists, then
-        tensorize. numpy/tensor strategies override to skip the round-trip
-        (from_numpy / pass-through), which is the whole point of benchmarking
-        them against this path.
-        """
+        """same blocks as a (n_blocks, seq_len) tensor, for collate-time packing."""
         blocks = self.pack(docs)
         if not blocks:
             return torch.empty((0, self.seq_len), dtype=torch.long)
@@ -95,7 +64,7 @@ class Packer:
             print(f"{type(self).__name__}: lost {lost} tokens")
 
 class ListPacker(Packer):
-    """naive python: extend a flat list, then slice. the original implementation."""
+    """extend a flat python list, then slice."""
 
     def pack(self, docs: list[list[int]]) -> list[list[int]]:
         stream: list[int] = []
@@ -115,32 +84,19 @@ class ListPackerBestFit(Packer):
     """
     best-fit-decreasing packing (https://arxiv.org/pdf/2404.10830).
 
-    each emitted block is one training sequence == one bin of capacity seq_len.
-    a long doc is split into full seq_len blocks (emitted as-is) plus a < seq_len
-    remainder; those remainders -- together with whole short docs -- are packed
-    into bins by best-fit-decreasing so we waste as little bin capacity as
-    possible (the paper's "fewer truncations" goal). a bin that doesn't fill up
-    is padded to seq_len with pad_id (distinct from eos so the filler stays
-    maskable in labels later).
+    long docs emit full seq_len blocks as-is; their remainders and short docs
+    are packed into seq_len bins, and unfilled bins are padded with pad_id.
+    nothing is dropped, so the output differs from the stream packers.
 
-    unlike the stream packers (ListPacker/NumpyPacker/TensorPacker) this does NOT
-    drop the tail and does NOT emit identical blocks -- different output is the
-    whole point. so it lives outside the equality group: the benchmark checks it
-    against token-conservation invariants instead (see BESTFIT_PACKERS).
-
-    a segment tree over remaining-space buckets (0..seq_len) gives O(log seq_len)
-    best fit: leaf s holds s iff some open bin has exactly s free, internal nodes
-    hold the max, so search(c) returns the smallest space >= c that fits.
+    a segment tree over remaining space (0..seq_len) gives O(log seq_len) best
+    fit: search(c) returns the smallest open space >= c.
     """
 
     def pack(self, docs: list[list[int]]) -> list[list[int]]:
         seq_len = self.seq_len
 
         full_blocks: list[list[int]] = []
-        # remainders to bin-pack. each carries a trailing eos so multiple docs
-        # sharing a bin stay delimited; sized including that eos. an exact
-        # multiple has an empty remainder -> a lone [eos] that still terminates
-        # the doc and costs almost nothing.
+        # remainders to bin-pack, each with a trailing eos
         items: list[list[int]] = []
         for ids in docs:
             n_full = len(ids) // seq_len
@@ -148,12 +104,9 @@ class ListPackerBestFit(Packer):
                 full_blocks.append(ids[i * seq_len: (i + 1) * seq_len])
             items.append(ids[n_full * seq_len:] + [self.eos_id])
 
-        # "decreasing": place the big items first so they claim fresh bins and
-        # the small ones slot into whatever gaps are left.
         items.sort(key=len, reverse=True)
 
-        # segment tree indexed by remaining space; space_to_bin maps a remaining
-        # space to the open bins that currently have it; bins holds contents.
+        # space_to_bin: remaining space -> open bins with exactly that much
         free = Node.build(0, seq_len)
         space_to_bin: dict[int, list[int]] = {}
         bins: list[list[int]] = []
@@ -162,7 +115,6 @@ class ListPackerBestFit(Packer):
             size = len(item)  # in [1, seq_len]
             space = free.search(size)
             if space is None:
-                # nothing open fits -> start a fresh bin.
                 bin_id = len(bins)
                 bins.append([])
                 space = seq_len
@@ -179,9 +131,6 @@ class ListPackerBestFit(Packer):
                     free.update(new_space, available=True)
                 bucket.append(bin_id)
 
-        # pad each bin up to seq_len (the collator stacks fixed-length rows).
-        # pad_id is distinct from eos so these positions stay identifiable for
-        # label masking later.
         for b in bins:
             if len(b) < seq_len:
                 b.extend([self.pad_id] * (seq_len - len(b)))
@@ -190,7 +139,6 @@ class ListPackerBestFit(Packer):
 
 class NumpyPacker(Packer):
     """concatenate into one int64 array, reshape into (n_blocks, seq_len)."""
-    # this makes no sense? why are we turning this into a list again
 
     def _blocks(self, docs: list[list[int]]) -> np.ndarray:
         eos = np.array([self.eos_id], dtype=np.int64)
@@ -210,7 +158,6 @@ class NumpyPacker(Packer):
         return self._blocks(docs).tolist()
 
     def pack_to_tensor(self, docs: list[list[int]]) -> torch.Tensor:
-        # from_numpy shares the buffer -- no copy, no list round-trip.
         return torch.from_numpy(self._blocks(docs))
 
 
@@ -238,18 +185,14 @@ class TensorPacker(Packer):
         return self._blocks(docs)
 
 
-# registry so the builder and the benchmark refer to strategies by name. these
-# all emit identical blocks for identical input, so the benchmark equality-gates
-# them against each other.
+# emit identical blocks, so the benchmark checks them against each other
 PACKERS: dict[str, type[Packer]] = {
     "list": ListPacker,
     "numpy": NumpyPacker,
     "tensor": TensorPacker,
 }
 
-# best-fit is a different algorithm with different output (no dropped tail,
-# padded bins), so it can't be equality-checked against the stream packers --
-# the benchmark times it and verifies token-conservation invariants separately.
+# different output, checked with token-conservation invariants instead
 BESTFIT_PACKERS: dict[str, type[Packer]] = {
     "bestfit": ListPackerBestFit,
 }

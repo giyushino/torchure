@@ -1,136 +1,119 @@
 """
-fsdp2: per-parameter sharding of params, grads and optimizer state along the
-mesh's `dp_shard` axis, with the unsharded weights materialized only for the
-window in which they're used.
+fsdp2: shard params, grads and optimizer state along `dp_shard`; gather a
+unit's weights just before it runs and free them right after.
 
-ddp holds a full fp32 replica of params + grads + adam state on every rank and
-all-reduces the grads. fsdp holds 1/dp_shard of each, all-gathers a unit's
-weights just before it runs, throws them away right after, and replaces the
-all-reduce with a reduce-scatter (half the bytes). on this hardware that is a
-*throughput* lever as much as a memory one -- DDP.md measured 442 ms/step of
-all-reduce against a ~350 ms backward window at 8 gpus, so 156 ms/step is
-exposed no matter how it's bucketed.
-
-full checklist, decisions and exit criteria: notes/FSDP2_SCOPE.md.
-tests: tests/fsdp2.py (gloo/cpu, mp.spawn) -- correctness first, then the
-invisible invariants (storage actually freed, exactly one gather per unit).
+scope/checklist: notes/FSDP2_SCOPE.md. measurements: notes/FSDP2_H100.md.
+tests: tests/fsdp2.py (gloo/cpu, mp.spawn).
 
 ===========================================================================
-the decisions, made
+design
 ===========================================================================
 
-**unit = one transformer block.** plus one "root" unit holding
-(token_emb + lm_head + final norm). the tie (`lm_head.weight is
-token_emb.weight`) forces those two into the same unit -- sharding them
-separately double-gathers one storage and corrupts grad flow. assert the tie,
-don't assume it.
+**unit = one transformer block**, plus a root unit (token_emb + lm_head +
+final norm). the tie `lm_head.weight is token_emb.weight` forces those into
+one unit. the root is `reshard_after_forward=False`: the fused CE reads
+`model.lm_head.weight` after the model's forward has returned.
 
-**per-param logical Shard(0), one flat storage per unit.** these aren't
-exclusive and the scope doc's question answers itself: shard each param
-logically on dim 0 (clean checkpoint metadata, clean clip_grad_norm), but back
-every shard in a unit with ONE flat fp32 buffer and hand each param a view.
-that makes unshard exactly one all_gather per unit instead of one per param --
-the same lesson ddp's buckets already taught on this box.
+**params stay plain nn.Parameter; `.data` is swapped.** the same Parameter
+objects live for the whole run:
 
-**params stay plain nn.Parameter; DTensor is edge metadata.** one Parameter
-object per param for the whole run, whose `.data` is swapped:
+    sharded:    p.data -> fp32 view into unit.shard_flat        (optimizer)
+    unsharded:  p.data -> bf16 view into unit.unsharded_flat    (compute)
 
-    resharded:  p.data -> fp32 shard view into unit.shard_flat     (optimizer)
-    unsharded:  p.data -> bf16 view into unit.unsharded_flat       (forward)
+the optimizer is built after _parallelize, so adamw allocates its state
+against the sharded shapes. that's the memory win.
 
-so `model.parameters()` keeps returning the same objects, fused adamw allocates
-its state against the *sharded* fp32 shapes (that's the memory win, and it is
-free only because the trainer builds the optimizer after _parallelize), and
-nothing in the hot path unwraps a subclass.
+**per-param Shard(0), one flat shard buffer per unit, copy-out after gather.**
+rank r's shard_flat is each param's r-th dim-0 chunk, concatenated:
 
-**mixed precision.** sharded master params fp32. gathered params bf16 -- the
-gather is the biggest collective in the step and doing it in bf16 halves it.
-grads arrive bf16. the reduce-scatter runs in **bf16** ("avg"), and its output
-is upcast into the fp32 sharded `.grad`: fp32 comm would give back the 2x we
-just bought, and bf16 accumulation error across dp_shard ranks is bounded by
-the tree depth, not by dp_shard. keep norm weights fp32 through all of it --
-the "bf16 params freeze under adamw" lesson in Trainer._init_weights applies to
-anything this path might quietly downcast. autocast stays on: its param casting
-becomes redundant once params arrive bf16, its activation policy does not.
+    shard_flat (rank r):   [ p0[r] | p1[r] | p2[r] ]          S elements
 
-**grad accumulation reduce-scatters every microbatch** into the sharded fp32
-`.grad`, rather than holding a full unsharded grad per unit across microbatches.
-one extra collective per microbatch, sharded memory -- which is the entire
-reason fsdp is being added. consequence worth stating: `requires_sync` (ddp's
-no_sync switch) is a **no-op here**, kept only so Trainer.train_step doesn't
-grow a second idiom.
+all_gather stacks the rank-major buffers, so the gathered buffer is
 
-**re-unshard in backward via module full-backward-pre-hooks**, not an autograd
-function on the unit's output. hooks are simpler and sit outside the compiled
-region by construction (`_compile` compiles `block.forward`). the thing to
-watch is stage 3: an autograd function is what survives dynamo reordering the
-graph, so if the compile composition test goes bad, that's the escape hatch --
-not a bucket-size tweak.
+    gather_buf (R, S):     [ p0[0] p1[0] p2[0] ]
+                           [ p0[1] p1[1] p2[1] ]
+                           ...
 
-**checkpointing is guarded, not fixed.** sharded save/load is phase 3. until
-then `Checkpointer.save_model` would write one rank's shard as if it were the
-model. FSDP.state_dict raises; the trainer must refuse to run fsdp with
-checkpointing enabled rather than write a corrupt file.
+and p0 is NOT contiguous in it: its chunks sit S elements apart. no view
+fixes this (F.linear won't take a strided 3-d weight), so unshard does one
+on-device copy-out into a per-param-contiguous buffer:
 
-===========================================================================
-the lifecycle of one unit, one step
-===========================================================================
+    unsharded_flat:        [ p0 (all R chunks) | p1 | p2 ]      R*S elements
 
-    forward pre-hook   unshard: all_gather(shard_flat -> unsharded_flat) in
-                       bf16 on the comm stream; default stream waits on the
-                       event; p.data -> views. then kick off unit i+1's gather
-                       (prefetch) so it flies while this unit computes.
-    forward post-hook  reshard: p.data -> fp32 shard views, and
-                       unsharded_flat.untyped_storage().resize_(0).
-                       ROOT UNIT EXCEPTED -- see below.
-    backward pre-hook  unshard again (storage().resize_(numel) + all_gather),
-                       and prefetch unit i-1. also point each p.grad at a view
-                       of a zeroed unsharded bf16 grad_flat, so autograd
-                       accumulates straight into the flat buffer instead of
-                       allocating a grad per param.
-    post-accum-grad    one counter per unit (ddp's machinery, one counter per
-                       unit rather than per bucket). when it hits zero:
-                       reduce_scatter(grad_flat, "avg", async) -> sharded bf16,
-                       free grad_flat and unsharded_flat, and on the wait
-                       upcast-accumulate into the fp32 p.grad.
-    sync()             wait every outstanding reduce-scatter, then clip, step.
+    torch.split_with_sizes_copy(gather_buf.view(R, S), [n0, n1, n2], dim=1,
+                                out=[u.view(R, n) for u in unsharded views])
 
-**the root unit never reshards mid-step.** token_emb runs at the very start of
-forward and lm_head at the very end -- and `ARObjective.compute_loss` reads
-`model.lm_head.weight` *after* the model's forward has already returned, to
-feed the fused linear+ce. any reshard-on-forward-post design hands the
-objective a freed weight. so the root unit is gathered once at the start of
-forward and stays unsharded until its post-backward. this is what real fsdp2
-does for the root module too (`reshard_after_forward=False`). the cost is
-honest and should be measured: one unsharded copy of the tied embedding held
-for the step (~311 MB bf16 at qwen3-0.6B). the alternative -- moving the fused
-ce inside the model's forward -- is cheaper in memory and worse for the
-objective abstraction; if the memory bites, that's the trade to revisit.
+reduce-scatter is the mirror: grads arrive per-param contiguous, get
+chunk-cat'd into (R, S) rank-major, reduce-scattered to (S,), and
+upcast-accumulated into the fp32 shard grad. both copies run at HBM
+bandwidth against a comm that runs at link bandwidth. the alternative
+(FSDP1-style flat sharding of the concatenated unit) is zero-copy but a
+rank's shard straddles param boundaries, so per-param shapes, clip norm and
+checkpoint metadata all get harder. not worth it.
+
+**mixed precision.** master shards fp32, gather in bf16, reduce-scatter in
+bf16, accumulate into fp32 grad shards. every param is gathered in
+param_dtype, norms included: the "bf16 norm gains freeze under adamw" bug in
+Trainer._init_weights was about bf16 *master* params. here the optimizer
+only ever sees the fp32 shard, so a bf16 compute copy is harmless. one dtype
+per unit keeps it at one gather per unit.
+
+**no dedicated comm stream (v0).** nccl already runs collectives on its own
+internal stream. `async_op=True` plus a deferred `work.wait()`, which makes
+the current stream wait on the collective, gives the overlap. prefetch is
+just "launch unit i+1's gather before unit i computes".
+
+**grad accumulation reduce-scatters every microbatch** into the fp32 shard
+grad. `requires_sync` is accepted and ignored, so the trainer loop stays
+shared with ddp.
+
+**hooks must run eagerly.** `nn.Module.compile()` compiles `_call_impl`,
+which includes the module's hooks, so dynamo would try to trace collectives
+and `.data` swaps. the trainer compiles `block.forward` instead.
 
 ===========================================================================
-the thing that will actually break
+lifecycle of one block unit, one microbatch
 ===========================================================================
 
-**storage lifetime across streams.** ddp got away with no comm stream because
-`async_op=True` on the default stream still overlaps with nccl's own. fsdp
-needs a stream it owns plus explicit events, and the gathered buffer's storage
-must stay alive from the gather on the comm stream until the last consumer on
-the compute stream is done. get it wrong and it corrupts nondeterministically,
-under memory pressure, hours in. `record_stream` (or an explicit event the
-allocator can see) on every buffer that crosses the boundary, and treat "which
-stream does this storage belong to" as something asserted, not assumed.
+    block forward-pre   unshard + wait_unshard, record order, prefetch next
+    block forward-post  reshard; register a hook on the block's OUTPUT tensor
+                        (fires when grad wrt output is ready = right before
+                        this block's backward). skipped under no_grad.
+    output grad hook    unshard + wait_unshard, prefetch previous
+    post-accum-grad     per-param countdown; at 0 -> post_backward:
+                        fold previous microbatch's reduce-scatter, chunk-cat
+                        grads, p.grad = None, reshard, launch reduce-scatter
+    FSDP.sync()         every unit: finalize_grads (fold + install p.grad)
 
-**freeing means resizing storage to 0, not dropping a python reference.** the
-block's saved activations hold references to the gathered weight tensors, so
-`del` frees nothing. resize the untyped storage. and note the failure mode:
-getting this wrong still *trains correctly*, it just doesn't save any memory --
-which is why tests/fsdp2.py asserts storage size directly, between units,
-during a real forward.
+root unit: unshard in the MODEL's forward-pre; it never reshards in forward.
+under no_grad (eval), the model's forward-post reshards it instead, since no
+backward will.
+
+===========================================================================
+what will break
+===========================================================================
+
+- **free by resizing storage, not by dropping references.** the unit keeps
+  its unsharded views alive on purpose (stable objects across steps), so
+  only `untyped_storage().resize_(0)` actually frees. getting this wrong
+  still trains correctly and saves nothing. tests assert storage size.
+- **p.grad must be None when backward starts.** autograd accumulates the
+  unsharded grad into an existing sharded-shaped p.grad and dies (or worse).
+  this relies on `optimizer.zero_grad()` with set_to_none=True, the default.
+- **backward reads the param, not a snapshot.** autograd saves the leaf
+  Parameter itself, so backward sees whatever `.data` is at that moment. the
+  output grad hook must have re-gathered first. if not, you get a shape
+  error in the backward. loud, but check it under compile too.
+- **meta-device init** is v1. v0 inits the full model on every rank and
+  slices. free each param's full tensor as its shard is built (unit by
+  unit), or the transient peak is full model + all shards (notes: 5 B/param).
 """
 
 from dataclasses import dataclass
+from enum import Enum, auto
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from torchure.core.collective import MeshLike
@@ -139,235 +122,257 @@ from torchure.core.collective import MeshLike
 @dataclass
 class MixedPrecisionPolicy:
     """
-    what dtype each leg of the step runs in. defaults are the recipe argued for
-    in the module docstring; they're a dataclass so the parity tests can run the
-    whole thing in fp32 (`MixedPrecisionPolicy.fp32()`) and get near-exact
-    agreement with a single-process reference.
+    dtype of each leg of the step. `fp32()` is what the cpu parity tests run.
     """
 
-    # dtype the params are gathered and computed in
+    # dtype params are gathered and computed in
     param_dtype: torch.dtype = torch.bfloat16
-    # dtype the reduce-scatter runs in
+    # dtype the reduce-scatter (and hsdp all-reduce) runs in
     reduce_dtype: torch.dtype = torch.bfloat16
-    # dtype of the sharded master params and of `.grad` the optimizer reads
+    # dtype of the sharded master params and of the `.grad` the optimizer reads
     master_dtype: torch.dtype = torch.float32
-    # module types whose params are never downcast. RMSNorm gains are fp32
-    # parameters on purpose -- see Trainer._init_weights for what happens when
-    # they aren't.
-    keep_master: tuple[type[nn.Module], ...] = (nn.RMSNorm, nn.LayerNorm)
 
     @staticmethod
     def fp32() -> "MixedPrecisionPolicy":
-        """no-op policy: everything fp32. what the cpu parity tests run."""
-        return MixedPrecisionPolicy(
-            param_dtype=torch.float32, reduce_dtype=torch.float32
-        )
+        return MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
 
 
 @dataclass
 class _ParamInfo:
-    """where one param lives inside its unit's two flat buffers."""
+    """
+    one param's place in its unit. `offset`/`numel` index the SHARDED flat
+    buffer. the param's unsharded region is [R*offset, R*(offset+numel)),
+    because unsharded_flat is per-param contiguous in the same order.
+    """
 
     param: nn.Parameter
-    module: nn.Module
-    name: str            # attribute name on `module`, for re-binding .data
+    fqn: str                       # for error messages
     full_shape: torch.Size
-    offset: int          # element offset into the SHARDED flat buffer
-    numel: int           # sharded numel
+    shard_shape: torch.Size        # (full_shape[0] // R, *full_shape[1:])
+    offset: int
+    numel: int                     # sharded numel
+    shard_view: torch.Tensor | None = None      # into shard_flat, master dtype
+    unsharded_view: torch.Tensor | None = None  # into unsharded_flat, full_shape
+
+
+class _State(Enum):
+    SHARDED = auto()
+    GATHERING = auto()   # all_gather launched, not yet waited / copied out
+    UNSHARDED = auto()
 
 
 class FSDPUnit:
     """
-    one all-gather's worth of parameters: a transformer block, or the root
-    (token_emb + lm_head + norm).
+    one all-gather's worth of params.
 
-    owns three storages and swaps `.data` / `.grad` between them:
+    storage it owns:
 
-      shard_flat      fp32, persistent, 1/dp_shard of the unit's params.
-                      the master weights. never freed. the optimizer's state is
-                      allocated against views of this.
-      unsharded_flat  bf16, allocated once and REUSED every step so the param
-                      views are the same tensor objects across steps (stable
-                      for dynamo guards -- this is what collective.all_gather's
-                      `output_tensor=` was added for). storage resized to 0
-                      between uses.
-      grad_flat       bf16, unsharded, zeroed before each backward; autograd
-                      accumulates into views of it. freed after the
-                      reduce-scatter.
+      shard_flat        (S,)    master dtype, persistent. p.data views when sharded.
+      grad_shard_flat   (S,)    master dtype, persistent. accumulates reduced
+                                grads across microbatches; p.grad views after sync.
+      unsharded_flat    (R*S,)  param dtype, allocated once, storage resized
+                                to 0 whenever sharded. p.data views when unsharded.
+      gather_buf        (R*S,)  param dtype, transient: gather -> copy-out -> drop.
+      reduce_in/out             transient, held with the Work handle until waited.
     """
 
     def __init__(
         self,
         name: str,
-        modules: list[nn.Module],
+        params: list[tuple[str, nn.Parameter]],
         mesh: MeshLike,
         shard_dim: str,
+        replicate_dim: str | None,
         policy: MixedPrecisionPolicy,
         reshard_after_forward: bool = True,
     ):
         """
-        collects every param owned by `modules` (dedup by identity -- the tied
-        embedding appears under two modules and must be sharded ONCE), builds
-        shard_flat by slicing dim 0 of each full param, points each param's
-        `.data` at its shard view, and drops the full tensors.
-
-        `reshard_after_forward=False` is the root unit: it stays gathered from
-        its pre-forward until its post-backward, because the objective consumes
-        lm_head.weight after the model's forward returns.
+        `params` is (fqn, param) pairs, already deduplicated by identity and
+        in the same order on every rank. FSDP._build_units does the dedup,
+        because "every param in exactly one unit" is a cross-unit property.
         """
         self.name = name
-        self.modules = modules
         self.mesh = mesh
         self.shard_dim = shard_dim
+        self.replicate_dim = replicate_dim
         self.policy = policy
         self.reshard_after_forward = reshard_after_forward
-
         self.shard_size = mesh.size(shard_dim)
+
         self.params: list[_ParamInfo] = []
-        self.is_unsharded = False
-        self.pending = 0  # post-accumulate-grad countdown, like ddp's buckets
-        raise NotImplementedError
+        self.shard_numel = 0  # S
+
+        self.shard_flat: torch.Tensor | None = None
+        self.grad_shard_flat: torch.Tensor | None = None
+        self.unsharded_flat: torch.Tensor | None = None
+
+        self.state = _State.SHARDED
+        self._gather_buf: torch.Tensor | None = None
+        self._gather_work: dist.Work | None = None
+
+        # post-accumulate-grad countdown. re-armed in post_backward
+        self.pending = len(params)
+        # (work, reduce_in, reduce_out) of the in-flight reduce-scatter.
+        # reduce_in is held only to keep it alive until the wait
+        self._reduce: tuple[dist.Work, torch.Tensor, torch.Tensor] | None = None
+        # reduce-scatters folded into grad_shard_flat since the last sync.
+        # 0 means the next fold overwrites instead of accumulating
+        self.folds = 0
+
+        self._build_shards(params)
+        self._alloc_buffers()
 
     # --- construction -----------------------------------------------------
 
-    def _collect_params(self, modules: list[nn.Module]) -> list[nn.Parameter]:
+    def _build_shards(self, params: list[tuple[str, nn.Parameter]]) -> None:
         """
-        unique params under `modules`, in a deterministic order (module
-        traversal order, which is identical on every rank). dedup by `id`, NOT
-        by name: `lm_head.weight is token_emb.weight` is one storage under two
-        names and must appear exactly once.
-        """
-        raise NotImplementedError
+        fill self.params and allocate shard_flat (S,) in master dtype.
 
-    def _build_shards(self) -> None:
-        """
-        allocate shard_flat and fill it.
+        every rank ran init_weights() on the full model with the same seed,
+        so each rank slices out its own dim-0 chunk locally, with no comm
+        needed:
 
-        v0 shard construction (roadmap): every rank has already run
-        `init_weights()` on the full model with the same seed, so slicing dim 0
-        locally is bit-identical across ranks with zero comm, and init_weights'
-        residual scaling stays a whole-tensor op. meta-device init and
-        shard-local rng are a later nicety.
+            chunk = p.detach()[c*d0//R : (c+1)*d0//R]    c = mesh.coordinate(shard_dim)
 
-        assert `full_shape[0] % shard_size == 0` per param and name the param in
-        the message. no padding in v0 (see dtensor.py for where it would go).
+        copy it into shard_flat[offset : offset+numel], then set
+        `p.data = shard_view` right away so the full tensor is freed as you
+        go.
+
+        - assert `full_shape[0] % R == 0` and name the fqn. no padding in v0.
+        - cast to master_dtype here. the model may arrive in any dtype.
+        - `p.data = ...` keeps the tie for free (one object, two attributes).
+          rebinding `module._parameters[name]` would silently break it.
         """
         raise NotImplementedError
 
     def _alloc_buffers(self) -> None:
         """
-        allocate unsharded_flat (bf16, full unit numel) once, then immediately
-        resize its storage to 0. build the param views into it now, so they are
-        stable objects for the life of the run.
+        allocate unsharded_flat (R*S,) in param dtype, build each info's
+        unsharded_view = unsharded_flat[R*off : R*(off+n)].view(full_shape),
+        then `unsharded_flat.untyped_storage().resize_(0)`. the views stay
+        valid Python objects over 0-byte storage until the next unshard.
+
+        allocate grad_shard_flat (S,) in master dtype. it's small (1/R).
         """
         raise NotImplementedError
 
     # --- forward ----------------------------------------------------------
 
-    def unshard(self, async_op: bool = True) -> None:
+    def unshard(self) -> None:
         """
-        resize unsharded_flat's storage back up, cast shard_flat into the bf16
-        staging shard, and all_gather into unsharded_flat on the comm stream.
+        launch the gather and don't wait. no-op unless SHARDED (prefetch may
+        already have launched it).
 
-        does NOT wait -- that's `wait_unshard`. the split is the whole point:
-        prefetch calls this for unit i+1 while unit i computes.
+          staged = shard_flat.to(param_dtype)       # a real alloc when dtypes differ
+          gather_buf = empty(R*S, param_dtype)
+          _, work = all_gather(staged, mesh, shard_dim, async_op=True,
+                               output_tensor=gather_buf)
 
-        the cast needs its own staging buffer (bf16 copy of the local shard);
-        it's per-unit and reused, and it is a real allocation, not free.
-        no-op if already unsharded (prefetch may have got here first).
+        stash gather_buf and work, and set state = GATHERING. also resize
+        unsharded_flat's storage back to R*S here, so the allocation happens
+        on the compute stream before the copy-out writes to it.
         """
         raise NotImplementedError
 
     def wait_unshard(self) -> None:
         """
-        have the compute stream wait on the gather's event, then point every
-        param's `.data` at its bf16 view. idempotent.
+        GATHERING -> UNSHARDED. idempotent once UNSHARDED; asserts it isn't
+        SHARDED (someone forgot to unshard).
+
+          work.wait()
+          torch.split_with_sizes_copy(gather_buf.view(R, S), [info.numel ...],
+                                      dim=1, out=[v.view(R, n) ...])
+          drop gather_buf
+          p.data = info.unsharded_view   for every info
+
+        `v.view(R, n)` is legal because v is contiguous and d0 % R == 0: row
+        r of that view is exactly p[r]'s chunk.
         """
         raise NotImplementedError
 
     def reshard(self) -> None:
         """
-        point every param's `.data` back at its fp32 shard view and
-        `unsharded_flat.untyped_storage().resize_(0)`.
+        p.data = shard_view for every param, then
+        unsharded_flat.untyped_storage().resize_(0). state = SHARDED.
 
-        resize, not `del` -- saved activations still reference the view
-        tensors, so dropping python references frees nothing and the memory win
-        silently doesn't happen. no-op when reshard_after_forward is False.
+        callers decide whether to call it (reshard_after_forward is a policy
+        for the hooks, not a guard in here). post_backward and eval need to
+        reshard the root unconditionally.
         """
         raise NotImplementedError
 
     # --- backward ---------------------------------------------------------
 
-    def prepare_grads(self) -> None:
-        """
-        allocate/zero grad_flat and set each `param.grad` to its unsharded bf16
-        view, so autograd accumulates directly into the flat buffer -- one
-        reduce-scatter input, no per-param grad allocations, and no foreach copy
-        the way ddp's buckets need one.
-
-        called from the backward pre-hook, after wait_unshard. note the tied
-        embedding accumulates two contributions into the same view; that is
-        correct and is exactly what tests/fsdp2.py's tied-embedding test pins.
-        """
-        raise NotImplementedError
-
     def on_grad_ready(self, param: nn.Parameter) -> None:
         """
-        post-accumulate-grad hook, one countdown per unit (ddp's `_Bucket`
-        machinery, coarser). when it hits zero the unit's grads are complete ->
-        `post_backward()`.
+        post-accumulate-grad hook. decrement pending, and at 0 call
+        post_backward.
 
-        re-arm `pending` on launch, like ddp does, so grad accumulation works
-        without re-registering anything.
+        the tied embedding is one leaf, so the engine sums both contributions
+        before its AccumulateGrad runs and this fires once. count unique
+        params, not uses.
         """
         raise NotImplementedError
 
     def post_backward(self) -> None:
         """
-        reduce_scatter(grad_flat, mesh, shard_dim, "avg", async_op=True) into a
-        per-unit sharded bf16 output buffer, then reshard the params and free
-        grad_flat.
+        all of this unit's grads are complete, in unsharded p.grad.
 
-        the "avg" is what makes N ranks x bs=1 equal 1 process x bs=N, same as
-        ddp. collective.reduce_scatter already handles async "avg" on gloo by
-        pre-dividing (it divides out-of-place on purpose -- under fsdp the input
-        IS the unsharded grad buffer and scaling it in place would corrupt every
-        later read), so the cpu tests exercise the same overlapped path the gpu
-        does. no fixup owed after the wait beyond the upcast.
+          1. _fold_reduced()   the previous microbatch's reduce-scatter, if any.
+             it must land before its output buffer is overwritten.
+          2. reduce_in = cat([p.grad.view(R, -1) for params], dim=1)
+                         .to(reduce_dtype)                        # (R, S) rank-major
+             (or torch._chunk_cat(grads, dim=0, num_chunks=R))
+          3. p.grad = None for every param   # next microbatch's backward needs None
+          4. reshard()                       # root included
+          5. reduce_out = empty(S); work = reduce_scatter(reduce_in.view(-1), ...,
+                                   "avg", async_op=True, output_tensor=reduce_out)
+             self._reduce = (work, reduce_in, reduce_out)
+          6. pending = len(self.params)
 
-        stash the work handle; `finalize_grads` does the upcast-accumulate.
+        assert each grad has full_shape before the cat. a sharded-shaped
+        grad here means p.grad wasn't None when backward started (zero_grad
+        with set_to_none=False).
+
+        is it safe to reshard at step 4? by the time every param's
+        AccumulateGrad has run, every node that read these weights has been
+        enqueued (MmBackward produces grad_input and grad_weight together),
+        and the storage free is ordered on the same stream.
+        """
+        raise NotImplementedError
+
+    def _fold_reduced(self) -> None:
+        """
+        wait the in-flight reduce-scatter (no-op if none). if replicate_dim
+        is set, all_reduce(reduce_out, mesh, replicate_dim, "avg"); that's
+        hsdp, and it's synchronous in v0. then:
+
+          folds == 0:  grad_shard_flat.copy_(reduce_out)
+          else:        grad_shard_flat.add_(reduce_out)
+          folds += 1;  self._reduce = None
         """
         raise NotImplementedError
 
     def finalize_grads(self) -> None:
         """
-        wait the reduce-scatter, then accumulate the sharded bf16 result into
-        the fp32 `param.grad` (`+=`, not `=` -- grad accumulation reduce-scatters
-        every microbatch into the same fp32 shard).
+        called from FSDP.sync(). run _fold_reduced(), then set
+        `p.grad = grad_shard_view` (grad_shard_flat[off:off+n].view(shard_shape)),
+        then folds = 0 so the next step's first fold overwrites.
 
-        after this, `param.data` and `param.grad` are both sharded fp32 and the
-        optimizer can step. this is also the point at which clip_grad_norm's
-        `shard_dims=("dp_shard",)` is telling the truth; an unsharded-shaped
-        grad sneaking through gives a silently *too large* norm, not a crash.
+        after this, p.data and p.grad are both sharded master dtype, and
+        clip_grad_norm with shard_dims=("dp_shard",) is correct. the views
+        get dropped by optimizer.zero_grad(), which is fine: grad_shard_flat
+        persists and gets overwritten.
         """
         raise NotImplementedError
 
 
 class FSDP:
     """
-    the model-level wrapper. mirrors DDP's shape so the trainer's
-    `_parallelize` doesn't grow a second idiom:
+    model-level wrapper. same surface as DDP (`requires_sync`, `sync()`,
+    `shard_dims`), so Trainer.train_step doesn't branch.
 
-        self.fsdp = FSDP(model, mesh, shard_dim="dp_shard")
-        ...
-        loss.backward()
-        self.fsdp.sync()
-        clip_grad_norm(model.parameters(), mesh, max_norm,
-                       shard_dims=("dp_shard",))
-        optimizer.step()
-
-    `dp_shard == 1` must be a TOTAL no-op: no hooks, no buffers, no groups
-    touched, exactly the way DDP is at `dp == 1`. tests/fsdp2.py asserts it.
+    `dp_shard == 1` is a TOTAL no-op, the way DDP is at dp == 1.
     """
 
     def __init__(
@@ -380,14 +385,12 @@ class FSDP:
         prefetch_depth: int = 1,
     ):
         """
-        `replicate_dim` is hsdp (stage 4): after the reduce-scatter along
-        shard_dim, all_reduce the sharded grads along replicate_dim. two
-        collectives, one ordering, no new state. None disables it, and
-        `replicate_dim` of size 1 must degenerate to the same thing.
+        `replicate_dim` is hsdp: reduce-scatter along shard_dim, then
+        all_reduce the sharded grads along replicate_dim.
 
-        `prefetch_depth` is how many units ahead to launch gathers for. 1 by
-        default; it costs one extra unsharded buffer live at a time, so it is a
-        memory knob as much as a throughput one.
+        `prefetch_depth` is how many units ahead to launch gathers. each one
+        costs a unit's worth of gather_buf + unsharded_flat while live.
+        notes/FSDP2_H100.md: 1 captures most of the win, and 2 adds ~1%.
         """
         self.mesh = mesh
         self.shard_dim = shard_dim
@@ -402,19 +405,23 @@ class FSDP:
         self._order_recorded = False
 
         if self.shard_size == 1:
+            # without this, dp_shard=1 x dp_replicate=N would sync no grads
+            # at all, and replicas would drift silently
+            assert replicate_dim is None or mesh.size(replicate_dim) == 1, (
+                f"fsdp with {shard_dim}=1 and {replicate_dim}={mesh.size(replicate_dim)} "
+                "is pure replication; use parallelism='ddp'"
+            )
             return
-        raise NotImplementedError
+
+        self.units = self._build_units(model)
+        self._register_hooks(model)
 
     @property
     def shard_dims(self) -> tuple[str, ...]:
         """
-        mesh axes across which param/grad state is sharded. this is what the
-        trainer passes to clip_grad_norm -- an unsharded-shaped grad sneaking
-        through with `()` gives a silently too-large norm, not a crash.
-
-        it doubles as "is model state sharded" for the checkpoint guard, which
-        is why `dp_shard == 1` must answer `()` rather than the axis name: at
-        size 1 nothing is split and rank 0's tensors really are the model.
+        mesh axes param/grad state is sharded over. feeds clip_grad_norm, and
+        doubles as "is model state sharded" for the trainer's checkpoint
+        guard. that's why dp_shard == 1 answers ().
         """
         return () if self.shard_size == 1 else (self.shard_dim,)
 
@@ -422,64 +429,72 @@ class FSDP:
 
     def _build_units(self, model: nn.Module) -> list[FSDPUnit]:
         """
-        unit 0 = root (token_emb + lm_head + final norm, reshard_after_forward
-        False), then one unit per entry in `model.blocks`.
+        units[0] = root: every param NOT under model.blocks (token_emb,
+        lm_head via the tie, norm), reshard_after_forward=False. then one unit
+        per model.blocks entry.
 
-        `model.blocks` is the contract (roadmap principle 4: it's the unit of
-        compile, fsdp wrapping, activation checkpointing and pp splitting), so
-        assert it exists rather than walking the module tree heuristically.
+        - assert `model.blocks` exists. it's the contract, don't walk the tree.
+        - assert `model.lm_head.weight is model.token_emb.weight`.
+        - dedup by id, not by name. named_parameters() already dedups, so
+          collect block params first, then root = everything left over.
+        - assert the union == set(model.parameters()) and nothing is claimed
+          twice. a param in no unit gets no sync and drifts between ranks.
+        """
+        assert model.blocks, "blocks must already be constructed"
+        assert model.lm_head.weight is model.token_emb.weight, \
+        "lm_head weight must be the same as token_emb weight"
+        return
 
-        assert the tie -- `model.lm_head.weight is model.token_emb.weight` --
-        instead of assuming it. an untied model isn't wrong, it just needs the
-        two in one unit for a different reason (both are vocab-sized), and the
-        assert is where that gets noticed.
+    def _register_hooks(self, model: nn.Module) -> None:
+        """
+        registered once, never removed.
 
-        every param must land in exactly one unit. check that the union covers
-        `model.parameters()` and that no param is claimed twice; a param that
-        falls through gets no gather, no reduce-scatter, and drifts between
-        ranks silently.
+          model.register_forward_pre_hook   -> _pre_forward(root)
+          model.register_forward_hook       -> reshard root iff not grad enabled
+          block.register_forward_pre_hook   -> _pre_forward(unit)
+          block.register_forward_hook       -> _post_forward(unit, output)
+          p.register_post_accumulate_grad_hook -> unit.on_grad_ready  (all units)
+
+        no register_full_backward_pre_hook: it wraps inputs/outputs in
+        BackwardHookFunction nodes, doesn't fire when the inputs don't need
+        grad, and is unsupported inside compiled regions. a plain tensor hook
+        on the block's output does the same job.
         """
         raise NotImplementedError
 
-    def _register_hooks(self) -> None:
-        """
-        per unit:
-          module.register_forward_pre_hook        -> unshard + wait + prefetch
-          module.register_forward_hook            -> reshard (unless root)
-          module.register_full_backward_pre_hook  -> unshard + wait +
-                                                     prepare_grads + prefetch
-        per param:
-          param.register_post_accumulate_grad_hook -> unit.on_grad_ready
+    # --- hook bodies ------------------------------------------------------
 
-        registered once at init and never removed, like ddp. one FSDP instance
-        per model.
+    def _pre_forward(self, unit: FSDPUnit) -> None:
+        """unit.unshard(); unit.wait_unshard(); _record_order(unit); _prefetch(unit, backward=False)."""
+        raise NotImplementedError
 
-        for a multi-module unit (the root: token_emb, lm_head, norm) the
-        forward hooks go on the modules that BOUND the unit's use -- unshard on
-        token_emb's pre-forward, and for the root there is no reshard hook at
-        all, since it's released in post_backward.
+    def _post_forward(self, unit: FSDPUnit, output: torch.Tensor) -> None:
         """
+        if unit.reshard_after_forward: unit.reshard().
+        if output.requires_grad: output.register_hook(lambda g: self._pre_backward(unit))
+        (return None from the tensor hook, so the grad passes through unchanged).
+        """
+        raise NotImplementedError
+
+    def _pre_backward(self, unit: FSDPUnit) -> None:
+        """unit.unshard(); unit.wait_unshard(); _prefetch(unit, backward=True)."""
         raise NotImplementedError
 
     # --- prefetch ---------------------------------------------------------
 
     def _record_order(self, unit: FSDPUnit) -> None:
         """
-        append to `_forward_order` on the first forward only. execution order,
-        not construction order -- they agree for qwen3 today and won't for the
-        first model that reorders or reuses blocks.
+        append on the first forward only. use execution order, not
+        construction order. set _order_recorded in sync() after the first
+        step, so a second forward can't double-append.
         """
         raise NotImplementedError
 
     def _prefetch(self, unit: FSDPUnit, backward: bool) -> None:
         """
-        launch `prefetch_depth` units' gathers ahead of `unit`: forward order
-        going forward, its exact reverse going backward.
-
-        no-op until the order is recorded (the first forward is strictly
-        serial comm->compute, and that's fine). a mismatch here degrades
-        silently into no prefetching at all rather than into a wrong answer,
-        which is why tests/fsdp2.py checks the recorded order directly.
+        call unshard() (launch only, no wait) on the next prefetch_depth
+        units after `unit`: forward order going forward, reversed going
+        backward. no-op until the order is recorded.
         """
         raise NotImplementedError
 
@@ -487,17 +502,14 @@ class FSDP:
 
     def sync(self) -> None:
         """
-        called between `loss.backward()` and `clip_grad_norm`. waits every
-        outstanding reduce-scatter and runs each unit's `finalize_grads`.
+        between the last microbatch's backward and clip_grad_norm.
 
-        assert every unit fired, with ddp's error message discipline -- a unit
-        that never completed means a param got no grad (frozen), or a hook
-        didn't fire because a block was skipped, and the resulting grads are
-        wrong rather than absent.
-
-        also assert every unit is resharded on the way out, root included:
-        leaving one gathered is the failure mode where fsdp trains perfectly and
-        saves no memory.
+        - assert every unit's pending == len(params), i.e. its post_backward
+          fired and re-armed. ddp-style message: frozen param, or a skipped
+          block.
+        - finalize_grads() on every unit.
+        - assert every unit is SHARDED, root included. a unit left gathered
+          trains fine and saves no memory.
         """
         if self.shard_size == 1:
             return
@@ -505,11 +517,9 @@ class FSDP:
 
     def state_dict(self) -> dict:
         """
-        phase 3. until sharded checkpointing exists this MUST raise: rank 0
-        writing `model.state_dict()` under fsdp writes one rank's shard as if it
-        were the model, and it's a corrupt file that only announces itself at
-        resume. the trainer should refuse to start an fsdp run with
-        checkpointing enabled rather than rely on this firing at save time.
+        phase 3. must raise until sharded checkpointing exists: rank 0's
+        model.state_dict() is one shard, and would be written as if it were
+        the model.
         """
         raise NotImplementedError(
             "sharded checkpointing is phase 3; an fsdp run cannot checkpoint yet"

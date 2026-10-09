@@ -1,13 +1,8 @@
 """
-checkpointing for the single gpu case: one directory per step
-(checkpoints/<run>/<step>/) with one torch.save file per component.
-load_* mirrors save_* and applies the state in place, so resume is
-"build everything like a fresh run, then load_* each piece".
+unsharded checkpointing: checkpoints/<run>/<step>/ with one torch.save file
+per component. load_* applies state in place onto a freshly built trainer.
 
-distributed later means swapping the torch.save calls for
-torch.distributed.checkpoint (sharded save/load); the per-step
-directory layout and the save_*/load_* surface stay the same so the
-trainer doesn't churn.
+TODO: torch.distributed.checkpoint for sharded state, same save_*/load_* api
 """
 import os
 
@@ -27,8 +22,6 @@ class Checkpointer:
         return step if step in self._steps() else None
 
     def _steps(self) -> list[int]:
-        # python if statemnts are short circuit, so
-        # passing int(d) into self.is_complete is fine
         return [
             int(d) for d in os.listdir(self.checkpoint_save_path)
             if d.isdigit() and self.is_complete(int(d))
@@ -44,9 +37,7 @@ class Checkpointer:
         torch.save(obj.state_dict(), os.path.join(self._step_dir(step, create=True), name))
 
     def _load(self, step: int, name: str, weights_only: bool = True):
-        # map_location="cpu": load_state_dict copies into the existing
-        # (possibly cuda) params/state, so deserializing straight to gpu
-        # would just spike memory for no benefit.
+        # cpu: load_state_dict copies into the existing tensors anyway
         return torch.load(
             os.path.join(self._step_dir(step), name),
             map_location="cpu",
@@ -63,13 +54,10 @@ class Checkpointer:
         self._save(scheduler, step, "scheduler.pt")
 
     def save_dataloader(self, dataloader, step: int, dp_rank: int = 0) -> None:
-        # per-dp-shard state: each dp rank streams a different slice of the
-        # dataset, so each writes (and later loads) its own file
         self._save(dataloader, step, f"dataloader_dp{dp_rank}.pt")
 
     def save_trainer(self, state: dict, step: int) -> None:
-        # trainer state is already a plain dict (step, rng states, config
-        # snapshot), not a state_dict() holder, so it bypasses _save
+        # already a plain dict, so it bypasses _save
         torch.save(state, os.path.join(self._step_dir(step, create=True), "trainer.pt"))
 
     def load_trainer(self, step: int) -> dict:
@@ -85,9 +73,7 @@ class Checkpointer:
         scheduler.load_state_dict(self._load(step, "scheduler.pt"))
 
     def load_dataloader(self, dataloader, step: int, dp_rank: int = 0) -> None:
-        # dataloader state carries arbitrary python from the hf dataset /
-        # worker states, which weights_only rejects; we wrote this file
-        # ourselves so full unpickling is fine.
+        # weights_only rejects the hf dataset state; we wrote this file ourselves
         dataloader.load_state_dict(
             self._load(step, f"dataloader_dp{dp_rank}.pt", weights_only=False)
         )

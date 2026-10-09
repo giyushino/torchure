@@ -1,35 +1,20 @@
 """
+mesh-aware collective wrappers over torch.distributed. the only module that
+calls torch.distributed comm ops directly.
+
 https://www.aleksagordic.com/blog/collective-operations
 https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html
-mesh-aware collective wrappers over torch.distributed.
 
-the only module in the repo that calls torch.distributed comm ops directly;
-ddp grad sync, fsdp2, dtensor redistribute, and cp ring attention all speak
-these functions instead of raw ProcessGroups.
+- callers pass (tensor, mesh, dim_name), never a ProcessGroup.
+- async_op=True returns (tensor, work); don't read the tensor until work.wait().
+- all_reduce / broadcast are in place and return the input. the others
+  return a new tensor.
+- op is a string so "avg" can be emulated on gloo (no ReduceOp.AVG): divide
+  locally first, then "sum". pre-dividing means no fixup after an async wait.
+- no autograd. if tp needs these inside compiled blocks, swap the internals
+  to torch.distributed._functional_collectives behind the same signatures.
 
-decisions baked into the signatures (so the call sites don't churn later):
-
-- callers pass (tensor, mesh, dim_name), never a ProcessGroup. MeshLike below
-  is the contract core/mesh.py must satisfy; collectives are implementable
-  and testable before the real mesh exists (see FlatMesh in
-  tests/collective.py).
-- sync call returns the result tensor. async_op=True returns (tensor, work);
-  the tensor is NOT safe to read until work.wait().
-- all_reduce / broadcast are IN-PLACE on the input and return it (the ddp
-  grad path wants zero extra allocations). all_gather / reduce_scatter /
-  all_to_all allocate and return a NEW tensor (the output shape differs
-  anyway).
-- op is a lowercase string, not dist.ReduceOp, so "avg" can be emulated on
-  gloo (which has no ReduceOp.AVG): divide by mesh.size(dim) locally, then
-  reduce with "sum". pre-dividing rather than post-dividing is what keeps
-  async_op=True working on the emulated path -- there is no fixup owed after
-  the wait. nccl uses ReduceOp.AVG directly.
-- no autograd through these: they run on grads/params/buffers outside any
-  compiled graph. when tp needs collectives *inside* compiled blocks, swap
-  the internals to torch.distributed._functional_collectives behind these
-  same signatures -- they are functional-shaped on purpose.
-
-run tests with: uv run tests/collective.py  (gloo/cpu, no gpus needed)
+tests: uv run tests/collective.py  (gloo/cpu, no gpus needed)
 
 ┌────────────────┬───────────────────┬─────────────────────────────────────────┐
 │   collective   │   per-rank size   │                   why                   │
@@ -55,8 +40,6 @@ import torch.distributed as dist
 
 ReduceOpName = Literal["sum", "avg", "max", "min"]
 
-# shared by all_reduce / reduce_scatter. "avg" is resolved per-backend at the
-# call site (nccl has ReduceOp.AVG, gloo needs sum + local divide).
 _OPS = {
     "sum": dist.ReduceOp.SUM,
     "avg": dist.ReduceOp.AVG,
@@ -73,12 +56,7 @@ class MeshLike(Protocol):
         ...
 
     def get_group(self, dim: str) -> dist.ProcessGroup:
-        """the ProcessGroup this rank belongs to along `dim`.
-
-        (mesh.py note for later: dist.new_group is itself a collective --
-        ALL ranks must call it for EVERY group, including groups this rank
-        is not a member of, in the same order.)
-        """
+        """the ProcessGroup this rank belongs to along `dim`."""
         ...
 
     def coordinate(self, dim: str) -> int:
@@ -98,26 +76,12 @@ def all_reduce(
     reduce `tensor` across the `dim` group, in place; every rank in the group
     ends up with the same reduced values. returns the input tensor.
     """
-    # 1. resolve WHERE: mesh dim name -> the ProcessGroup this rank reduces in
     group = mesh.get_group(dim)
-
-    # 2. resolve WHAT: "avg" needs a per-backend decision, everything else is
-    #    a straight enum lookup
     if op == "avg" and dist.get_backend(group) != "nccl":
-        # no ReduceOp.AVG here: pre-divide, then sum. dividing before the
-        # reduce gives the same mean (group size is fixed) and, unlike
-        # sum-then-divide, needs no post-wait fixup -- which is what lets
-        # async_op work: ddp grad overlap wants (tensor, work) back from an
-        # "avg" on gloo too (see parallelism/data_parallel.py + its tests).
         tensor /= mesh.size(dim)
         op = "sum"
 
-    # 3. communicate: the backend runs the actual ring/tree exchange and
-    #    mutates `tensor` in place on every rank
     work = dist.all_reduce(tensor, _OPS[op], group=group, async_op=async_op)
-
-    # 4. no fix-up needed on this path
-    # 5. return the input tensor (in-place contract), plus the handle if async
     return (tensor, work) if async_op else tensor
 
 
@@ -130,17 +94,10 @@ def broadcast(
     async_op: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dist.Work]:
     """
-    copy `tensor` from the rank at coordinate `src` WITHIN the dim group
-    (not a global rank) to every rank in the group, in place.
-
-    impl note: dist.broadcast wants a GLOBAL rank -- convert with
-    dist.get_global_rank(group, src). passing the coordinate straight
-    through happens to work on a 1-d mesh and silently breaks on any real
-    one; tests/collective.py uses src=1 to catch exactly this.
+    copy `tensor` from coordinate `src` within the dim group (not a global
+    rank) to every rank in the group, in place.
     """
-    # what
     group = mesh.get_group(dim)
-    # where
     work = dist.broadcast(tensor, src=None, group=group, async_op=async_op, group_src=src)
     return (tensor, work) if async_op else tensor
 
@@ -159,30 +116,14 @@ def all_gather(
     by coordinate. out.shape[gather_dim] == tensor.shape[gather_dim] * size.
     all ranks get the same result.
 
-    impl notes:
-    - wrap dist.all_gather_into_tensor (single preallocated output, one
-      kernel), not the python-list variant.
-    - it only stacks along dim 0: for gather_dim != 0, movedim before and
-      after. inputs must be contiguous -- either .contiguous() or assert,
-      never silently corrupt.
-    - `output_tensor` lets the caller own the destination instead of taking a
-      fresh allocation per call; the returned tensor then aliases it. this is
-      for fsdp2, which unshards each unit into one buffer reused every step:
-      the param views into that buffer stay the same objects across steps
-      (stable for compile guards), and freeing becomes a storage resize the
-      caller times rather than a refcount drop the allocator may reuse under
-      an in-flight collective. restricted to gather_dim == 0 -- the collective
-      always stacks along dim 0, so a buffer shaped like the *returned* view
-      at any other gather_dim passes a numel check and comes back transposed.
+    `output_tensor` lets the caller own a reusable destination buffer (fsdp2's
+    per-unit unshard buffer); the result aliases it. only for gather_dim == 0.
     """
     group = mesh.get_group(dim)
     group_size = mesh.size(dim)
     input_tensor = tensor.movedim(gather_dim, 0).contiguous()
     expected_shape = (group_size * input_tensor.size(0), *input_tensor.size()[1:])
 
-    # `is None`, not truthiness: bool() on a tensor raises for anything with
-    # more than one element and reads the *value* for exactly one, so a falsy
-    # 1-element buffer would be silently thrown away and reallocated.
     if output_tensor is None:
         output_tensor = torch.empty(
             expected_shape, dtype=tensor.dtype, device=tensor.device
@@ -230,30 +171,14 @@ def reduce_scatter(
         all_gather(reduce_scatter(x)) == all_reduce(x)
     which is exactly fsdp's decomposition.
 
-    v0: require tensor.shape[scatter_dim] % size == 0 and assert loudly;
-    no padding. wrap dist.reduce_scatter_tensor; same movedim/contiguity
-    story as all_gather. same gloo-"avg" caveat as all_reduce.
+    requires shape[scatter_dim] % size == 0 (no padding).
     """
     group = mesh.get_group(dim)
     group_size = mesh.size(dim)
     assert tensor.shape[scatter_dim] % group_size == 0, f"shape[{scatter_dim}]={tensor.shape[scatter_dim]} not divisible by group size {group_size}"
 
-    # no ReduceOp.AVG here: pre-divide, then sum. dividing before the reduce
-    # gives the same mean (group size is fixed) and, unlike sum-then-divide,
-    # needs no post-wait fixup -- which is what lets async_op work on this
-    # path (fsdp's backward wants this call overlapped).
-    #
-    # two things this has to get right, both of which the all_reduce version
-    # of this block gets for free and this one does NOT:
-    #   - it runs BEFORE input_tensor is built. .contiguous() below may copy
-    #     (any scatter_dim != 0, or a non-contiguous input), and a divide
-    #     applied after that copy is written to a tensor nobody reduces --
-    #     silently a plain "sum" labelled "avg", off by exactly group_size.
-    #   - `/`, not `/=`. all_reduce is documented in-place on its input, so
-    #     mutating there is the contract; reduce_scatter allocates a new
-    #     output and leaves the input alone. under fsdp the input is the
-    #     unsharded grad buffer, and scaling it in place would corrupt every
-    #     later read of it, on gloo only.
+    # gloo avg emulation. must happen before .contiguous() (which may copy),
+    # and out of place: unlike all_reduce, the input must not be mutated
     if op == "avg" and dist.get_backend(group) != "nccl":
         tensor = tensor / group_size
         op = "sum"
@@ -299,12 +224,7 @@ def all_to_all(
     to coordinate j; the size received chunks (ordered by sender coordinate)
     are concatenated along `concat_dim`. returns a new tensor.
 
-    this is Shard(i)->Shard(j) redistribution and the ep token shuffle.
-
-    v0: even splits only (shape[split_dim] % size == 0), wrap
-    dist.all_to_all_single. ep will eventually need uneven
-    input_splits/output_splits -- add those kwargs when a consumer exists,
-    not now.
+    even splits only. ep will eventually need uneven splits.
     """
     group = mesh.get_group(dim)
     group_size = mesh.size(dim)
@@ -330,31 +250,23 @@ def ring_send_recv(
     coordinate-1 (mod size) along `dim`. returns the received tensor
     (newly allocated, same shape/dtype as the input).
 
-    this is the cp ring-attention primitive (and the building block of the
-    educational ring all-reduce).
-
-    sync-only for v0 (same reasoning as all_to_all: no consumer overlaps it
-    yet). when cp wants comm/compute overlap, lift the assert and return the
-    recv req as the work handle.
+    sync-only for now; cp overlap would return the recv req as the work handle.
     """
     assert not async_op, "ring_send_recv is sync-only (v0)"
     group = mesh.get_group(dim)
     group_size = mesh.size(dim)
     coord = mesh.coordinate(dim)
     if group_size == 1:
-        # a 1-rank ring is a self-loop; backends don't support self
-        # send/recv, and the semantics are just "a copy of my own tensor"
+        # backends don't support send/recv to self
         return tensor.clone()
 
-    # P2POp wants GLOBAL ranks: same coordinate conversion as broadcast
+    # P2POp wants global ranks
     dst = dist.get_global_rank(group, (coord + 1) % group_size)
     src = dist.get_global_rank(group, (coord - 1) % group_size)
 
     send_tensor = tensor.contiguous()
     recv_tensor = torch.empty_like(send_tensor)
-    # submit the send and recv as one batch: every rank doing a blocking
-    # send() then recv() deadlocks (all ranks stuck sending, nobody
-    # receiving). batching lets the backend interleave both directions.
+    # batched: blocking send-then-recv on every rank would deadlock
     reqs = dist.batch_isend_irecv(
         [
             dist.P2POp(dist.isend, send_tensor, dst, group=group),
@@ -369,8 +281,7 @@ def ring_send_recv(
 def barrier(mesh: MeshLike | None = None, dim: str | None = None) -> None:
     """
     block until all ranks arrive (all ranks of the dim group; the whole
-    world if mesh is None). for fencing checkpoint saves and test output --
-    don't sprinkle it through the training loop.
+    world if mesh is None).
     """
     dist.barrier(group=None if mesh is None else mesh.get_group(dim))
 

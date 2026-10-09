@@ -1,10 +1,7 @@
 """
 comm/compute overlap profiler -- roadmap phase 1 exit criterion (c).
 
-answers "how much of the grad all-reduce is actually hidden behind backward",
-which an end-to-end ablation cannot: an ablation tells you overlapping is
-faster than not overlapping, but a +11% delta looks the same whether you are
-hiding 40% of the traffic or 95%.
+measures how much of the grad all-reduce is hidden behind backward.
 
 capture a trace and print the table:
 
@@ -15,23 +12,15 @@ re-analyze one you already have (no gpus, no rendezvous):
 
     uv run -m torchure.train.profile_overlap --analyze traces/overlap_dp8.json
 
-the chrome trace also loads directly in ui.perfetto.dev. two tracks matter
-there: the compute stream and the nccl stream. put them side by side and the
-hidden comm (nccl bars under a solid compute row) and the exposed tail (one
-long all-reduce at the end of the step with an empty compute row beside it)
-are visible without any of the arithmetic below.
+the trace also loads in ui.perfetto.dev.
 
-method: GPU kernels split into comm (`ncclDevKernel_*`) and everything else,
-each set's intervals unioned, the two unions intersected.
+kernels are split into comm (`ncclDevKernel_*`) and compute, and the unions
+of each are intersected:
 
-    hidden  = comm  n  compute      -- overlapped, effectively free
-    exposed = comm --- compute      -- what ddp actually COSTS
+    hidden  = comm  n  compute
+    exposed = comm --- compute      -- the number to optimize
 
-exposed is the number to optimize. `traces/` is gitignored -- regenerate
-rather than commit, they are ~11 MB each.
-
-warmup matters: the first steps pay torch.compile and allocator churn, so
-profiling them measures the wrong thing entirely. default 10 is past both.
+the default 10 warmup steps skip compile and allocator churn.
 """
 
 import argparse
@@ -126,12 +115,7 @@ def analyze(trace_path: str, n_steps: int) -> None:
     print(f"{'  EXPOSED (real ddp cost)':<32}{ms(exposed):>10.1f}{100 * exposed / wall:>11.1f}% of step")
     print(f"{'gpu idle (no kernel at all)':<32}{ms(wall - comp_total - exposed):>10.1f}")
 
-    # per-kernel exposure separates the structural tail from the rest. the
-    # tied-embedding grad is the LAST one ready (first layer, plus the lm_head
-    # contribution), so its reduce has no compute left to hide behind -- that
-    # part is unavoidable at any bucket size. exposure in the smaller buckets
-    # is either bucketing/launch order or, once total comm exceeds the backward
-    # window, plain bandwidth starvation.
+    # the tied-embedding grad is ready last, so its reduce is always exposed
     ranked = sorted(
         ((e - s, (e - s) - intersect_len([[s, e]], comp_merged)) for s, e in per_kernel),
         reverse=True,
@@ -161,7 +145,7 @@ def capture(args: argparse.Namespace) -> None:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    # same p2p policy as train.py -- profiling the slow path would be useless
+    # same p2p policy as train.py
     os.environ.setdefault("NCCL_P2P_LEVEL", "SYS")
 
     torch.cuda.set_device(local_rank)
@@ -170,8 +154,6 @@ def capture(args: argparse.Namespace) -> None:
         trainer = Trainer(args.config, rank=rank, local_rank=local_rank, world_size=world_size)
         for _ in range(args.warmup):
             trainer.train_step()
-        # fence: no rank starts profiling while another is still warming up,
-        # or the trace catches a step that was waiting on a straggler
         torch.cuda.synchronize()
         dist.barrier()
 
@@ -199,8 +181,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # the guard is load-bearing, not boilerplate: the dataloader's forkserver
-    # re-runs this file to rebuild __main__ in every worker process, and
-    # without it each worker re-enters main() and the run dies in a
-    # BrokenPipeError with no useful traceback.
+    # required: dataloader workers re-import __main__
     main()

@@ -170,12 +170,8 @@ def test_reduce_scatter(mesh, dim, device):
 
 
 def test_reduce_scatter_avg_contract(mesh, dim, device):
-    # the "avg" emulation on backends without ReduceOp.AVG pre-divides the
-    # input and reduces with "sum". every case below is one this got wrong
-    # while test_reduce_scatter above stayed green: that test only ever
-    # passes scatter_dim=0 with a contiguous throwaway tensor, which is
-    # exactly the one layout where the divide lands on the reduced tensor by
-    # accident and the mutation is invisible.
+    # cases the gloo "avg" emulation got wrong while test_reduce_scatter
+    # (contiguous, scatter_dim=0 only) stayed green
     c, g = mesh.coordinate(dim), mesh.size(dim)
     avged = rank_pattern((3, 4 * g), 0, device) * ((g + 1) / 2)
 
@@ -203,9 +199,7 @@ def test_reduce_scatter_avg_contract(mesh, dim, device):
         msg="'avg' on a non-contiguous input is wrong (divide lost to the copy)",
     )
 
-    # the out-of-place contract: unlike all_reduce, this op allocates its
-    # output and must leave the input untouched. under fsdp the input is the
-    # unsharded grad buffer -- scaling it in place corrupts every later read.
+    # out of place: unlike all_reduce, the input must be left untouched
     x = rank_pattern((4 * g, 3), c, device)
     before = x.clone()
     C.reduce_scatter(x, mesh, dim, "avg", scatter_dim=0)
@@ -213,9 +207,7 @@ def test_reduce_scatter_avg_contract(mesh, dim, device):
         x, before, msg="reduce_scatter mutated its input (in-place divide?)"
     )
 
-    # async on the emulated path: pre-dividing (rather than dividing after
-    # the reduce) is what makes this legal, and it is the call fsdp's
-    # backward wants overlapped -- so the cpu suite has to cover it.
+    # async on the emulated path (fsdp's backward overlaps this call)
     res = C.reduce_scatter(
         rank_pattern((4 * g, 3), c, device), mesh, dim, "avg",
         scatter_dim=0, async_op=True,
@@ -323,11 +315,9 @@ def test_subgroup_isolation(mesh, dim, device):
 
 
 def test_mesh_flatten(mesh, dim, device):
-    # flatten(("dp_replicate", "dp_shard"), "dp") is the "which batch shard
-    # am i" helper: tp peers must land in DIFFERENT flat groups but share the
-    # SAME flat coordinate, and coordinate == index in group rank order (the
-    # all_gather-order invariant). dp_shard=1 also covers a size-1 axis
-    # inside the flatten.
+    # tp peers must land in different flat groups but share the same flat
+    # coordinate, and coordinate == index in group rank order. dp_shard=1
+    # covers a size-1 axis inside the flatten.
     if dist.get_world_size() != 4:
         raise Skip("needs exactly 4 ranks; rerun with --world-size 4")
 
@@ -408,10 +398,8 @@ def _worker(rank: int, world_size: int, backend: str, only: str | None = None):
     else:
         device = torch.device("cpu")
 
-    # exercise the real N-d Mesh instead of FlatMesh: a 2-d (dp x tp) layout so
-    # `dp` is a genuine subgroup, not the whole world -- that's what catches
-    # wrong-group bugs. the tp groups get built too, exercising the multi-axis
-    # new_group loop (the "all ranks create every group" deadlock trap).
+    # real 2-d (dp x tp) Mesh, so `dp` is a genuine subgroup and wrong-group
+    # bugs show up
     if world_size % 2 == 0 and world_size >= 4:
         spec = {"dp": world_size // 2, "tp": 2}
     else:
@@ -432,11 +420,8 @@ def _worker(rank: int, world_size: int, backend: str, only: str | None = None):
         except AssertionError as e:
             err = f"FAIL: {e}"
         except Exception as e:
-            # unexpected crash inside a collective (bad shapes, backend
-            # errors, timeouts): report and keep going rather than nuking
-            # the whole run with a spawn traceback. note a timeout may
-            # leave the process group wedged, in which case later tests
-            # will error too -- trust the FIRST error line.
+            # report and keep going. a timeout can wedge the process group,
+            # so trust the first error line.
             err = f"ERROR: {type(e).__name__}: {e}"
         dist.barrier()
         if rank == 0:

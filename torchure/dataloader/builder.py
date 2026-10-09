@@ -1,14 +1,8 @@
 """
-build helper for the dataloader, colocated with DataLoader
-note that testing shows numpy is faster than torch or
-python arrs, so we should move packing into the collator
+dataloader builder
 
-but this doesn't seem to be bottleneck for throughput
-so leave for now
-
-eos vs pad: eos (doc separator, trained on) and pad (bin filler,
-maskable) are looked up separately from config and must be distinct
-vocab ids -- see the contract in packers.py
+TODO: numpy packing in the collator benchmarks faster, but packing isn't a
+throughput bottleneck yet
 """
 
 import datasets
@@ -18,24 +12,15 @@ from datasets.distributed import split_dataset_by_node
 from tokenizers import Tokenizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-# packing strategies live in packers.py so they can be swapped/benchmarked
-# independently; see tests/dataloader_packing.py. ListPacker is the original
-# python-list implementation.
 from torchure.dataloader.packers import ListPacker
 
 
 class Collator:
     """
-    stack pre-packed rows into a batch. the Packer (.map step) already emits
-    fixed-length seq_len blocks with no padding, so there's nothing to pad,
-    truncate, or mask here -- the collate just stacks ids and clones labels.
+    stack pre-packed seq_len rows into a batch. labels are an unshifted clone;
+    shifting is the objective's job. ignore_index is kept for sft masking later.
 
-    every position is a real token, so labels are a straight clone (no
-    ignore_index in the pretrain path). label *shifting* stays the objective's
-    job. ignore_index is kept on the constructor for SFT prompt-masking later.
-
-    a top-level class (not a closure) so DataLoader workers can pickle it,
-    which forkserver/spawn start methods require (py3.14 default on linux).
+    top-level class so spawn workers can pickle it.
     """
     def __init__(self, tokenizer: Tokenizer, ignore_index: int):
         self.tokenizer = tokenizer
@@ -48,14 +33,9 @@ class Collator:
 
 
 def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int, dp_size: int):
-    # streaming on by default. an explicit split is required so we get an
-    # IterableDataset back, not an IterableDatasetDict (no .num_shards, and
-    # split_dataset_by_node rejects it). `config` is the dataset's subset
-    # name (e.g. "en" for c4); pass None for datasets without subsets.
-    # TODO: a dataset registry once per-dataset split/field quirks pile up.
-
-    # when the dataset is in json format on huggingface, this no longer 
-    # works and we'll need to change the format
+    # an explicit split returns an IterableDataset (not a Dict), which
+    # split_dataset_by_node needs. `config` is the hf subset name, or None.
+    # TODO: doesn't handle hf datasets stored as json
     dataset = datasets.load_dataset(
         data_cfg["name"],
         data_cfg.get("config"),
@@ -65,25 +45,16 @@ def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int
     if dp_rank == 0:
         print(f"num shards: {dataset.num_shards}")
 
-    # normalize whatever the source calls its text column to "text" so the
-    # collate_fn stays dataset-agnostic. rename_column, NOT a lambda .map:
-    # the dataset is pickled to DataLoader workers under forkserver/spawn
-    # (py3.14 default on linux) and lambdas don't pickle -- same reason
-    # Packer/Collator are top-level classes.
+    # rename_column rather than a lambda .map, since lambdas don't pickle to workers
     text_field = data_cfg["text_field"]
     if text_field != "text":
         dataset = dataset.rename_column(text_field, "text")
 
     dataset = dataset.shuffle(buffer_size=data_cfg["shuffle_buffer"], seed=data_cfg["seed"])
-    # split by the data-parallel mesh coordinate: ranks in the same TP/CP
-    # group share a dp_rank and so deterministically read the same shards.
+    # tp/cp peers share a dp_rank, so they read the same shards
     dataset = split_dataset_by_node(dataset, rank=dp_rank, world_size=dp_size)
 
-    # eos delimits documents in the packed stream (real, trained-on signal);
-    # pad only fills bestfit bins and must be a DIFFERENT vocab id so labels
-    # can mask filler later without masking genuine doc boundaries (see
-    # packers.py). token_to_id returns None for tokens missing from the
-    # vocab -- fail here, loudly, not as a TypeError inside a worker.
+    # eos and pad must be distinct ids (see packers.py)
     eos_id = tokenizer.token_to_id(data_cfg["eos_token"])
     pad_id = tokenizer.token_to_id(data_cfg["pad_token"])
     assert eos_id is not None, f"eos_token {data_cfg['eos_token']!r} not in tokenizer vocab"
@@ -96,13 +67,7 @@ def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int
         remove_columns=dataset.column_names,
     )
 
-    # the loader only ever sees the MICRO batch: one iteration == one
-    # forward/backward, which is also what torch's own DataLoader(batch_size=)
-    # means. how many microbatches make up an optimizer step (grad
-    # accumulation) is entirely the trainer's business -- it derives that from
-    # global_batch_size and validates divisibility against dp_size, so nothing
-    # here needs to know the global batch exists.
-    #return torch.utils.data.DataLoader(
+    # micro batches only; grad accumulation is the trainer's job
     num_workers = data_cfg["num_workers"]
     return StatefulDataLoader(
         dataset,
@@ -110,10 +75,7 @@ def build_dataloader(data_cfg, tokenizer: Tokenizer, ignore_id: int,dp_rank: int
         num_workers=num_workers,
         collate_fn=Collator(tokenizer, ignore_id),
         persistent_workers=num_workers > 0,
-        # spawn, not the default fork: workers otherwise inherit whatever
-        # live sockets/background threads the streaming HTTP filesystem
-        # opened in the parent (fsspec's async event-loop thread in
-        # particular), which can deadlock a worker on its first request
+        # fork can deadlock on fsspec's background threads inherited from the parent
         multiprocessing_context="spawn" if num_workers > 0 else None,
         pin_memory=True
     )

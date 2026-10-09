@@ -30,9 +30,7 @@ class Mesh:
         return strides
 
     def _group_for(self, axis: str):
-        """
-        get every group for a given axis
-        """
+        """yield the member ranks of every group along `axis`"""
         size = self.size(axis)
         stride = self.strides[axis]
         block = size * stride
@@ -54,31 +52,20 @@ class Mesh:
 
     def flatten(self, axes: tuple[str, ...], name: str) -> None:
         """
-        register a virtual axis `name` treating `axes` as one row-major
-        super-axis; size()/coordinate()/get_group() then work on it like a
-        real axis. built for "which batch shard am i": the dataloader wants
-        one dp coordinate spanning (dp_replicate, dp_shard), shared by
-        tp/cp/pp peers.
+        register a virtual axis `name` treating `axes` as one row-major axis,
+        e.g. dp = (dp_replicate, dp_shard).
 
-        `axes` must be real axes listed in spec (outer -> inner) order; that
-        makes coordinate(name) == my index in the group's rank order, so
-        all_gather order along the flat axis matches the coordinate.
-
-        collective, like _build_groups: every rank must call this with the
-        same arguments in the same order (dist.new_group is collective).
+        `axes` must be in spec order so coordinate(name) matches all_gather
+        order. collective: every rank must call this identically.
         """
         assert axes and len(set(axes)) == len(axes), f"bad axes {axes}"
         assert all(ax in self.strides for ax in axes), f"unknown axis in {axes}"
-        # NB: self.strides iterates inner->outer (built reversed); use
-        # self.sizes for spec order. virtual names in sizes can't collide
-        # here -- the strides-membership assert above already excluded them.
+        # self.strides is inner->outer, so use self.sizes for spec order
         spec_order = [ax for ax in self.sizes if ax in axes]
         assert list(axes) == spec_order, f"{axes} must follow spec order {spec_order}"
         assert name not in self.sizes, f"axis {name!r} already exists"
 
-        # bucket every global rank by its coords on the NON-flattened axes:
-        # strip the flattened axes' contribution to the rank; ranks left with
-        # the same base differ only along `axes`, i.e. form one flat group.
+        # ranks with the same coords on the other axes form one flat group
         buckets: dict[int, list[int]] = {}
         for r in range(self.world_size):
             offset = sum(
@@ -92,9 +79,6 @@ class Mesh:
             group = dist.new_group(members)
             if rank in members:
                 self.groups[name] = group
-                # coord = position in group rank order; the spec-order assert
-                # makes this equal the row-major mixed-radix coordinate, which
-                # is the invariant all_gather along `name` relies on
                 self._flat_coords[name] = members.index(rank)
 
         flat_size = 1

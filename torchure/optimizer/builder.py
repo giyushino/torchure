@@ -1,14 +1,6 @@
 """
-registry + build helpers for optimizers (and their schedulers)
-
-optimizers are a swappable, config-selected component like objectives, so they
-get the same registry treatment instead of being special-cased in the trainer.
-
-on top of registry selection, params are split into two groups: weight decay
-applies only to >=2D tensors (matmuls, embeddings), while 1D params (biases,
-norm/scale weights) are exempted -- the standard decoupled-weight-decay
-convention. everything else in optim_config (lr, betas, fused, ...) is passed
-straight through, so it stays config-driven per optimizer.
+registry + build helpers for optimizers and schedulers. weight decay applies
+only to >=2D params; biases and norm weights are exempt.
 """
 
 import torch.nn as nn
@@ -29,9 +21,6 @@ SCHEDULER_REGISTRY = {
 
 
 def build_optimizer(model: nn.Module, optim_name: str, optim_config: dict) -> optim.Optimizer:
-    # weight decay is applied per param group, not globally, so pull it out of
-    # the flat config and hand each group its own value below. copy first so we
-    # don't mutate the caller's config dict.
     cfg = dict(optim_config)
     weight_decay = cfg.pop("weight_decay", 0.0)
 
@@ -50,8 +39,6 @@ def build_scheduler(optimizer: optim.Optimizer, scheduler_config: dict) -> optim
     scheduler_cfg = dict(scheduler_config)
     schedulder_type = scheduler_cfg["type"]
     if schedulder_type == "cosine":
-        # NotImplementedError, not the NotImplemented sentinel: raising the
-        # sentinel is a TypeError, which would mask the real message
         raise NotImplementedError("cosine scheduler is a stub (get_lr returns 0); use wsd")
 
     scheduler_cfg.pop("type")

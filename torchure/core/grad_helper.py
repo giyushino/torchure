@@ -7,10 +7,10 @@ from torchure.core.collective import all_reduce
 
 def clip_grad_norm(params, mesh, max_norm, shard_dims=()) -> torch.Tensor:
     """
-    returns the pre-clip global grad norm for loggings
-    note that grads are mutated in place
+    clips grads in place and returns the pre-clip global grad norm.
+    max_norm=None measures without clipping.
     """
-    norm_type = 2.0 # use l2 norm for now
+    norm_type = 2.0
     grads = [p.grad for p in params if p.grad is not None]
     if not grads:
         assert grads, "clip_grad_norm got no grads; backward didn't run, or all params are frozen"
@@ -23,9 +23,6 @@ def clip_grad_norm(params, mesh, max_norm, shard_dims=()) -> torch.Tensor:
             all_reduce(total, mesh, dim, "sum")
         total = total ** (1.0 / norm_type)
 
-    # max_norm=None means "measure but don't clip": the norm is still the
-    # diagnostic you want in the log line, so it's returned either way. the
-    # reduce above already ran, so every rank leaves here in lockstep.
     if max_norm is None:
         return total
 

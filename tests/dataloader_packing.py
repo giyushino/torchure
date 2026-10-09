@@ -64,8 +64,7 @@ def make_corpus(
 
 
 def build_packers(seq_len: int = SEQ_LEN, eos_id: int = EOS_ID, pad_id: int = PAD_ID):
-    # tokenizer=None: pack() never touches it and the benchmark feeds
-    # pre-tokenized docs directly, so no real tokenizer is needed.
+    # tokenizer=None: docs are pre-tokenized
     return {name: cls(None, seq_len, eos_id, pad_id) for name, cls in PACKERS.items()}
 
 
@@ -211,11 +210,8 @@ def run_benchmark(n_docs: int = 2000) -> None:
         [benchmark(name, lambda p=p: p.pack_to_tensor(docs)) for name, p in packers.items()],
     )
 
-    # case 3: best-fit vs the plain list packer, head to head on both speed and
-    # *useful* throughput. they pack the same corpus, but the list packer drops
-    # each map-batch's < seq_len tail while best-fit keeps it -- so we batch the
-    # corpus the way `.map` does (build_dataloader's pack_batch) to surface that
-    # loss, then score retained-tokens/sec, not just wall time.
+    # case 3: best-fit vs list packer, scored on retained tokens/sec since the
+    # list packer drops each map-batch's tail
     run_token_throughput(docs)
 
 

@@ -1,22 +1,11 @@
 import torch
 import torch.nn.functional as F
 
-# maybe we should move the shifting out of here,
-# otherwise it would not work for other models
-# with slightly different objectives
+# TODO: move shifting out of the loss so other objectives can reuse it
 def cross_entropy_loss_naive(tokenized_input: torch.Tensor, logits: torch.Tensor, ignore_index: int) -> torch.Tensor:
     B, S, V = logits.shape
-    # for the seq length, throw away the last token
-    # since we don't have a ground truth for that
     shifted_logits = logits[:, :-1 ,:]
-    
-    # for the ground truth, remove the first token
-    # since we don't have any context for it
     shifted_labels = tokenized_input[:, 1:]
-
-    # we're missing the tokenizer padding right
-    # now, not sure how to set this. probably
-    # pass it as a param
     return F.cross_entropy(
         shifted_logits.reshape(-1, V),
         shifted_labels.reshape(-1),

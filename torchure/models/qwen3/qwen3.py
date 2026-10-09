@@ -1,8 +1,7 @@
 """
-self contained qwen3 arch llm
-dense qwen -> maybe remove
-the cached rope, doesn't seem
-to give any speedups
+self contained dense qwen3
+
+TODO: maybe remove the rope cache, it doesn't seem to give any speedup
 """
 
 import math
@@ -29,38 +28,24 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
 
 
 class Qwen3RotaryEmbedding(nn.Module):
-    """
-    The goal of this is to encode position by
-    rotating the Q and K vectors inside attention
-    """
     def __init__(self, head_dim: int, base: int = 1_000_000):
         super().__init__()
         assert head_dim % 2 == 0, "RoPE requires even head_dim"
 
-        # inv_freq gives us theta, which determines how much
-        # we should rotate the Q K vectors in attention
         inv_freq = 1.0 / (
             base ** (torch.arange(0, head_dim, 2).float() / head_dim)
         )
         self.register_buffer("inv_freq", inv_freq, False)
 
-        # cache for the packed-training path: with no padding mask every step
-        # sees position_ids = arange(seq_len), so cos/sin are identical across
-        # steps. cache them per (seq_len, device) so the eager rope math (which
-        # runs outside the per-block compiled regions) happens once, not every
-        # forward. keyed by seq_len; the padded/eval path recomputes.
+        # cos/sin per (seq_len, device) for the packed, no-mask training path
         self._cache: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
 
     def _cos_sin(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # add new dimension to end of position ids, get (B, S, 1)
-        # add 2 new dimentions to inv_freq, get (1, 1, D/2)
+        # (B, S, 1) * (1, 1, D/2) -> (B, S, D/2)
         freqs = position_ids.float()[:, :, None] * self.inv_freq[None, None, :]
-
-        # freqs shape: (B, S, D/2)
         emb = torch.cat([freqs, freqs], dim=-1)
 
-        # cos/sin shape: (B, 1, S, D), broadcast over heads. kept in fp32 here;
-        # apply_rotary casts to the Q/K dtype at use-time.
+        # (B, 1, S, D), fp32; apply_rotary casts to the Q/K dtype
         cos = emb.cos()[:, None, :, :]
         sin = emb.sin()[:, None, :, :]
 
@@ -69,16 +54,15 @@ class Qwen3RotaryEmbedding(nn.Module):
     def forward(
         self, position_ids: torch.Tensor, cacheable: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # `cacheable` is set by the caller only when position_ids is the plain
-        # arange(seq_len) broadcast over the batch (the packed, no-mask training
-        # path), so the result depends solely on seq_len and can be reused.
+        # cacheable: position_ids is arange(seq_len) broadcast over the batch
         if not cacheable:
             return self._cos_sin(position_ids)
 
+        # cache a single row (1, 1, S, D) so it broadcasts over any batch size
         key = (position_ids.shape[1], position_ids.device)
         cached = self._cache.get(key)
         if cached is None:
-            cached = self._cos_sin(position_ids)
+            cached = self._cos_sin(position_ids[:1])
             self._cache[key] = cached
         return cached
 
@@ -90,6 +74,7 @@ class Qwen3GroupQueryAttention(nn.Module):
         emb_dim: int,
         num_kv_heads: int = 8,
         head_dim: int | None = None,
+        norm_eps: float = 1e-6,
     ):
         super().__init__()
         assert num_heads % num_kv_heads == 0 and num_heads >= num_kv_heads, \
@@ -109,18 +94,12 @@ class Qwen3GroupQueryAttention(nn.Module):
         self.v_proj = nn.Linear(emb_dim, kv_out, bias=False)
         self.o_proj = nn.Linear(q_out, emb_dim, bias=False)
 
-        self.q_norm = nn.RMSNorm(self.head_dim)
-        self.k_norm = nn.RMSNorm(self.head_dim)
-
-        # self.rope = Qwen3RotaryEmbedding(self.head_dim)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=norm_eps)
 
     def split_heads_old(self, x: torch.Tensor) -> torch.Tensor:
-        # reshape input tensor for multihead attention
-        # x is (batch_size, seq_length, emb_dim)
+        # (B, S, emb_dim) -> (B, num_heads, S, head_dim)
         B, S, _ = x.shape
-
-        # each head should see a slice of the embeddings
-        # the new shape is (batch_size, num_heads, seq_length, head_dim)
         return x.reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
      
     def split_heads(self, x):
@@ -132,7 +111,6 @@ class Qwen3GroupQueryAttention(nn.Module):
         return x.reshape(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
     def combine_heads(self, x: torch.Tensor) -> torch.Tensor:
-        # (B, num_heads, S, head_dim) 
         B, _, S, _ = x.shape
         return x.transpose(1, 2).reshape(B, S, self.num_heads * self.head_dim)
 
@@ -143,18 +121,7 @@ class Qwen3GroupQueryAttention(nn.Module):
         V: torch.Tensor,
         attention_mask: torch.Tensor | None
     ):
-
-        # Q matrix contains what each token is looking for
-        # K matrix contains how each token should be matched
-        # V matrix contains the information each token can contribute
-
-        # Q and K are (batch_size, num_heads, seq_length, head_dim)
-        # for matrix mult, we'll take the transpose of K, where we
-        # can simply swap head_dim and seq_length
-        # divide by sqrt of head dim to reduce variance  
-        # matmul automatically broadcasts over the first two dims
-        # shape is now (batch_size, num_heads, seq_length, seq_length)
-
+        # (B, H, S, S)
         attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
         mask_value = torch.finfo(attn_scores.dtype).min
 
@@ -165,28 +132,20 @@ class Qwen3GroupQueryAttention(nn.Module):
         )
         attn_scores = attn_scores.masked_fill(causal_mask, mask_value)
 
-        # this about the padding tokens
         if attention_mask is not None:
             key_padding_mask = ~attention_mask[:, None, None, :].bool()
             attn_scores = attn_scores.masked_fill(key_padding_mask, mask_value)
 
         attn_probs = torch.softmax(attn_scores, dim=-1)
-    
-        # this final matrix mult mixes information between the embeddings
-        # of a token with the tokens it attended to
         return torch.matmul(attn_probs, V)
 
     def scaled_self_attention(self, Q, K, V, attention_mask):
-        # SDPA applies 1/sqrt(head_dim) scaling itself, so don't pre-scale Q@Kᵀ.
-  
-        # fast path (packing / training): pure causal. is_causal=True lets SDPA
-        # use the flash kernel and never materialize the S×S score matrix.
+        # no mask (packed training): is_causal lets sdpa use the flash kernel
         if attention_mask is None:
             return F.scaled_dot_product_attention(Q, K, V, is_causal=True, enable_gqa=True)
   
-        # padding present (eval / left-pad generation): can't combine is_causal
-        # with a key-padding mask, so fold both into one boolean mask.
-        # bool semantics: True = "attend to this position".
+        # padding: is_causal can't be combined with a mask, so build one bool
+        # mask (True = attend)
         S = Q.size(-2)
         causal = torch.ones(S, S, dtype=torch.bool, device=Q.device).tril()
         key_keep = attention_mask[:, None, None, :].bool()      # (B,1,1,S)
@@ -206,11 +165,6 @@ class Qwen3GroupQueryAttention(nn.Module):
 
         Q = apply_rotary(Q, cos, sin)
         K = apply_rotary(K, cos, sin)
-
-        # GQA !! 
-        # repeat_factor = self.num_heads // self.num_kv_heads
-        # K = K.repeat_interleave(repeat_factor, dim=1)
-        # V = V.repeat_interleave(repeat_factor, dim=1)
 
         attn_output = self.scaled_self_attention(Q, K, V, attention_mask)
 
@@ -238,14 +192,15 @@ class Qwen3TransformerBlock(nn.Module):
         num_kv_heads: int = 8,
         head_dim: int | None = None,
         ffn_dim: int | None = None,
+        norm_eps: float = 1e-6,
     ):
         super().__init__()
-        self.gqa = Qwen3GroupQueryAttention(num_heads, emb_dim, num_kv_heads, head_dim)
-        self.norm1 = nn.RMSNorm(emb_dim)
-        self.norm2 = nn.RMSNorm(emb_dim)
+        self.gqa = Qwen3GroupQueryAttention(num_heads, emb_dim, num_kv_heads, head_dim, norm_eps)
+        self.norm1 = nn.RMSNorm(emb_dim, eps=norm_eps)
+        self.norm2 = nn.RMSNorm(emb_dim, eps=norm_eps)
 
         if ffn_dim is None:
-            # round up dim to more hardware friendly number
+            # 8/3 * emb_dim rounded up to a multiple of 256
             ffn_dim = 256 * ((int(8 * emb_dim / 3) + 255) // 256)
         self.ffn  = SwiGLU(emb_dim, ffn_dim)
 
@@ -273,27 +228,25 @@ class Qwen3(nn.Module):
         head_dim: int,
         vocab_size: int,
         ffn_dim: int | None = None,
+        # explicit: nn.RMSNorm's default eps depends on input dtype
+        norm_eps: float = 1e-6,
     ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, emb_dim)
         self.rope = Qwen3RotaryEmbedding(head_dim)
         self.blocks = nn.ModuleList(
-            Qwen3TransformerBlock(num_heads, emb_dim, num_kv_heads, head_dim, ffn_dim)
+            Qwen3TransformerBlock(num_heads, emb_dim, num_kv_heads, head_dim, ffn_dim, norm_eps)
             for _ in range(num_layers)
         )
-        self.norm = nn.RMSNorm(emb_dim)
+        self.norm = nn.RMSNorm(emb_dim, eps=norm_eps)
         self.lm_head = nn.Linear(emb_dim, vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight
 
     def init_weights(self, std: float = 0.02) -> None:
         """
-        gpt/llama-style init. without this, pytorch's default per-layer init
-        lets residual-stream variance compound with depth and the logits blow
-        up (fresh CE ~900 instead of ~ln(vocab)).
-
-        the key piece is scaling the projections that *write into* the residual
-        stream (attn o_proj, ffn down_proj) by 1/sqrt(2 * num_layers) so the
-        added variance per layer stays bounded as depth grows.
+        gpt/llama-style init. projections that write into the residual stream
+        (o_proj, down_proj) are scaled by 1/sqrt(2 * num_layers) so variance
+        doesn't compound with depth.
         """
         for module in self.modules():
             if isinstance(module, nn.Linear):
@@ -319,8 +272,7 @@ class Qwen3(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         B, S = x.shape
 
-        # keep left-padded batches compatible with RoPE by numbering only the
-        # non-pad tokens.
+        # number only non-pad tokens so left padding works with rope
         if attention_mask is None:
             position_ids = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
             cacheable = True
@@ -339,13 +291,10 @@ class Qwen3(nn.Module):
             if return_hidden_states:
                 hidden_states.append(x)
 
-        # skip the head: lets the objective fuse lm_head + cross-entropy
-        # (see torchure/loss/fused_linear_ce.py) without materializing the
-        # (B, S, vocab) logits.
+        # for fused lm_head + cross-entropy (torchure/loss/fused_linear_ce.py)
         if return_final_hidden:
             return self.norm(x)
 
-        # (batch_size, seq_lenth, vocab_size)
         logits = self.lm_head(self.norm(x))
         if return_hidden_states:
             return logits, hidden_states
@@ -367,8 +316,3 @@ if __name__ == "__main__":
     print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(total_params)
-    #566_632_448
-
-#    input_ids = torch.randint(0, config["vocab_size"], (2, 10))
-#    logits = model(input_ids)
-#    print(logits.shape)

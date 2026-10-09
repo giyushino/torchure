@@ -1,6 +1,5 @@
 """
-learning rate scheduler
-functions are not typed, maybe we should change
+learning rate schedulers
 https://docs.pytorch.org/docs/2.12/generated/torch.optim.lr_scheduler.LambdaLR.html
 """
 import math
@@ -21,15 +20,14 @@ class WarmupStableDecaySchedulder(LRScheduler):
         decay_phase_start = self.total_steps * (1 - self.decay_ratio)
 
         warmup_steps = max(1, round(self.total_steps * self.warmup_ratio))
-        # strict <: with the +1 numerator, step W-1 already hits scale 1.0;
-        # letting step == W in here would overshoot to (W+1)/W
+        # strict <: step W-1 already reaches scale 1.0
         if step < warmup_steps:
             scale = (step + 1) / warmup_steps
 
         elif step >= decay_phase_start:
             num_decay_steps = self.decay_ratio * self.total_steps
             scale = 1 - ((step - decay_phase_start) / num_decay_steps)
-            scale = max(0, scale) # clamp to 0
+            scale = max(0, scale)
 
         else:
             scale = 1.0
@@ -37,7 +35,6 @@ class WarmupStableDecaySchedulder(LRScheduler):
         return [base_lr * scale for base_lr in self.base_lrs] 
 
 
-# we'll just have warmup regardless
 class CosineAnnealingScheduler(LRScheduler):
     def __init__(self, optimizer, total_steps, warmup_ratio, min_lr_ratio, last_epoch=-1):
         self.total_steps = total_steps
