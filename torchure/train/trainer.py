@@ -61,6 +61,8 @@ class Trainer:
         self.config = load_json(train_config_path)
         self.rank = rank
         self.world_size = world_size
+        self.seed = self.config.get("seed", 67)
+        torch.manual_seed(self.seed)
         # benchmark mode (train.py --steps): fixed-step tps run, no checkpoints or wandb
         self.benchmark = benchmark
         self.device = torch.device(f"cuda:{local_rank}")
