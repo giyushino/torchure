@@ -8,7 +8,7 @@ import torch
 
 from torch.optim.lr_scheduler import LRScheduler
 
-class WarmupStableDecaySchedulder(LRScheduler):
+class WarmupStableDecayScheduler(LRScheduler):
     def __init__(self, optimizer, total_steps, warmup_ratio, decay_ratio, last_epoch=-1):
         self.total_steps = total_steps
         self.warmup_ratio = warmup_ratio
@@ -51,6 +51,7 @@ class CosineAnnealingScheduler(LRScheduler):
         
         else:
             progress = (step - warmup_steps) / max(1, self.total_steps - warmup_steps)
+            progress = min(1.0, progress)
             scale = self.min_lr_ratio + 0.5 * (1 - self.min_lr_ratio) * (1 + math.cos(math.pi * progress))
 
         return [base_lr * scale for base_lr in self.base_lrs]

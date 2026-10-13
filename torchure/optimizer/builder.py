@@ -6,7 +6,7 @@ only to >=2D params; biases and norm weights are exempt.
 import torch.nn as nn
 import torch.optim as optim
 
-from torchure.optimizer.scheduler import WarmupStableDecaySchedulder, CosineAnnealingScheduler
+from torchure.optimizer.scheduler import WarmupStableDecayScheduler, CosineAnnealingScheduler
 
 
 OPTIMIZER_REGISTRY = {
@@ -15,7 +15,7 @@ OPTIMIZER_REGISTRY = {
 }
 
 SCHEDULER_REGISTRY = {
-    "wsd": WarmupStableDecaySchedulder,
+    "wsd": WarmupStableDecayScheduler,
     "cosine": CosineAnnealingScheduler
 }
 
@@ -37,11 +37,7 @@ def build_optimizer(model: nn.Module, optim_name: str, optim_config: dict) -> op
 
 def build_scheduler(optimizer: optim.Optimizer, scheduler_config: dict) -> optim.lr_scheduler.LRScheduler:
     scheduler_cfg = dict(scheduler_config)
-    schedulder_type = scheduler_cfg["type"]
-    if schedulder_type == "cosine":
-        raise NotImplementedError("cosine scheduler is a stub (get_lr returns 0); use wsd")
-
-    scheduler_cfg.pop("type")
+    scheduler_type = scheduler_cfg.pop("type")
     scheduler_cfg["optimizer"] = optimizer
-    return SCHEDULER_REGISTRY[schedulder_type](**scheduler_cfg)
+    return SCHEDULER_REGISTRY[scheduler_type](**scheduler_cfg)
 

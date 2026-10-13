@@ -25,7 +25,7 @@ import torch.nn as nn
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from torchure.checkpoint.checkpointer import Checkpointer
-from torchure.optimizer.scheduler import WarmupStableDecaySchedulder
+from torchure.optimizer.scheduler import WarmupStableDecayScheduler
 
 
 def build_model(seed: int) -> nn.Module:
@@ -36,7 +36,7 @@ def build_model(seed: int) -> nn.Module:
 def build_state(seed: int):
     model = build_model(seed)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    scheduler = WarmupStableDecaySchedulder(
+    scheduler = WarmupStableDecayScheduler(
         optimizer, total_steps=100, warmup_ratio=0.1, decay_ratio=0.1
     )
     loader = StatefulDataLoader(list(range(64)), batch_size=4, num_workers=0)
