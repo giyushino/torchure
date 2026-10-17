@@ -121,15 +121,8 @@ from torchure.core.collective import MeshLike
 
 @dataclass
 class MixedPrecisionPolicy:
-    """
-    dtype of each leg of the step. `fp32()` is what the cpu parity tests run.
-    """
-
-    # dtype params are gathered and computed in
     param_dtype: torch.dtype = torch.bfloat16
-    # dtype the reduce-scatter (and hsdp all-reduce) runs in
     reduce_dtype: torch.dtype = torch.bfloat16
-    # dtype of the sharded master params and of the `.grad` the optimizer reads
     master_dtype: torch.dtype = torch.float32
 
     @staticmethod
@@ -243,6 +236,7 @@ class FSDPUnit:
         - `p.data = ...` keeps the tie for free (one object, two attributes).
           rebinding `module._parameters[name]` would silently break it.
         """
+        
         raise NotImplementedError
 
     def _alloc_buffers(self) -> None:
@@ -429,21 +423,47 @@ class FSDP:
 
     def _build_units(self, model: nn.Module) -> list[FSDPUnit]:
         """
-        units[0] = root: every param NOT under model.blocks (token_emb,
-        lm_head via the tie, norm), reshard_after_forward=False. then one unit
-        per model.blocks entry.
-
-        - assert `model.blocks` exists. it's the contract, don't walk the tree.
-        - assert `model.lm_head.weight is model.token_emb.weight`.
-        - dedup by id, not by name. named_parameters() already dedups, so
-          collect block params first, then root = everything left over.
-        - assert the union == set(model.parameters()) and nothing is claimed
-          twice. a param in no unit gets no sync and drifts between ranks.
         """
-        assert model.blocks, "blocks must already be constructed"
-        assert model.lm_head.weight is model.token_emb.weight, \
-        "lm_head weight must be the same as token_emb weight"
-        return
+        assert model.blocks and len(model.blocks) > 0, "blocks must already be constructed"
+
+        seen: dict[int, str] = {}
+        block_params: list[list[tuple[str, nn.Parameter]]] = []
+
+        for i, block in enumerate(model.blocks):
+            name = f"blocks.{i}"
+            params = []
+
+            for fqn, param in block.named_parameters(prefix=name):
+                assert id(param) not in seen, (
+                    f"{fqn} already claimed by {seen[id(param)]}; a param in two "
+                    "units is gathered and reduce-scattered twice"
+                )
+                seen[id(param)] = name
+                params.append((fqn, param))
+
+            block_params.append(params)
+
+        root_params = []
+        for fqn, param in model.named_parameters():
+            if id(param) not in seen:
+                seen[id(param)] = "root"
+                root_params.append((fqn, param))
+
+        missing = {id(p) for p in model.parameters()} - set(seen)
+        assert not missing, (
+            f"{len(missing)} param in no unit, require sync"
+        )
+
+        def make(name, params, reshard_after_forward=True):
+            return FSDPUnit(
+                name, params, self.mesh, self.shard_dim, self.replicate_dim,
+                self.policy, reshard_after_forward=reshard_after_forward,
+            )
+
+        units = [make("root", root_params, reshard_after_forward=False)]
+        units += [make(f"blocks.{i}", p) for i, p in enumerate(block_params)]
+        return units
+
 
     def _register_hooks(self, model: nn.Module) -> None:
         """
