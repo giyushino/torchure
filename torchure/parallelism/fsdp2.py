@@ -236,8 +236,35 @@ class FSDPUnit:
         - `p.data = ...` keeps the tie for free (one object, two attributes).
           rebinding `module._parameters[name]` would silently break it.
         """
-        
-        raise NotImplementedError
+        offset = 0
+        device = params[0][1].device
+
+        for fqn, param in params:
+            assert param.shape[0] % self.shard_size == 0, \
+            f"{fqn}: dim 0 ({param.shape[0]}) not divisible by shard size {self.shard_size}"
+
+            shard_shape = torch.Size((param.shape[0] // self.shard_size, *param.shape[1:]))
+            numel = shard_shape.numel()
+            
+            self.params.append(_ParamInfo(
+                param=param, fqn=fqn, full_shape=param.shape,
+                shard_shape=shard_shape, offset=offset, numel=numel,
+            ))
+            offset += numel
+
+        self.shard_numel = offset
+
+        self.shard_flat = torch.empty(self.shard_numel, dtype=self.policy.master_dtype, device=device)
+        pos = self.mesh.coordinate(self.shard_dim)
+
+        for param_info in self.params:
+            rows = param_info.shard_shape[0]
+            chunk = param_info.param.detach()[pos * rows: (pos + 1) * rows]
+            view = self.shard_flat[param_info.offset : param_info.offset + param_info.numel].view(param_info.shard_shape)
+            view.copy_(chunk)
+            param_info.shard_view = view
+            param_info.param.data = view
+            
 
     def _alloc_buffers(self) -> None:
         """
