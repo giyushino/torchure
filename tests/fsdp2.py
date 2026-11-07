@@ -1,73 +1,42 @@
 """
-tests for torchure/parallelism/fsdp2.py.
+parity + invariant tests for torchure/parallelism/fsdp2.py.
 
 run (gloo/cpu, no gpus needed):
     uv run tests/fsdp2.py --world-size 4
+    uv run tests/fsdp2.py --world-size 4 --backend nccl   (on a 4-gpu box)
 
-same discipline as tests/data_parallel.py: mp.spawn, gloo, a tiny REAL qwen3
-rather than an mlp (the tied embedding and the rmsnorm/rope structure are what
-break), a deterministic batch every rank recomputes locally so no gathers are
-needed for the comparison, and a TESTS list swept over parameters.
+the model is a tiny real Qwen3, not an mlp: the tied embedding (one storage,
+two modules, and the weight consumed by the objective AFTER forward returns)
+and the rmsnorm structure are exactly what an fsdp implementation breaks on.
 
-everything here runs under MixedPrecisionPolicy.fp32() -- gloo's bf16 support
-is patchy, and a parity test that has to loosen its tolerance to accommodate
-the comm dtype isn't testing what it claims to. the bf16 comm path is a gpu
-concern, measured in CHANGES.md rather than asserted here.
+two families of test here, and the second matters more:
 
-===========================================================================
-this file is written milestone by milestone
-===========================================================================
-
-ACTIVE: shard construction. no forward, no hooks, no autograd -- just "the
-model is sharded and nothing was lost". these fail until FSDPUnit._build_shards
-exists, which is the point.
-
-STILL OWED (see notes/FSDP2_SCOPE.md for the full list):
-  - forward parity + storage-actually-freed between units
-  - grad parity vs single process, and the ddp cross-check (same model, same
-    batch, ddp and fsdp grads must agree -- the test that catches
-    reduce-scatter scaling and ordering mistakes)
-  - multi-step loss curve vs single process (optimizer-state sharding bugs are
-    invisible to a single backward)
-  - grad accumulation, with the collective count asserted
-  - clip_grad_norm with shard_dims=("dp_shard",) vs the single-process norm
-  - hsdp: dp_replicate=2 x dp_shard=2 grads == dp=4 ddp grads
-  - prefetch order: recorded order == module execution order, exactly reversed
-    in backward
-
-===========================================================================
-the private surface these tests reach into
-===========================================================================
-
-deliberate, and documented here so a design change has one place to look:
-
-    fsdp.units          list[FSDPUnit], in construction order
-    unit.params         the unit's _ParamInfo entries (.param is the tensor)
-
-reaching in is the whole point for the invariants that are invisible from the
-outside -- an fsdp that gathers twice, or never frees, still trains perfectly
-and just doesn't do its job. tests/data_parallel.py reaches into ddp._works for
-the same reason.
+- **parity** -- N ranks under fsdp must produce the single-process grads, and
+  the same grads ddp produces. same invariant as tests/data_parallel.py.
+- **invariants invisible from the outside** -- an fsdp that never frees its
+  gathered buffers, or gathers a unit twice, still trains perfectly and simply
+  does not do its job. those are asserted directly: storage sizes mid-forward,
+  collective counts, and adam state numel.
 """
 
 import argparse
 import os
 from datetime import timedelta
+from functools import partial
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from torchure.core.collective import all_gather
+from torchure.core import collective as C
+from torchure.core.grad_helper import clip_grad_norm
 from torchure.core.mesh import Mesh
+from torchure.core.placement import Replicate, Shard
 from torchure.models.qwen3.qwen3 import Qwen3
-from torchure.parallelism.fsdp2 import FSDP, MixedPrecisionPolicy
+from torchure.parallelism.data_parallel import DDP
+from torchure.parallelism.fsdp2 import FSDP
 
-# head_dim 16 is the tightest dim-0 in the model (q_norm/k_norm are 16 wide),
-# so it's what bounds the world size this suite can run at: at --world-size 8
-# each rank owns 2 elements of them, at 16 the divisibility assert fires. that
-# is the intended behaviour, not a test bug -- v0 asserts rather than pads.
 CFG = {
     "num_layers": 2,
     "num_heads": 2,
@@ -79,202 +48,607 @@ CFG = {
 SEQ = 16
 
 
-def build_model(seed: int = 0) -> Qwen3:
+class Skip(Exception):
+    pass
+
+
+def build_model(seed: int, device) -> Qwen3:
     torch.manual_seed(seed)
     model = Qwen3(**CFG)
     model.init_weights()
-    return model
+    return model.to(device)
 
 
-def global_batch(n_seqs: int) -> torch.Tensor:
+def global_batch(n_seqs: int, device) -> torch.Tensor:
     g = torch.Generator().manual_seed(1234)
-    return torch.randint(0, CFG["vocab_size"], (n_seqs, SEQ), generator=g)
+    return torch.randint(0, CFG["vocab_size"], (n_seqs, SEQ), generator=g).to(device)
 
 
 def loss_fn(model: Qwen3, ids: torch.Tensor) -> torch.Tensor:
-    # plain logits + CE (next-token shift). the fused-CE path consumes
-    # lm_head.weight AFTER the model's forward returns, which is the root
-    # unit's whole reason for existing -- it gets its own test once the
-    # forward path lands, not this one.
     logits = model(ids)
     return F.cross_entropy(
         logits[:, :-1].reshape(-1, CFG["vocab_size"]), ids[:, 1:].reshape(-1)
     )
 
 
-def unit_params(unit) -> list[torch.nn.Parameter]:
-    """the tensors a unit owns. one place to fix if _ParamInfo changes shape."""
-    return [info.param for info in unit.params]
-
-
-def fsdp_fp32(model, mesh, **kwargs) -> FSDP:
-    return FSDP(model, mesh, shard_dim="dp_shard", policy=MixedPrecisionPolicy.fp32(), **kwargs)
-
-
-# --------------------------------------------------------------------------
-# milestone 1: shard construction
-# --------------------------------------------------------------------------
-
-
-def test_unit_partition(mesh):
+def fused_loss_fn(model: Qwen3, ids: torch.Tensor) -> torch.Tensor:
     """
-    every param lands in exactly one unit, and the tie survives sharding.
-
-    the tie assert is the load-bearing one. `lm_head.weight is
-    token_emb.weight` is ONE Parameter object under two attributes, so
-    `p.data = shard` propagates to both for free -- but rebinding
-    `module._parameters[name]` instead silently breaks the tie, and you get two
-    independently gathered copies of the largest weight in the model with grads
-    flowing to only one. that failure trains fine and quietly diverges.
-
-    note `named_parameters()` dedups by default (lm_head.weight never appears
-    in it), so the count comparison below would pass even with the tie broken.
-    the `is` check is what actually catches it.
+    the path the trainer actually runs: the objective pulls
+    model.lm_head.weight AFTER model.forward has returned. any design that
+    reshards unit 0 on a forward-post hook hands this a freed weight.
     """
-    model = build_model()
-    expected = {id(p) for p in model.parameters()}
+    from torchure.objectives.autoregressive import ARObjective
 
-    fsdp = fsdp_fp32(model, mesh)
-
-    seen: dict[int, str] = {}
-    for unit in fsdp.units:
-        for p in unit_params(unit):
-            assert id(p) not in seen, (
-                f"param claimed by both {seen[id(p)]} and {unit.name} -- a "
-                "double-claimed param is gathered twice and its grad "
-                "reduce-scattered twice"
-            )
-            seen[id(p)] = unit.name
-
-    missing = expected - set(seen)
-    assert not missing, (
-        f"{len(missing)} param(s) in no unit at all -- they get no gather and "
-        "no reduce-scatter, so they drift between ranks silently"
-    )
-    assert not (set(seen) - expected), "unit claims a param the model doesn't have"
-
-    assert model.lm_head.weight is model.token_emb.weight, (
-        "the embedding tie was broken by sharding: lm_head.weight and "
-        "token_emb.weight are no longer the same object"
-    )
-    # and both must be in the SAME unit -- separate units double-gather one
-    # storage even when the objects are still identical
-    emb_units = {u.name for u in fsdp.units if any(
-        p is model.token_emb.weight for p in unit_params(u)
-    )}
-    assert len(emb_units) == 1, f"tied embedding appears in units {emb_units}"
+    obj = ARObjective(ignore_index=-100, fused_linear_ce=True, ce_chunk_size=8)
+    return obj.compute_loss(model, {"input_ids": ids, "labels": ids})
 
 
-def test_shard_roundtrip(mesh):
+def sharded_ref_grad(ref_param: torch.Tensor, mesh, dim) -> torch.Tensor:
+    """the slice of a single-process grad this rank is responsible for."""
+    return Shard(0).local_slice(ref_param, mesh.size(dim), mesh.coordinate(dim))
+
+
+def collect(errors: list, label: str, got, expected, rtol=1e-4, atol=1e-6) -> None:
     """
-    all_gather of every rank's shard reconstructs the original weights.
+    record a mismatch instead of raising.
 
-    bit-exact (`rtol=0, atol=0`): sharding is a copy, there is no arithmetic
-    here to be tolerant of. a tolerance would hide an off-by-one in the offset
-    math, which is exactly the bug this is for.
-
-    gathers `p.data` rather than reaching into shard_flat, so it holds whether
-    or not the shards are backed by one flat buffer per unit.
+    raising from inside a loop that still has collectives left is a DEADLOCK,
+    not a failure: the rank that raises stops participating while every other
+    rank blocks in the next all_gather until the process-group timeout. so
+    every comparison inside a multi-cycle test collects here and the test
+    raises once, after the last collective has run on every rank.
     """
-    reference = build_model()
-    full = {name: p.detach().clone() for name, p in reference.named_parameters()}
-
-    model = build_model()
-    fsdp_fp32(model, mesh)
-
-    for name, p in model.named_parameters():
-        ref = full[name]
-        assert p.shape[0] * mesh.size("dp_shard") == ref.shape[0], (
-            f"param {name}: local shard dim-0 {p.shape[0]} x {mesh.size('dp_shard')} "
-            f"!= full {ref.shape[0]}"
+    if got is None:
+        errors.append(f"{label}: no grad")
+        return
+    if tuple(got.shape) != tuple(expected.shape):
+        errors.append(
+            f"{label}: shape {tuple(got.shape)} != sharded {tuple(expected.shape)} "
+            "-- the reduce_scatter didn't land"
         )
-        gathered = all_gather(p.detach().contiguous(), mesh, "dp_shard", gather_dim=0)
-        try:
-            torch.testing.assert_close(gathered, ref, rtol=0, atol=0)
-        except AssertionError as e:
-            raise AssertionError(f"param {name} did not round-trip: {e}") from None
+        return
+    try:
+        torch.testing.assert_close(got, expected, rtol=rtol, atol=atol)
+    except AssertionError as e:
+        # keep the "Mismatched elements" and "Greatest absolute difference"
+        # lines: the count vs the magnitude is what distinguishes a real bug
+        # (systematic, large) from fp associativity (one element, tiny)
+        lines = [ln.strip() for ln in str(e).splitlines() if ln.strip()]
+        detail = " ".join(ln for ln in lines if ln.startswith(("Mismatched", "Greatest")))
+        errors.append(f"{label}: {detail or lines[0]}")
 
 
-def test_shard_memory(mesh):
+def finish(errors: list) -> None:
+    if errors:
+        raise AssertionError(f"{len(errors)} mismatch(es): " + " | ".join(errors[:4]))
+
+
+def check_grads(errors, model, reference, mesh, dim, tag="", rtol=1e-4, atol=1e-6):
+    for (name, p), (_, p_ref) in zip(
+        model.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        collect(
+            errors,
+            f"{tag}{name}",
+            p.grad,
+            sharded_ref_grad(p_ref.grad, mesh, dim),
+            rtol=rtol,
+            atol=atol,
+        )
+
+
+# --------------------------------------------------------------------------
+# parity
+# --------------------------------------------------------------------------
+
+
+def test_shard_and_replicate(mesh, dim, device):
     """
-    per-rank param numel is total/dp_shard. this is the reason the phase
-    exists, it's free to check on cpu, and it catches a param that quietly
-    never got sharded -- which every correctness test above would still pass.
+    ctor must (a) make every rank agree on the full weights before slicing --
+    nothing in this repo seeds torch, so ranks init DIFFERENT models -- and
+    (b) leave params pointing at their shard, which is what makes the
+    optimizer allocate sharded state.
     """
-    shard_size = mesh.size("dp_shard")
-    before = sum(p.numel() for p in build_model().parameters())
+    model = build_model(seed=dist.get_rank(), device=device)
+    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    reference = build_model(seed=0, device=device)
+    g = mesh.size(dim)
 
-    model = build_model()
-    fsdp_fp32(model, mesh)
-    after = sum(p.numel() for p in model.parameters())
+    for (name, p), (_, p_ref) in zip(
+        model.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        expected = Shard(0).local_slice(p_ref.data, g, mesh.coordinate(dim))
+        assert p.shape == expected.shape, (
+            f"param {name}: {tuple(p.shape)} is not the sharded {tuple(expected.shape)}"
+        )
+        torch.testing.assert_close(
+            p.data, expected, rtol=0, atol=0,
+            msg=f"param {name} is not rank 0's weights (broadcast missing?)",
+        )
 
-    assert after == before // shard_size, (
-        f"per-rank params {after} != {before}/{shard_size} = {before // shard_size} "
-        f"({before - after * shard_size} elements unsharded)"
+    total = sum(p.numel() for p in reference.parameters())
+    assert fsdp.sharded_numel() == total // g, (
+        f"this rank owns {fsdp.sharded_numel()} of {total} params, expected "
+        f"{total // g} -- the memory win is exactly this number"
+    )
+    assert fsdp.unsharded_bytes_live() == 0, (
+        "gathered buffers hold memory before any forward has run"
+    )
+    assert fsdp.placements_of("norm.weight") == (Shard(0),)
+
+
+def test_grad_parity(mesh, dim, device, loss=loss_fn):
+    """N ranks x bs=1 under fsdp == 1 process x bs=N, sharded."""
+    model = build_model(seed=dist.get_rank(), device=device)
+    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+
+    reference = build_model(seed=0, device=device)
+    batch = global_batch(mesh.size(dim), device)
+    loss(reference, batch).backward()
+
+    local = batch[mesh.coordinate(dim)].unsqueeze(0)
+    errors = []
+    for cycle in range(2):  # two cycles: catches re-arm / buffer-reuse bugs
+        loss(model, local).backward()
+        fsdp.sync()
+        check_grads(errors, model, reference, mesh, dim, tag=f"cycle{cycle} ")
+        for p in model.parameters():
+            p.grad = None
+    finish(errors)
+
+
+def test_grad_parity_fused_ce(mesh, dim, device):
+    """
+    the same parity, through ARObjective's fused linear+CE -- which reads
+    model.lm_head.weight after forward returns. this is the single most
+    likely thing to break, so it gets its own case.
+    """
+    if device.type != "cuda":
+        # fused_linear_ce's addmm(out_dtype=) only has a cuda kernel
+        raise Skip("fused linear ce needs cuda; run with --backend nccl")
+    model = build_model(seed=dist.get_rank(), device=device)
+    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    reference = build_model(seed=0, device=device)
+    batch = global_batch(mesh.size(dim), device)
+    fused_loss_fn(reference, batch).backward()
+
+    local = batch[mesh.coordinate(dim)].unsqueeze(0)
+    fused_loss_fn(model, local).backward()
+    fsdp.sync()
+    errors = []
+    check_grads(errors, model, reference, mesh, dim, rtol=1e-3, atol=1e-5)
+    finish(errors)
+
+
+def test_matches_ddp(mesh, dim, device):
+    """
+    ddp and fsdp are supposed to compute the identical thing. this is the
+    test that catches reduce-scatter ordering and scaling mistakes, because
+    both paths have to agree with each other and neither is the reference.
+    """
+    fsdp_model = build_model(seed=dist.get_rank(), device=device)
+    fsdp = FSDP(fsdp_model, mesh, shard_dim=dim, replicate_dim=None)
+
+    ddp_model = build_model(seed=dist.get_rank(), device=device)
+    ddp = DDP(ddp_model, mesh, dim)
+
+    batch = global_batch(mesh.size(dim), device)
+    local = batch[mesh.coordinate(dim)].unsqueeze(0)
+
+    loss_fn(fsdp_model, local).backward()
+    fsdp.sync()
+    loss_fn(ddp_model, local).backward()
+    ddp.sync()
+
+    errors = []
+    for (name, p), (_, p_ddp) in zip(
+        fsdp_model.named_parameters(), ddp_model.named_parameters(), strict=True
+    ):
+        collect(errors, f"fsdp!=ddp {name}", p.grad,
+                sharded_ref_grad(p_ddp.grad, mesh, dim), rtol=1e-5, atol=1e-7)
+    finish(errors)
+
+
+def test_grad_accumulation(mesh, dim, device, microbatches: int):
+    """K microbatches x N ranks == 1 process x bs=(N*K), still sharded."""
+    world = mesh.size(dim)
+    model = build_model(seed=dist.get_rank(), device=device)
+    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+
+    reference = build_model(seed=0, device=device)
+    batch = global_batch(world * microbatches, device)
+    loss_fn(reference, batch).backward()
+
+    base = mesh.coordinate(dim) * microbatches
+    errors = []
+    for cycle in range(2):
+        fsdp.requires_sync = False
+        for i in range(microbatches - 1):
+            (loss_fn(model, batch[base + i].unsqueeze(0)) / microbatches).backward()
+        fsdp.requires_sync = True
+        (loss_fn(model, batch[base + microbatches - 1].unsqueeze(0)) / microbatches).backward()
+        fsdp.sync()
+        check_grads(errors, model, reference, mesh, dim, tag=f"cycle{cycle} ")
+        for p in model.parameters():
+            p.grad = None
+    finish(errors)
+
+
+def test_multi_step(mesh, dim, device):
+    """
+    5 optimizer steps against a single-process reference. catches
+    optimizer-state sharding bugs a single-backward test can't see: adam's
+    moments are per-shard, and if the update is right the sharded weights must
+    stay equal to the reference's slice step after step.
+    """
+    model = build_model(seed=dist.get_rank(), device=device)
+    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+
+    reference = build_model(seed=0, device=device)
+    ref_opt = torch.optim.AdamW(reference.parameters(), lr=1e-2)
+
+    g = mesh.size(dim)
+    errors = []
+    for step in range(5):
+        batch = global_batch(g, device) + step  # a different batch each step
+        batch = batch % CFG["vocab_size"]
+
+        ref_loss = loss_fn(reference, batch)
+        ref_loss.backward()
+
+        loss = loss_fn(model, batch[mesh.coordinate(dim)].unsqueeze(0))
+        loss.backward()
+        fsdp.sync()
+
+        # 1. grads, TIGHT, and BEFORE either optimizer steps -- this is the
+        #    part a sharding bug breaks, and checking it here means the
+        #    optimizer never gets a chance to launder the error into something
+        #    that looks like rounding.
+        # step 0 ONLY. at step 0 both models hold identical weights, so the
+        # grads are comparable at test_grad_parity's tolerance. from step 1 the
+        # two weight sets have legitimately drifted apart (see the weight check
+        # below), so the grads are evaluated at different points and demanding
+        # 1e-6 of them is demanding zero drift -- which is not what this test
+        # is for. on nccl that shows up immediately: bs=4 and bs=1 backwards
+        # pick different cuBLAS reduction orders, and by step 3 the grad gap is
+        # ~2e-6 while the weights and the loss curve still track fine.
+        if step == 0:
+            check_grads(errors, model, reference, mesh, dim, tag=f"step{step} ",
+                        rtol=1e-4, atol=1e-6)
+
+        ref_opt.step()
+        ref_opt.zero_grad()
+        opt.step()
+        opt.zero_grad()
+
+        # 2. weights, at a tolerance adam's update actually permits. the
+        #    update is lr * m/(sqrt(v)+eps) -- a NORMALIZED quantity, so for an
+        #    element whose grad is near zero the ratio is ill-conditioned and a
+        #    1e-9 grad difference (pure fp32 associativity: the reduce_scatter
+        #    sums this rank's shard in a different order than the single-process
+        #    reduction) can move the weight by a good fraction of lr. observed:
+        #    exactly 1 element in 2048 drifting ~1.4e-5 with lr=1e-2, while the
+        #    grads above stay equal to 1e-7. atol=1e-4 is still 100x tighter
+        #    than any real sharding bug, which misplaces a whole shard and shows
+        #    up at the O(1e-2) scale of the weights themselves.
+        for (name, p), (_, p_ref) in zip(
+            model.named_parameters(), reference.named_parameters(), strict=True
+        ):
+            collect(errors, f"step{step} weight {name}", p.data,
+                    Shard(0).local_slice(p_ref.data, g, mesh.coordinate(dim)),
+                    rtol=1e-4, atol=1e-4)
+
+        # 3. the loss curve, which is the roadmap's actual stated criterion.
+        #    `loss` is THIS rank's bs=1 loss, not the global one -- the mean
+        #    across dp is what equals the single-process bs=N loss, which is
+        #    why the trainer all-reduces it before logging. comparing the local
+        #    loss directly would "fail" on a completely correct run.
+        mean_loss = C.all_reduce(loss.detach().clone(), mesh, dim, "avg")
+        if abs(mean_loss.item() - ref_loss.item()) > 1e-4:
+            errors.append(
+                f"step{step} mean loss {mean_loss.item():.6f} != reference "
+                f"{ref_loss.item():.6f}"
+            )
+    finish(errors)
+
+    # the memory win, stated as a number: adam keeps two moments per SHARDED
+    # element, so state numel must be 2x the sharded param count, not 2x total
+    state_numel = sum(
+        v.numel()
+        for s in opt.state.values()
+        for v in s.values()
+        if torch.is_tensor(v) and v.dim() > 0
+    )
+    total = sum(p.numel() for p in reference.parameters())
+    assert state_numel == 2 * (total // g), (
+        f"adam state is {state_numel} elements; expected {2 * (total // g)} "
+        f"(2 moments x {total}/{g}). optimizer state did not shard"
     )
 
 
-def test_noop_at_size_one(mesh_replicate_only):
-    """
-    dp_shard=1 must be a TOTAL no-op, the way DDP is at dp=1: no units, no
-    buffers, no collectives, and shard_dims=() so the trainer's checkpoint
-    guard lets the run through (at size 1 rank 0's tensors really are the
-    model).
-    """
-    model = build_model()
-    before = [p.detach().clone() for p in model.parameters()]
+def test_clip_grad_norm(mesh, dim, device):
+    """the sharded norm must equal the single-process norm."""
+    model = build_model(seed=dist.get_rank(), device=device)
+    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    reference = build_model(seed=0, device=device)
 
-    fsdp = fsdp_fp32(model, mesh_replicate_only)
+    batch = global_batch(mesh.size(dim), device)
+    loss_fn(reference, batch).backward()
+    loss_fn(model, batch[mesh.coordinate(dim)].unsqueeze(0)).backward()
+    fsdp.sync()
 
-    assert fsdp.shard_dims == (), f"shard_dims {fsdp.shard_dims} != () at dp_shard=1"
-    assert not fsdp.units, f"{len(fsdp.units)} unit(s) built at dp_shard=1"
-    for p, ref in zip(model.parameters(), before, strict=True):
-        torch.testing.assert_close(p, ref, rtol=0, atol=0, msg="params touched at dp_shard=1")
-    fsdp.sync()  # must not hang or raise
+    ref_norm = clip_grad_norm(reference.parameters(), mesh, max_norm=None, shard_dims=())
+    got = clip_grad_norm(model.parameters(), mesh, max_norm=None, shard_dims=(dim,))
+    torch.testing.assert_close(
+        got, ref_norm, rtol=1e-4, atol=1e-6,
+        msg="sharded grad norm != single-process norm; shard_dims wrong?",
+    )
+
+    # and clipping writes through: post-clip grads must still match
+    clip_grad_norm(reference.parameters(), mesh, max_norm=0.1, shard_dims=())
+    clip_grad_norm(model.parameters(), mesh, max_norm=0.1, shard_dims=(dim,))
+    errors = []
+    check_grads(errors, model, reference, mesh, dim, tag="post-clip ")
+    finish(errors)
+
+
+def test_hsdp(mesh, dim, device):
+    """dp_replicate=2 x dp_shard=2 grads == dp=4 ddp grads."""
+    if dist.get_world_size() != 4:
+        raise Skip("needs exactly 4 ranks (2x2 mesh)")
+    m = Mesh({"dp_replicate": 2, "dp_shard": 2})
+
+    model = build_model(seed=dist.get_rank(), device=device)
+    fsdp = FSDP(model, m, shard_dim="dp_shard", replicate_dim="dp_replicate")
+
+    reference = build_model(seed=0, device=device)
+    batch = global_batch(4, device)
+    loss_fn(reference, batch).backward()
+
+    # under hsdp each rank still owns one sequence of the global batch
+    local = batch[dist.get_rank()].unsqueeze(0)
+    loss_fn(model, local).backward()
+    fsdp.sync()
+
+    errors = []
+    for (name, p), (_, p_ref) in zip(
+        model.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        collect(errors, f"hsdp {name}", p.grad,
+                Shard(0).local_slice(p_ref.grad, 2, m.coordinate("dp_shard")))
+    finish(errors)
+
+    assert fsdp.placements_of("norm.weight") == (Replicate(), Shard(0))
+
+
+# --------------------------------------------------------------------------
+# the invariants that are invisible from the outside
+# --------------------------------------------------------------------------
+
+
+def test_storage_actually_freed(mesh, dim, device):
+    """
+    an fsdp that gathers correctly and never frees still trains perfectly and
+    saves nothing. assert the storage size DURING a forward, between units --
+    after the whole step everything is free either way.
+    """
+    model = build_model(seed=0, device=device)
+    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+
+    seen = []
+
+    def probe(module, args):
+        # fires at each block's forward-pre, before that block is gathered
+        seen.append(fsdp.unsharded_bytes_live())
+
+    handles = [b.register_forward_pre_hook(probe) for b in model.blocks]
+    loss_fn(model, global_batch(1, device)).backward()
+    fsdp.sync()
+    for h in handles:
+        h.remove()
+
+    root_bytes = sum(
+        st.unsharded.numel() * st.unsharded.element_size()
+        for st in fsdp._units[0].params
+    )
+    block_bytes = sum(
+        st.unsharded.numel() * st.unsharded.element_size()
+        for st in fsdp._units[1].params
+    )
+    # at block i's forward-pre: unit 0 is still live (it must be -- lm_head is
+    # consumed after forward returns), block i is being gathered by the
+    # prefetch, and every EARLIER block has been freed. so the live total must
+    # never grow with depth.
+    assert seen[0] <= root_bytes + 2 * block_bytes, (
+        f"{seen[0]} bytes live at the first block; expected at most unit 0 plus "
+        "the prefetch window"
+    )
+    assert seen == sorted(seen, reverse=True) or len(set(seen)) == 1, (
+        f"live gathered bytes grow with depth ({seen}) -- blocks are not being "
+        "freed after their forward"
+    )
+    assert fsdp.unsharded_bytes_live() == 0, (
+        f"{fsdp.unsharded_bytes_live()} bytes still held after backward; every "
+        "unit must be resharded once its grads are reduced"
+    )
+
+
+def test_collective_counts(mesh, dim, device):
+    """
+    exactly one all_gather per param per forward, one per param per backward
+    for blocks (unit 0 is kept unsharded so it is NOT re-gathered), and one
+    reduce_scatter per param per step. gathering twice, or not prefetching at
+    all, is otherwise invisible.
+    """
+    model = build_model(seed=0, device=device)
+    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+
+    counts = {"all_gather": 0, "reduce_scatter": 0}
+    real_ag, real_rs = C.all_gather, C.reduce_scatter
+
+    import torchure.parallelism.fsdp2 as fsdp_mod
+
+    def counting_ag(*a, **kw):
+        counts["all_gather"] += 1
+        return real_ag(*a, **kw)
+
+    def counting_rs(*a, **kw):
+        counts["reduce_scatter"] += 1
+        return real_rs(*a, **kw)
+
+    fsdp_mod.all_gather, fsdp_mod.reduce_scatter = counting_ag, counting_rs
+    try:
+        loss_fn(model, global_batch(1, device)).backward()
+        fsdp.sync()
+    finally:
+        fsdp_mod.all_gather, fsdp_mod.reduce_scatter = real_ag, real_rs
+
+    n_params = len(fsdp._states)
+    n_block_params = sum(len(u.params) for u in fsdp._units[1:])
+    expected_ag = n_params + n_block_params  # forward all, backward blocks only
+    assert counts["all_gather"] == expected_ag, (
+        f"{counts['all_gather']} all_gathers, expected {expected_ag} "
+        f"({n_params} in forward + {n_block_params} re-gathered in backward)"
+    )
+    assert counts["reduce_scatter"] == n_params, (
+        f"{counts['reduce_scatter']} reduce_scatters, expected {n_params} (one "
+        "per param per step)"
+    )
+
+
+def test_prefetch_order(mesh, dim, device):
+    """recorded unit order must be module execution order, once."""
+    model = build_model(seed=0, device=device)
+    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    loss_fn(model, global_batch(1, device)).backward()
+    fsdp.sync()
+    assert fsdp._order_checked, "execution order was never pinned"
+    assert fsdp._exec_order == list(range(len(fsdp._units))), (
+        f"forward order {fsdp._exec_order} != static order; prefetch would "
+        "silently degrade to none"
+    )
+
+
+def test_noop_at_size_one(mesh, dim, device):
+    """dp_shard=1 must register no hooks, allocate nothing, launch nothing."""
+    model = build_model(seed=0, device=device)
+    before = [p.data_ptr() for p in model.parameters()]
+    solo = Mesh({"dp_shard": dist.get_world_size()}) if False else None
+    del solo
+
+    class OneMesh:
+        def size(self, d):
+            return 1
+
+        def get_group(self, d):
+            return dist.group.WORLD
+
+        def coordinate(self, d):
+            return 0
+
+    fsdp = FSDP(model, OneMesh(), shard_dim="dp_shard", replicate_dim=None)
+    assert fsdp._units == [] and fsdp._states == [], "size-1 fsdp built state"
+    assert [p.data_ptr() for p in model.parameters()] == before, (
+        "size-1 fsdp moved a parameter's storage"
+    )
+    assert not model._forward_pre_hooks, "size-1 fsdp registered a hook"
+    loss_fn(model, global_batch(1, device)).backward()
+    fsdp.sync()  # must be a no-op, not an assert about units never firing
+    for p in model.parameters():
+        assert p.grad is not None and p.grad.shape == p.shape, (
+            "size-1 fsdp changed the grad shape"
+        )
+
+
+def test_tied_embedding(mesh, dim, device):
+    """
+    embed and head must land in ONE unit, share one storage through every
+    swap, and the shared weight's grad must be the SUM of both contributions.
+    """
+    model = build_model(seed=0, device=device)
+    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+
+    assert model.lm_head.weight is model.token_emb.weight
+    owners = {
+        st.name: u.index for u in fsdp._units for st in u.params
+    }
+    assert "token_emb.weight" in owners and owners["token_emb.weight"] == 0
+    # exactly one state for the tied storage, not two
+    assert sum(1 for st in fsdp._states if st.param is model.token_emb.weight) == 1
+
+    reference = build_model(seed=0, device=device)
+    batch = global_batch(mesh.size(dim), device)
+    loss_fn(reference, batch).backward()
+    loss_fn(model, batch[mesh.coordinate(dim)].unsqueeze(0)).backward()
+    fsdp.sync()
+
+    errors = []
+    collect(errors, "tied token_emb.weight (sum of embedding + head paths)",
+            model.token_emb.weight.grad,
+            sharded_ref_grad(reference.token_emb.weight.grad, mesh, dim))
+    finish(errors)
+    # both modules still see one storage after a full cycle
+    assert model.lm_head.weight.data_ptr() == model.token_emb.weight.data_ptr()
 
 
 TESTS = [
-    ("test_noop_at_size_one", test_noop_at_size_one, "replicate"),
-    ("test_unit_partition", test_unit_partition, "shard"),
-    ("test_shard_roundtrip", test_shard_roundtrip, "shard"),
-    ("test_shard_memory", test_shard_memory, "shard"),
+    ("test_shard_and_replicate", test_shard_and_replicate),
+    ("test_grad_parity", test_grad_parity),
+    ("test_grad_parity_fused_ce", test_grad_parity_fused_ce),
+    ("test_matches_ddp", test_matches_ddp),
+    ("test_accum_2", partial(test_grad_accumulation, microbatches=2)),
+    ("test_accum_3", partial(test_grad_accumulation, microbatches=3)),
+    ("test_multi_step", test_multi_step),
+    ("test_clip_grad_norm", test_clip_grad_norm),
+    ("test_hsdp", test_hsdp),
+    ("test_storage_actually_freed", test_storage_actually_freed),
+    ("test_collective_counts", test_collective_counts),
+    ("test_prefetch_order", test_prefetch_order),
+    ("test_noop_at_size_one", test_noop_at_size_one),
+    ("test_tied_embedding", test_tied_embedding),
 ]
 
 
-def _worker(rank: int, world_size: int):
+def _worker(rank: int, world_size: int, backend: str):
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29533")
+    os.environ.setdefault("MASTER_PORT", "29551")
+    if backend == "nccl":
+        torch.cuda.set_device(rank)
     dist.init_process_group(
-        "gloo", rank=rank, world_size=world_size, timeout=timedelta(seconds=60)
+        backend, rank=rank, world_size=world_size, timeout=timedelta(seconds=120)
     )
-
-    # both meshes are built up front: dist.new_group is collective, so every
-    # rank must create every group in the same order regardless of which tests
-    # end up running.
-    shard_mesh = Mesh({"dp_replicate": 1, "dp_shard": world_size})
-    shard_mesh.flatten(("dp_replicate", "dp_shard"), "dp")
-    replicate_mesh = Mesh({"dp_replicate": world_size, "dp_shard": 1})
-    replicate_mesh.flatten(("dp_replicate", "dp_shard"), "dp")
-    meshes = {"shard": shard_mesh, "replicate": replicate_mesh}
+    device = torch.device(f"cuda:{rank}" if backend == "nccl" else "cpu")
+    mesh, dim = Mesh({"dp": world_size}), "dp"
 
     failed = []
-    for name, test, which in TESTS:
+    for name, test in TESTS:
         try:
-            test(meshes[which])
-            err = None
+            test(mesh, dim, device)
+            msg = "PASS"
+        except Skip as e:
+            msg = f"SKIP: {e}"
         except AssertionError as e:
-            err = f"FAIL: {e}"
-        except NotImplementedError:
-            err = "TODO: not implemented yet"
-        except Exception as e:
-            err = f"ERROR: {type(e).__name__}: {e}"
-        dist.barrier()
-        if rank == 0:
-            print(f"[{name}] {err or 'PASS'}")
-        # NotImplementedError is the expected state of an unwritten milestone,
-        # not a failure -- the suite goes red on real breakage only
-        if err and not err.startswith("TODO"):
+            msg = f"FAIL: {e}"
             failed.append(name)
+        except Exception as e:  # noqa: BLE001
+            msg = f"ERROR: {type(e).__name__}: {e}"
+            failed.append(name)
+        # gather every rank's verdict, not just rank 0's. a sharded bug is
+        # frequently rank-dependent -- rank 0 owns the first slice of every
+        # param and is the one rank a broadcast-from-0 bug leaves correct --
+        # so reporting only rank 0 hides exactly the failures worth catching.
+        verdicts = [None] * world_size
+        dist.all_gather_object(verdicts, msg)
+        if rank == 0:
+            bad = {r: v for r, v in enumerate(verdicts) if v != "PASS" and not v.startswith("SKIP")}
+            if bad:
+                print(f"[{name}] " + " || ".join(f"rank{r}: {v}" for r, v in bad.items()), flush=True)
+            else:
+                print(f"[{name}] {verdicts[0]}", flush=True)
+        if any(v != "PASS" and not v.startswith("SKIP") for v in verdicts):
+            if name not in failed:
+                failed.append(name)
     dist.destroy_process_group()
     if failed:
         raise SystemExit(1)
@@ -283,6 +657,6 @@ def _worker(rank: int, world_size: int):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--world-size", type=int, default=4)
+    parser.add_argument("--backend", choices=["gloo", "nccl"], default="gloo")
     args = parser.parse_args()
-    assert args.world_size >= 2, "fsdp at dp_shard=1 is a no-op; use >= 2 ranks"
-    mp.spawn(_worker, args=(args.world_size,), nprocs=args.world_size)
+    mp.spawn(_worker, args=(args.world_size, args.backend), nprocs=args.world_size)

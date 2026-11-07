@@ -37,6 +37,16 @@ torch.set_float32_matmul_precision("high")
 
 PROJECT_DIR = get_project_dir()
 
+# config strings -> dtypes for fsdp's mixed precision. None means "no cast":
+# gathered params keep the fp32 master dtype (what an fp32 debug run wants).
+_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+    None: None,
+    "none": None,
+}
+
 def load_json(train_config_path: str) -> dict:
     with open(train_config_path, 'r') as file:
         return json.load(file)
@@ -197,6 +207,12 @@ class Trainer:
                 bucket_mb=ddp_cfg.get("bucket_mb", 25),
             )
         elif self.parallelism == "fsdp":
+            # FSDP at dp_shard=1 is a full no-op, so it would silently skip
+            # the dp_replicate grad sync too. pure replication is ddp's job.
+            assert self.mesh.size("dp_shard") > 1, (
+                f"parallelism 'fsdp' needs dp_shard > 1 (mesh {self.config['mesh']}); "
+                "use parallelism 'ddp' for pure replication"
+            )
             fsdp_cfg = self.config.get("fsdp", {})
             self.parallel = FSDP(
                 model,
@@ -204,7 +220,9 @@ class Trainer:
                 shard_dim="dp_shard",
                 # hsdp: reduce-scatter on dp_shard, then all_reduce on dp_replicate
                 replicate_dim="dp_replicate" if self.mesh.size("dp_replicate") > 1 else None,
-                prefetch_depth=fsdp_cfg.get("prefetch_depth", 1),
+                param_dtype=_DTYPES[fsdp_cfg.get("param_dtype", "bfloat16")],
+                reduce_dtype=_DTYPES[fsdp_cfg.get("reduce_dtype", "float32")],
+                prefetch=fsdp_cfg.get("prefetch", 1),
             )
         else:
             raise ValueError(

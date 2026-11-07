@@ -2,155 +2,252 @@
 DTensor: a bookkeeping wrapper over (local_tensor, mesh, placements) with an
 explicit `redistribute`.
 
-deliberately NOT a `__torch_dispatch__` subclass with sharding propagation for
-every aten op (roadmap 2.1 makes this decision explicitly). pytorch's DTensor
-does full op dispatch; that is a compiler-sized project, and nothing here needs
-it -- fsdp2, tp, cp and the sharded checkpointer all know exactly which
-collective they want and when. this class exists to make "which placement is
-this tensor in" a thing you can assert on, test against a ground truth, and
-write into checkpoint metadata.
+**this is deliberately NOT a __torch_dispatch__ subclass with sharding
+propagation.** pytorch's DTensor infers placements through every aten op;
+that's a compiler-sized project, and nothing downstream here needs it --
+fsdp2, tp, cp and checkpointing all know exactly which collective they want
+and are better off saying so. this wrapper exists to name layouts, convert
+between them, and carry the metadata a sharded checkpoint will need.
 
-**the runtime consequence, stated once so it doesn't get re-litigated:** fsdp2
-params stay plain `torch.Tensor` / `nn.Parameter` at runtime. fused adamw,
-`torch._foreach_*`, and `clip_grad_norm` keep working untouched, and nothing in
-the hot path unwraps. DTensor is used at the edges: constructing shards at
-init, checkpoint save/load metadata, and tests that need `full_tensor()` as
-ground truth. if that ever stops being enough, the note to leave behind is:
-every `p.grad`, every foreach call, and the whole clip path grows an unwrap.
+consequence, and the reason fsdp2.py reads the way it does: **the optimizer
+never sees a DTensor.** params stay plain torch.Tensors at runtime, with
+their placements recorded alongside in fsdp2's per-param state. fused AdamW,
+the torch._foreach_* calls in core/grad_helper.py, and every `p.grad` access
+keep working untouched. if real op propagation is ever wanted, that decision
+is what has to be revisited first.
 
-the redistribute table (implement + test every cell against `full_tensor()`):
+the redistribute table (each cell is one call into core/collective.py):
 
-    from -> to              collective
-    Shard(d)   -> Replicate all_gather(gather_dim=d)
-    Replicate  -> Shard(d)  local slice, NO comm
-    Partial    -> Replicate all_reduce(op)
-    Partial    -> Shard(d)  reduce_scatter(op, scatter_dim=d)
-    Shard(i)   -> Shard(j)  all_to_all(split_dim=j, concat_dim=i)
-    X          -> X         no-op
-    Replicate  -> Partial   ILLEGAL (would need to invent a decomposition)
+    Shard(d)   -> Replicate    all_gather(gather_dim=d)
+    Replicate  -> Shard(d)     local slice, NO comm
+    Partial(op)-> Replicate    all_reduce(op)
+    Partial(op)-> Shard(d)     reduce_scatter(op, scatter_dim=d)
+    Shard(i)   -> Shard(j)     all_to_all(split_dim=j, concat_dim=i)
 
-divisibility: the collectives assert `shape[dim] % size == 0` and do not pad.
-every qwen3 param's dim 0 is divisible by 8, so v0 asserts loudly and moves on.
-the first model with an awkward vocab or head count needs padding, and it goes
-*here* -- pad the local shard to the max shard size at `from_local`, carry the
-logical shape in `self.shape`, and trim in `full_tensor()`. don't discover this
-at 3am.
+transitions INTO Partial are not implemented: Replicate -> Partial has no
+canonical answer (you'd have to zero every rank but one, and which one is
+arbitrary), and nothing needs it. Partial arises only from local computation
+-- an unreduced gradient -- so it is produced by `from_local`, never by a
+redistribute.
 
-run tests with: uv run tests/dtensor.py --world-size 4  (gloo/cpu)
+run tests with: uv run tests/dtensor.py --world-size 4   (gloo/cpu)
 """
-
-from __future__ import annotations
 
 import torch
 
-from torchure.core.collective import MeshLike
-from torchure.core.placement import Placement
+from torchure.core.collective import (
+    MeshLike,
+    all_gather,
+    all_reduce,
+    all_to_all,
+    reduce_scatter,
+)
+from torchure.core.placement import (
+    Partial,
+    Placement,
+    Placements,
+    Replicate,
+    Shard,
+)
+from torchure.core import placement as _placement
 
 
 class DTensor:
+    """
+    (local_tensor, mesh, placements). `placements` has one entry per axis in
+    `mesh_dims`, which is the explicit axis-name tuple this tensor is laid out
+    over -- passing the names rather than reading them off the mesh keeps a
+    tensor sharded only over ("dp_shard",) from having to carry Replicate()
+    entries for tp/pp/cp axes it doesn't care about.
+    """
+
+    __slots__ = ("_local", "_mesh", "_mesh_dims", "_placements")
+
     def __init__(
         self,
-        local_tensor: torch.Tensor,
+        local: torch.Tensor,
         mesh: MeshLike,
         mesh_dims: tuple[str, ...],
-        placements: tuple[Placement, ...],
-        shape: torch.Size | None = None,
+        placements: Placements,
     ):
-        """
-        `mesh_dims` names the axes this tensor is distributed over, positionally
-        paired with `placements` -- our Mesh is a named dict, not an ordered
-        n-d object, so the pairing has to be carried explicitly rather than
-        inferred from mesh rank order.
+        assert len(mesh_dims) == len(placements), (
+            f"{len(placements)} placements for axes {mesh_dims}"
+        )
+        assert all(isinstance(p, Placement) for p in placements), (
+            f"placements must be Placement instances, got {placements}"
+        )
+        # two axes sharding the SAME tensor dim would make the gathered order
+        # depend on which axis is gathered first, and neither order is
+        # obviously right. nothing in fsdp/hsdp needs it (hsdp shards on
+        # dp_shard and replicates on dp_replicate), so reject it rather than
+        # pick an order nobody verified.
+        shard_dims = [p.dim for p in placements if isinstance(p, Shard)]
+        assert len(shard_dims) == len(set(shard_dims)), (
+            f"two mesh axes shard the same tensor dim in {placements}; "
+            "not supported in v0 (the gather order would be ambiguous)"
+        )
+        self._local = local
+        self._mesh = mesh
+        self._mesh_dims = tuple(mesh_dims)
+        self._placements = tuple(placements)
 
-        `shape` is the LOGICAL (full) shape. it is derivable from local_tensor
-        + placements today, but it stops being derivable the moment padding
-        lands, and it is what checkpoint metadata wants. store it.
-        """
-        raise NotImplementedError
-
-    # --- construction -----------------------------------------------------
+    # ---- construction / access -------------------------------------------
 
     @staticmethod
     def from_local(
-        local_tensor: torch.Tensor,
+        local: torch.Tensor,
         mesh: MeshLike,
         mesh_dims: tuple[str, ...],
-        placements: tuple[Placement, ...],
-    ) -> DTensor:
+        placements: Placements,
+    ) -> "DTensor":
         """
-        wrap an already-local tensor, asserting nothing about its contents.
-        no comm. this is the cheap constructor fsdp uses once per param at init.
+        wrap an already-correctly-laid-out local tensor. NO communication and
+        no validation that the ranks agree -- this is an assertion by the
+        caller about what the local tensor already is.
         """
-        raise NotImplementedError
-
-    @staticmethod
-    def from_full(
-        full_tensor: torch.Tensor,
-        mesh: MeshLike,
-        mesh_dims: tuple[str, ...],
-        placements: tuple[Placement, ...],
-    ) -> DTensor:
-        """
-        every rank holds the identical full tensor; slice out this rank's part.
-        no comm (that's the point -- fsdp2 v0 inits full weights on every rank
-        with a fixed seed and slices, which is bit-identical by construction and
-        keeps init_weights' residual scaling a whole-tensor operation).
-
-        trap: `.contiguous()` the slice. a `Shard(d>0)` slice is a view with the
-        original stride, and handing that to a collective either copies
-        silently or asserts, depending on the op.
-        """
-        raise NotImplementedError
-
-    # --- accessors --------------------------------------------------------
+        return DTensor(local, mesh, mesh_dims, placements)
 
     def to_local(self) -> torch.Tensor:
-        """this rank's local tensor. no comm, no copy -- the same object."""
-        raise NotImplementedError
+        """the raw local shard. no comm."""
+        return self._local
+
+    @property
+    def placements(self) -> Placements:
+        return self._placements
+
+    @property
+    def mesh_dims(self) -> tuple[str, ...]:
+        return self._mesh_dims
+
+    @property
+    def mesh(self) -> MeshLike:
+        return self._mesh
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._local.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self._local.device
+
+    def _sizes(self) -> tuple[int, ...]:
+        return tuple(self._mesh.size(d) for d in self._mesh_dims)
+
+    @property
+    def shape(self) -> torch.Size:
+        """the GLOBAL shape. Partial and Replicate don't change it."""
+        return torch.Size(
+            _placement.global_shape(
+                tuple(self._local.shape), self._placements, self._sizes()
+            )
+        )
 
     def full_tensor(self) -> torch.Tensor:
         """
-        the logical tensor, materialized on every rank. this is
-        `redistribute(all Replicate).to_local()` and it is the ground truth
-        every test in tests/dtensor.py compares against. never call it in the
-        training loop.
+        the whole logical tensor on every rank: redistribute to Replicate on
+        every axis and unwrap. this is the ground truth the tests compare
+        against, and it is a real collective -- note that for a Partial it is
+        an all_reduce, not a gather.
         """
-        raise NotImplementedError
-
-    # --- the interesting one ----------------------------------------------
-
-    def redistribute(self, placements: tuple[Placement, ...]) -> DTensor:
-        """
-        move to `placements` (same mesh_dims, positionally). returns a NEW
-        DTensor; `self` is untouched.
-
-        implementation notes:
-        - do one axis at a time, in mesh_dims order, and keep it a flat
-          dispatch over (src, dst) pairs -- no clever multi-axis fusion. the
-          table is small and the whole value of this class is that each cell
-          is individually testable.
-        - `Partial -> Shard(d)` is the one fsdp's backward actually runs, and
-          the one that has to accept `async_op`. it isn't exposed here (this
-          API is sync); fsdp2 calls `reduce_scatter` directly for the
-          overlapped path and uses this only to check itself in tests.
-        - `Replicate -> Partial` must raise, not silently divide by group size.
-        """
-        raise NotImplementedError
-
-    # --- ergonomics -------------------------------------------------------
+        return self.redistribute((Replicate(),) * len(self._mesh_dims)).to_local()
 
     def __repr__(self) -> str:
+        return (
+            f"DTensor(local={tuple(self._local.shape)}, global={tuple(self.shape)}, "
+            f"dims={self._mesh_dims}, placements={self._placements})"
+        )
+
+    # ---- the redistribute table ------------------------------------------
+
+    def redistribute(self, placements: Placements) -> "DTensor":
         """
-        `DTensor(shape=(151936, 1024), dp_shard=Shard(0), local=(37984, 1024))`
-        -- placements and both shapes, because every bug in this file looks
-        like a shape mismatch three frames later.
+        return a new DTensor with the requested placements, launching one
+        collective per axis that actually changes. axes whose placement is
+        already the target are skipped entirely, which is what makes a size-1
+        axis (and a no-op redistribute) genuinely free.
+
+        axes are processed in `mesh_dims` order. that is well defined here
+        because the ctor rejects two axes sharding the same tensor dim, so no
+        two transitions can interact.
         """
-        raise NotImplementedError
+        assert len(placements) == len(self._mesh_dims), (
+            f"{len(placements)} placements for axes {self._mesh_dims}"
+        )
+        local = self._local
+        current = list(self._placements)
 
-    def placement_for(self, mesh_dim: str) -> Placement:
-        """placement on a named axis; Replicate() for axes not in mesh_dims."""
-        raise NotImplementedError
+        for i, dim_name in enumerate(self._mesh_dims):
+            src, dst = current[i], placements[i]
+            if src == dst:
+                continue
+            local = self._transition(local, dim_name, src, dst)
+            current[i] = dst
+
+        return DTensor(local, self._mesh, self._mesh_dims, tuple(current))
+
+    def _transition(
+        self, local: torch.Tensor, dim_name: str, src: Placement, dst: Placement
+    ) -> torch.Tensor:
+        """one cell of the table, for one mesh axis."""
+        size = self._mesh.size(dim_name)
+
+        # a size-1 axis can't move any data: every transition between
+        # placements is the identity, except Partial->anything, which is still
+        # the identity because there is exactly one contributor. skipping the
+        # collective here is what keeps dp_shard=1 free.
+        if size == 1:
+            return local
+
+        if isinstance(src, Shard) and isinstance(dst, Replicate):
+            return all_gather(local, self._mesh, dim_name, gather_dim=src.dim)
+
+        if isinstance(src, Replicate) and isinstance(dst, Shard):
+            # the one cell with no comm
+            coord = self._mesh.coordinate(dim_name)
+            return dst.local_slice(local, size, coord).contiguous()
+
+        if isinstance(src, Partial) and isinstance(dst, Replicate):
+            # all_reduce is in-place on its input and returns it; clone first
+            # so redistribute never mutates the caller's tensor (same contract
+            # reduce_scatter follows)
+            return all_reduce(local.clone(), self._mesh, dim_name, src.op)
+
+        if isinstance(src, Partial) and isinstance(dst, Shard):
+            return reduce_scatter(
+                local, self._mesh, dim_name, src.op, scatter_dim=dst.dim
+            )
+
+        if isinstance(src, Shard) and isinstance(dst, Shard):
+            # currently split along src.dim, want split along dst.dim: cut the
+            # local chunk along the TARGET dim, trade row-for-row, and glue
+            # the received pieces back along the SOURCE dim.
+            return all_to_all(
+                local, self._mesh, dim_name, split_dim=dst.dim, concat_dim=src.dim
+            )
+
+        if isinstance(dst, Partial):
+            raise NotImplementedError(
+                f"{src} -> {dst} on axis {dim_name!r}: transitions INTO Partial "
+                "are not defined (you would have to zero all ranks but an "
+                "arbitrary one). Partial comes from local computation, via "
+                "from_local, never from a redistribute"
+            )
+
+        raise NotImplementedError(f"redistribute {src} -> {dst} on axis {dim_name!r}")
 
 
-if __name__ == "__main__":
-    print("dtensor: see tests/dtensor.py")
+def distribute_tensor(
+    full: torch.Tensor,
+    mesh: MeshLike,
+    mesh_dims: tuple[str, ...],
+    placements: Placements,
+) -> DTensor:
+    """
+    take a full tensor that every rank already holds identically and produce
+    the DTensor with the requested placements. sharding is a local slice, so
+    this launches no collectives -- it does NOT check that the ranks really do
+    agree on `full` (fsdp broadcasts before calling this; see fsdp2.py).
+    """
+    dt = DTensor(full, mesh, mesh_dims, (Replicate(),) * len(mesh_dims))
+    return dt.redistribute(placements)
