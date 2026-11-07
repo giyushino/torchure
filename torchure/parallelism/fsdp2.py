@@ -1,95 +1,23 @@
 """
-fsdp2: per-parameter sharding along the mesh's `dp_shard` axis.
+fsdp2: per-parameter Shard(0) sharding along `dp_shard`; hsdp when
+`replicate_dim` is set too.
 
-each parameter's master copy is a Shard(0) slice in fp32. before a unit runs,
-its shards are all-gathered into a full-size buffer (optionally cast to a
-compute dtype on the way); after it runs, that buffer's storage is released.
-gradients are reduce-scattered back down to sharded fp32, so params, grads and
-optimizer state all scale as 1/dp_shard -- the last of those being the actual
-memory win, and it happens for free only because the optimizer is built from
-`model.parameters()` AFTER sharding.
+each param keeps ONE nn.Parameter whose `.data` is swapped between its fp32
+shard (optimizer) and a gathered full buffer (forward/backward). that keeps the
+tied embedding tied, lets grad hooks register once, and means the optimizer
+never sees a DTensor.
 
-## the one structural idea
+units: unit 0 = everything outside `model.blocks` (embed, norm, lm_head), held
+unsharded until its backward because the fused CE reads lm_head.weight after
+forward returns. each block is its own unit:
 
-each logical parameter keeps exactly ONE nn.Parameter object for the lifetime
-of the model, and `param.data` is swapped between two storages:
+    forward-pre    all_gather; prefetch next unit
+    forward-post   reshard (storage resize to 0, not a dropped ref)
+    backward-pre   re-gather; prefetch previous unit
+    post-backward  reduce_scatter grads -> sharded fp32, reshard
 
-    resharded:  param.data -> the fp32 Shard(0) master     (what the optimizer sees)
-    unsharded:  param.data -> the compute-dtype full buffer (what forward sees)
-
-that single decision buys three things that are otherwise fiddly:
-
-- **the tied embedding works for free.** `lm_head.weight is token_emb.weight`
-  is one Parameter object reachable from two modules, so swapping `.data`
-  updates both views at once. there is no way to accidentally gather it twice
-  or give the two modules different storages. the ctor asserts the tie rather
-  than assuming it.
-- **grad hooks are registered once.** `register_post_accumulate_grad_hook`
-  lives on the Parameter, so it survives every swap -- the same mechanism ddp
-  uses, with one counter per unit instead of per bucket.
-- **the optimizer never sees a DTensor.** params are plain tensors at runtime
-  with their placements recorded in `_ParamState`; fused AdamW, the
-  `torch._foreach_*` calls in grad_helper, and every `p.grad` access work
-  untouched. see core/dtensor.py for why that decision was made.
-
-## units
-
-a unit is the granularity of one gather. unit 0 is everything outside
-`model.blocks` -- token_emb, the final norm, lm_head -- and each transformer
-block is its own unit. the tied weight FORCES embed and head into one unit;
-splitting them would double-gather one storage and corrupt the grad flow.
-
-unit 0 is gathered at the model's forward-pre hook and is **not** resharded
-until its backward completes. that is deliberate: `ARObjective.compute_loss`
-calls `model(..., return_final_hidden=True)` and then hands
-`model.lm_head.weight` to the fused linear+CE, so the head weight is consumed
-*after* the model's forward has returned -- any reshard on a forward-post hook
-would hand the objective a freed weight. holding one unit unsharded for the
-step costs one transient full-size copy of the embedding and does not touch
-the memory exit criterion, which is about master params + grads + adam state.
-
-## lifecycle per block unit
-
-    forward-pre    all_gather shards -> full buffer; prefetch the NEXT unit
-    forward-post   point params back at the shards, resize the buffer to 0
-    backward-pre   re-gather; prefetch the PREVIOUS unit
-    post-backward  reduce_scatter grads -> sharded fp32, free, reshard
-
-resharding is a storage resize, not a dropped python reference. saved
-activations from the block's backward hold a reference to the weight tensor,
-so refcounting alone would never release it -- the run would be numerically
-perfect and save no memory at all, which is exactly why tests/fsdp2.py asserts
-storage size directly rather than trusting a peak-memory number.
-
-## grad accumulation
-
-grads are reduce-scattered EVERY microbatch and accumulated in the sharded
-fp32 `sharded_grad`, rather than accumulated unsharded and reduced once. that
-is one extra collective per microbatch in exchange for never holding a full
-unsharded grad per unit, which is the whole reason to be here. "avg" is linear,
-so avg-then-sum over microbatches equals ddp's sum-then-avg. `requires_sync`
-exists only so the trainer loop can stay one idiom across ddp and fsdp; fsdp
-ignores it (see the attribute's docstring).
-
-## what v0 does NOT do
-
-- **no dedicated comm stream.** collectives are launched with `async_op=True`
-  on the default stream, which is how parallelism/data_parallel.py already
-  gets its overlap on nccl. a stream fsdp owns, plus explicit events and
-  buffer lifetime across the stream boundary, is the next perf step and the
-  single biggest source of nondeterministic corruption -- it should land with
-  a profiler trace proving it, not on faith.
-- **one all_gather per PARAM, not per unit.** a flat per-unit buffer would cut
-  ~9 collectives per block to 1, but the gathered layout is rank-major, so
-  reassembling per-param views out of it needs a copy-out pass
-  (`split_with_sizes_copy`) and a second live buffer. correctness first: the
-  per-param path needs neither, and the structure here (buffers owned by
-  `_ParamState`, gathers launched by the unit) is what a flat-buffer swap
-  would replace.
-- **no activation checkpointing interaction.** recompute re-runs a block's
-  forward during backward, so the unit must be unsharded then too. the
-  backward-pre hook happens to do exactly that, but it is untested.
-- **uneven shards.** divisibility is asserted loudly; nothing pads.
+grads are reduce-scattered every microbatch, so `requires_sync` is ignored.
+not done yet: dedicated comm stream, flat per-unit buffers, uneven shards.
 """
 
 from dataclasses import dataclass, field
@@ -160,23 +88,10 @@ class _PendingReduce:
 
 class FSDP:
     """
-    shard `model` along `mesh`'s `shard_dim` axis.
-
-    at `mesh.size(shard_dim) == 1` this is a total no-op -- no hooks, no
-    buffers, no collectives -- the same way DDP is at dp=1, so a config can
-    drop to one rank without changing code paths.
-
-    `replicate_dim` turns this into hsdp: grads are reduce-scattered along
-    `shard_dim`, then all-reduced along `replicate_dim`. at size 1 that second
-    collective is skipped entirely.
-
-    dtypes: `param_dtype` is what the gathered buffers (and therefore the
-    forward) use; None means "no cast", which keeps an fp32 model bit-exact
-    and is what the cpu parity tests rely on. masters are always the dtype the
-    model was built in. `reduce_dtype` is what grads are reduced in: fp32
-    costs an upcast of the unsharded grad but avoids accumulation error across
-    dp_shard ranks; None means "reduce in whatever dtype the grad already is",
-    which halves the bytes when param_dtype is bf16.
+    shard `model` along `shard_dim`; a no-op when that axis has size 1.
+    `replicate_dim` adds hsdp: reduce-scatter on shard_dim, then all-reduce on
+    replicate_dim. `param_dtype` is the gathered/compute dtype (None = no
+    cast); `reduce_dtype` is the grad reduction dtype (None = grad's dtype).
     """
 
     def __init__(
@@ -501,16 +416,9 @@ class FSDP:
 
     def _drain(self, final: bool = False) -> None:
         """
-        advance the reduction pipeline one stage. under hsdp each grad goes
-        reduce-scatter (dp_shard) -> all-reduce (dp_replicate), and both are
-        async, so from unit k's post-backward:
-
-            finish the all-reduces launched at unit k-1   (unit k-2's grads)
-            wait unit k-1's reduce-scatters, launch their all-reduces
-            (caller then launches unit k's reduce-scatters)
-
-        the replica all-reduce overlaps a whole unit's backward instead of
-        stalling the compute stream. `final` (from sync) flushes both stages.
+        hsdp pipeline: wait the previous unit's reduce-scatters and launch
+        their replica all-reduces async, finishing the ones from the unit
+        before. `final` (from sync) flushes everything.
         """
         self._finish_all_reduces()
         while self._pending:
