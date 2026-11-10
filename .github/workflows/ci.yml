@@ -51,3 +51,5 @@ jobs:
         run: uv run --no-sync tests/dataloader_packing.py --check
       - name: checkpointer roundtrip
         run: uv run --no-sync tests/checkpointer.py
+      - name: sharded checkpoint resharding (gloo, up to 4 ranks)
+        run: uv run --no-sync tests/sharded_checkpoint.py

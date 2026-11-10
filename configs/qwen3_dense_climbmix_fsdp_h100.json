@@ -62,7 +62,7 @@
     "prefetch": 1
   },
   "checkpointing": {
-    "save_steps": null,
+    "save_steps": 6000,
     "resume": null
   },
   "run_name": "climbmix_fsdp_h100",

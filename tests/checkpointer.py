@@ -125,9 +125,9 @@ def check_roundtrip(tmp: str) -> None:
 def check_completion_marker(tmp: str) -> None:
     """
     a step dir exists from the moment its first file lands, so the dir
-    alone proves nothing. Trainer.checkpoint writes .complete last, after
-    the barrier that fences every rank's writes -- an unmarked step is one
-    we died partway through, and resume discovery has to skip it.
+    alone proves nothing. each rank commits a marker after its last file --
+    a step missing any rank's marker is one we died partway through, and
+    resume discovery has to skip it.
     """
     ckpt = Checkpointer(os.path.join(tmp, "marker_run"))
     model, optimizer, scheduler, loader = build_state(seed=0)
@@ -147,7 +147,7 @@ def check_completion_marker(tmp: str) -> None:
     assert ckpt.latest() is None, "unmarked step must not be picked up"
     assert ckpt.valid_step(10) is None
 
-    ckpt.mark_complete(10)
+    ckpt.commit(10)
     assert ckpt.is_complete(10)
     assert ckpt.latest() == 10
     assert ckpt.valid_step(10) == 10
@@ -162,12 +162,12 @@ def check_completion_marker(tmp: str) -> None:
 
     # finishing 20 promotes it
     write_all(20)
-    ckpt.mark_complete(20)
+    ckpt.commit(20)
     assert ckpt.latest() == 20
     assert ckpt.valid_step(20) == 20
 
     # marking an already-marked step is a no-op, not an error
-    ckpt.mark_complete(20)
+    ckpt.commit(20)
     assert ckpt.latest() == 20
 
     # a step that was never written at all
@@ -179,11 +179,101 @@ def check_completion_marker(tmp: str) -> None:
     assert ckpt.latest() == 20
 
 
+def check_per_rank_markers(tmp: str) -> None:
+    """a step is complete only once EVERY rank of the run has committed."""
+    path = os.path.join(tmp, "rank_run")
+    model, _, _, _ = build_state(seed=0)
+    r0 = Checkpointer(path, rank=0, world_size=2)
+    r1 = Checkpointer(path, rank=1, world_size=2)
+
+    r0.save_model(model, 5)
+    r0.commit(5)
+    assert r0.latest() is None, "rank 1 hasn't committed; step must not be resumable"
+    r1.save_rng({"cpu_rng": torch.get_rng_state()}, 5, dp_rank=1)
+    r1.commit(5)
+    assert r0.latest() == 5 and r1.latest() == 5
+
+    # re-saving the step withdraws that rank's marker until it commits again
+    r0.save_model(model, 5)
+    assert r0.latest() is None, "a step being rewritten must not read as complete"
+    r0.commit(5)
+    assert r0.latest() == 5
+
+    # checkpoints written before per-rank markers carry a single .complete
+    os.makedirs(os.path.join(path, "7"))
+    open(os.path.join(path, "7", ".complete"), "w").close()
+    assert r0.latest() == 7
+
+    # per-dp-rank rng: each rank gets its own stream back, and a rank the
+    # checkpoint has nothing for gets None rather than someone else's
+    torch.manual_seed(11)
+    state = torch.get_rng_state()
+    expected = torch.randn(4)
+    r1.save_rng({"cpu_rng": state}, 9, dp_rank=1)
+    r1.commit(9)
+    torch.set_rng_state(r1.load_rng(9, dp_rank=1)["cpu_rng"])
+    torch.testing.assert_close(torch.randn(4), expected)
+    assert r1.load_rng(9, dp_rank=3) is None
+
+
+def check_async(tmp: str) -> None:
+    """
+    async save must write the state as it was at save time, not as it is when
+    the background thread gets to it, and must not mark the step before then.
+    """
+    path = os.path.join(tmp, "async_run")
+    ckpt = Checkpointer(path, async_save=True)
+    model, optimizer, scheduler, loader = build_state(seed=0)
+    train_steps(model, optimizer, scheduler, 3)
+    want_model = {k: v.clone() for k, v in model.state_dict().items()}
+    want_moments = {
+        i: st["exp_avg"].clone() for i, st in optimizer.state_dict()["state"].items()
+    }
+
+    ckpt.save_model(model, 3)
+    ckpt.save_optimizer(optimizer, 3)
+    ckpt.save_scheduler(scheduler, 3)
+    ckpt.save_dataloader(loader, 3)
+    assert not os.path.exists(os.path.join(path, "3", "model.pt")), (
+        "async save_* must only snapshot; nothing is written before commit"
+    )
+    assert ckpt.latest() is None
+    ckpt.commit(3)
+    # training carries on, mutating params and adam state in place, while
+    # (or before) the writer thread runs
+    train_steps(model, optimizer, scheduler, 3)
+    ckpt.wait()
+    assert ckpt.latest() == 3
+
+    model2, optimizer2, scheduler2, _ = build_state(seed=1)
+    ckpt.load_model(model2, 3)
+    ckpt.load_optimizer(optimizer2, 3)
+    for k, v in model2.state_dict().items():
+        assert torch.equal(v, want_model[k]), f"{k}: async save captured later state"
+    for i, st in optimizer2.state_dict()["state"].items():
+        assert torch.equal(st["exp_avg"], want_moments[i]), "adam state captured late"
+
+    # a failed background write surfaces on the next wait(), not silently,
+    # and leaves the step unmarked
+    ckpt.save_model(model, 4)
+    os.makedirs(os.path.join(path, "4", "model.pt"))  # the write target is a dir
+    ckpt.commit(4)
+    try:
+        ckpt.wait()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("failed async save did not raise from wait()")
+    assert ckpt.latest() == 3
+
+
 def main() -> None:
     tmp = tempfile.mkdtemp(prefix="torchure_ckpt_test_")
     try:
         check_roundtrip(tmp)
         check_completion_marker(tmp)
+        check_per_rank_markers(tmp)
+        check_async(tmp)
         print("all checkpointer checks passed")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -102,6 +102,10 @@ class DDP:
         """mesh axes param/grad state is sharded over; none for ddp."""
         return ()
 
+    def shard_dim_of(self, param: nn.Parameter) -> int | None:
+        """the tensor dim `param` is sharded along; ddp shards nothing."""
+        return None
+
     def _replicate(self, model: nn.Module):
         for tensor in [*model.parameters(), *model.buffers()]:
             broadcast(tensor.detach(), self.mesh, self.dim, src=0)

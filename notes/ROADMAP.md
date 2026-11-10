@@ -35,11 +35,12 @@ these already shaped the code; write them down so future phases don't drift:
 6. **minimal deps.** no framework imports (megatron, deepspeed, accelerate,
    liger). optional integrations (wandb, torchao fp8) stay optional.
 
-## current state (2026-07-30)
+## current state (2026-11-09)
 
-phase 0 and all of phase 1 are done: distributed foundations, overlapped DDP,
-grad accumulation and grad-norm clipping, all three exit criteria met. fsdp2
-and everything after it is still ahead.
+phases 0 and 1 are done. phase 2 (fsdp2 + hsdp) is running and measured
+(FSDP2_H100.md); meta init (2.3) and activation checkpointing (2.4) are still
+owed. phase 3 (sharded checkpointing with resharding load, async save) landed
+11/9, so fsdp runs are resumable. tensor parallel (phase 4) is next.
 
 the 7/30 overlap trace (DDP.md) sharpens what phase 2 is *for* on this
 hardware: at 8 gpus the grad all-reduce (442 ms/step) no longer fits inside the
@@ -50,13 +51,15 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
 | area | state |
 |------|-------|
 | `core/collective.py` | **done.** all 7 ops implemented against the documented contracts; 12 tests green on gloo (`tests/collective.py --world-size 4`, in ci). nccl sweep still owed |
-| `core/mesh.py` | **done.** named axes over the flat rank space: per-axis groups, strides, coordinates, `flatten()` for virtual axes (dataloader's dp coord). `dtensor.py` / `placement.py` not started — fsdp2 decides their shape |
+| `core/mesh.py` | **done.** named axes over the flat rank space: per-axis groups, strides, coordinates, `flatten()` for virtual axes (dataloader's dp coord) |
+| `core/placement.py`, `core/dtensor.py` | **done (phase 2.1).** `Shard / Replicate / Partial` value types and a bookkeeping `DTensor` with an explicit redistribute table; no op dispatch. tests in `tests/placement.py`, `tests/dtensor.py` |
 | `parallelism/data_parallel.py` | **done (phase 1).** bucketed grad all-reduce launched from `register_post_accumulate_grad_hook`, overlapped with backward; flat-buffer buckets with `.grad` repointed at views, oversized params (the tied embedding) reduced in place; dp=1 is a total no-op. `requires_sync` gives no_sync semantics for grad accumulation (1.3). grad parity + accumulation parity tested on gloo (`tests/data_parallel.py`) |
-| `core/grad_helper.py` | **done (phase 1.3).** `clip_grad_norm(params, mesh, max_norm, shard_dims=())` — placement-aware global grad-norm clip, returns the pre-clip norm for logging. local path matches `torch.nn.utils.clip_grad_norm_` and runs at memory-bandwidth limit (~10 ms / 2.1 GiB of grads, ~1.8% of a step); sharded path implemented and tested but unused until fsdp2. tests in `tests/grad_helper.py` |
-| `parallelism/{fsdp2,context_parallel,expert_parallel}.py` | empty stubs — next up |
+| `core/grad_helper.py` | **done (phase 1.3).** `clip_grad_norm(params, mesh, max_norm, shard_dims=())` — placement-aware global grad-norm clip, returns the pre-clip norm for logging. local path matches `torch.nn.utils.clip_grad_norm_` and runs at memory-bandwidth limit (~10 ms / 2.1 GiB of grads, ~1.8% of a step); sharded path is what fsdp passes its shard axis to. tests in `tests/grad_helper.py` |
+| `parallelism/fsdp2.py` | **done (phase 2.2, 2.5).** per-param `Shard(0)` along `dp_shard`, hsdp when `dp_replicate > 1`. model-agnostic: the caller passes the unit modules (`units=model.blocks`), everything else is the root unit; fsdp reads no model attribute names. async gather with prefetch, reduce-scatter per microbatch, fp32 sharded masters + bf16 gathered buffers. not done: dedicated comm stream, flat per-unit buffers, uneven shards (asserts), meta init. `tests/fsdp2.py` (gloo, not in ci) |
+| `parallelism/{context_parallel,expert_parallel}.py` | empty stubs |
 | models | qwen3 dense (0.6B validated, per-block compile, ~13k tps on A40, 73.5k global on 8x A40); llama3 stubbed |
-| trainer | single-gpu and dp through the same path (world_size=1 is not a special case). lifecycle build → parallelize → init → optimizer → data, so sharded init slots in without reordering. grad accumulation (`global_batch_size / (micro_batch_size × dp)` microbatches) and grad-norm clipping both land in `train_step`; `train_step` returns a metrics dict (loss, grad_norm). no eval loop, no metrics logger, and `self.ddp` is still a concrete attribute — the parallelism abstraction gets designed when fsdp2 gives it a second implementation |
-| checkpointing | per-step dirs, `resume: null \| "auto" \| <step>`, full state (model/optimizer/scheduler/dataloader/rng/config). dp-aware: rank 0 writes replicas, every dp rank writes its own dataloader file, barrier-fenced, refuses to resume across a mesh change. still unsharded (phase 3) and still missing a done marker |
+| trainer | single-gpu and dp through the same path (world_size=1 is not a special case). lifecycle build → parallelize → init → optimizer → data, so sharded init slots in without reordering. grad accumulation (`global_batch_size / (micro_batch_size × dp)` microbatches) and grad-norm clipping both land in `train_step`; `train_step` returns a metrics dict (loss, grad_norm). no eval loop, no metrics logger, `self.parallel` is DDP or FSDP behind one surface (`requires_sync`, `sync()`, `shard_dims`, `shard_dim_of`), so `train_step` and checkpointing never branch on the strategy. torch is seeded from `config.seed`: one shared seed through init, then a per-dp-rank stream (`seed + 1 + dp coord`) |
+| checkpointing | **done (phase 3).** per-step dirs, `resume: null \| "auto" \| <step>`, full state (model/optimizer/scheduler/dataloader/rng/config). sharded: one rank per shard writes `{model,optimizer}_shard{k}.pt`, load reshards any saved shard count onto the current layout (fsdp ↔ hsdp ↔ ddp) via mmap range reads. per-dp-rank dataloader and rng files. per-rank `.done{rank}of{world}` markers instead of a barrier. async by default (`checkpointing.async_save`): cpu snapshot, background-thread write. a mesh change needs `resume_dataloader: false`. tests: `tests/checkpointer.py`, `tests/sharded_checkpoint.py` (both in ci) |
 | objectives | AR CE, with the chunked fused-linear-CE landed and wired into `ARObjective` (default on). backward scales the stashed grads in place — see DEV_LOG 7/27 |
 | dataloader | streaming HF + packing (stream + best-fit-decreasing) + stateful + CUDA prefetcher; splits by the mesh's dp coordinate. packing allows cross-document attention (no doc mask); prefetcher skips one batch on resume |
 
@@ -65,15 +68,20 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
 - **prefetcher one-batch skip on resume** — the prefetcher pulls batch N+1
   before `checkpoint()` snapshots the dataloader, so the saved position is one
   batch ahead of what was consumed. data loss only, but "exact resume" isn't.
-- **no checkpoint done marker** — `latest()` trusts any numeric dir, including
-  a half-written one from a crash, which is the exact case `resume: "auto"`
-  exists for.
-- **rank 0's rng lands on every rank at resume** — harmless while nothing
-  samples per step, load-bearing the moment dropout or masked diffusion does
-  (needs the per-rank seed derivation in 0.3). nothing seeds torch at trainer
-  start either, so runs aren't reproducible.
-- **`tests/data_parallel.py` and `tests/grad_helper.py` aren't in ci** despite
-  being gloo/cpu and being the two most valuable tests in the tree.
+- fixed: checkpoint done marker (per-rank `.done` markers; `latest()` skips a
+  step any rank didn't finish).
+- fixed 11/9: rank 0's rng used to land on every rank at resume. each dp rank
+  now saves and restores its own stream. a rank the checkpoint has no rng
+  file for (resume onto a larger mesh) keeps its seed-derived stream; tp/cp
+  peers sharing a dp coordinate all write the same `rng_dp{c}.pt`, which
+  wants a single designated writer once tp exists (same for the dataloader
+  file).
+- **`tests/data_parallel.py`, `tests/grad_helper.py` and `tests/fsdp2.py`
+  aren't in ci** despite being gloo/cpu and being the most valuable tests in
+  the tree.
+- **sharded checkpointing is only exercised small**: gloo tests and a
+  2-gpu tiny-model trainer smoke with compile off. no run at real model
+  size, with compile on, or on a shared filesystem across nodes yet.
 - **the benchmark numbers are boost-clock numbers.** throughput decays 2–3%
   over a run as the card power-caps (measured 7/30: `SwPowerCap` from step 0,
   clocks 1665 → 1590 MHz as it heats 70 → 79 °C). rounds 1–2 were 10–30 step
@@ -89,7 +97,7 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
 
 # part 1 — parallelism
 
-## phase 0: distributed foundations — DONE (except the nccl sweep + 0.3 seeding)
+## phase 0: distributed foundations — DONE (except the nccl sweep)
 
 everything else stacks on this. smallest phase, highest leverage.
 
@@ -118,9 +126,10 @@ decisions:
   equivalent coords helper from day one — retrofitting this is painful.
 - size-1 dims must be free (no groups, collectives become no-ops or asserts).
 
-**0.3 trainer bootstrap.** ✅ except **per-dim seed derivation**, which is
-still owed (nothing seeds torch at trainer start, and resume restores rank 0's
-rng onto every rank). torchrun entrypoint: read
+**0.3 trainer bootstrap.** ✅ including per-dim seed derivation (11/9): the
+shared `config.seed` through init, then `seed + 1 + dp coordinate`, so tp/cp
+peers share a stream and dp ranks don't; resume restores each dp rank's own
+rng. torchrun entrypoint: read
 `RANK/LOCAL_RANK/WORLD_SIZE` from env, `init_process_group` with an explicit
 timeout, `destroy_process_group` on exit, single-gpu path unchanged when
 `WORLD_SIZE` is absent. rank-0-only logging helper, per-dim seed derivation
@@ -206,7 +215,13 @@ vector, and a regression test that grads below the threshold are left
 mutation-checked — disabling the suppression or reintroducing the clamp bug
 makes them fail.
 
-## phase 2: DTensor + FSDP2
+## phase 2: DTensor + FSDP2 — DONE except 2.3 (meta init) and activation checkpointing in 2.4
+
+status: 2.1, 2.2, 2.5 landed; numbers in FSDP2_H100.md. one deviation from
+the 2.2 text below: units are not derived from `model.blocks` inside fsdp —
+the caller passes them (`FSDP(model, mesh, units)`), and fsdp holds no
+model-specific code. params are plain tensors with placements recorded
+alongside, not DTensors. the dedicated comm stream is not done.
 
 the centerpiece. FSDP2-style = per-parameter sharding over DTensors, not
 flat-parameter FSDP1.
@@ -273,7 +288,30 @@ at shard=2); (c) tps within ~10% of DDP at 0.6B/2 gpus (FSDP overhead is real
 at small scale — record it honestly); (d) compile + activation checkpointing
 both composing, ablated in CHANGES.md.
 
-## phase 3: distributed checkpointing
+## phase 3: distributed checkpointing — DONE (11/9)
+
+status against the list below:
+- sharded save ✅ — one file per shard (not per rank: hsdp replicas don't
+  write), `*_shards.json` records the shard count and which tensors are split
+  along which dim. crash consistency is per-rank `.done{rank}of{world}`
+  markers rather than barrier + one marker, because the async writer thread
+  can't run a collective.
+- resharding load ✅ — went straight to the "v1": files are mmapped and each
+  rank reads only its byte range. any saved shard count (including the
+  unsharded `model.pt` format, old checkpoints included) loads onto any
+  current layout.
+- full state ✅ — optimizer state reshards with its param (state shaped like
+  the param is sharded, the rest replicated); rng is per dp rank.
+- async save ✅ — on by default. the snapshot is a plain cpu copy, not pinned
+  memory; pin it if the snapshot stall ever shows up in step time. one save
+  in flight at a time.
+- `export_full` / relationship to `torch.distributed.checkpoint`: not done.
+  own format; loading a sharded checkpoint at dp_shard=1 already yields plain
+  state dicts, so the export is a thin wrapper when it's wanted.
+- golden test: `tests/sharded_checkpoint.py` — train, checkpoint, resume on
+  a different layout; state bitwise after load, same final model after the
+  remaining steps. synthetic data, so it does not cover dataloader resume
+  across a mesh change (unsupported: needs `resume_dataloader: false`).
 
 do this immediately after fsdp2, before TP — resumable multi-gpu runs are the
 prerequisite for every long experiment that follows, and the current

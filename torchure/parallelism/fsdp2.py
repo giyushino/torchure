@@ -67,7 +67,7 @@ class _ParamState:
     param: nn.Parameter
     sharded: torch.Tensor           # fp32 Shard(0) master; param.data when free
     unsharded: torch.Tensor         # compute-dtype full buffer; storage 0 when free
-    placements: Placements          # recorded for phase 3's sharded checkpoint
+    placements: Placements          # layout over (dp_replicate, dp_shard)
     sharded_grad: torch.Tensor | None = None
 
 
@@ -133,6 +133,7 @@ class FSDP:
         self._backwards = 0
         self._units: list[_Unit] = []
         self._states: list[_ParamState] = []
+        self._by_param: dict[int, tuple[_Unit, _ParamState]] = {}
         self._exec_order: list[int] = []
         self._order_checked = False
 
@@ -208,6 +209,8 @@ class FSDP:
             unit.pending = len(states)
             self._units.append(unit)
             self._states.extend(states)
+            for st in states:
+                self._by_param[id(st.param)] = (unit, st)
 
     def _make_state(self, name: str, param: nn.Parameter) -> _ParamState:
         placement = Shard(0)
@@ -481,6 +484,21 @@ class FSDP:
         grads are already averaged across dp_replicate, so only dp_shard.
         """
         return (self.shard_dim,) if self.group_size > 1 else ()
+
+    def shard_dim_of(self, param: nn.Parameter) -> int | None:
+        """
+        the tensor dim `param` is sharded along, or None if it isn't sharded.
+        what the checkpointer needs to save and reshard this run's state.
+        """
+        entry = self._by_param.get(id(param))
+        if entry is None:
+            return None
+        unit, st = entry
+        assert unit.status == _FREE, (
+            f"param {st.name!r} is gathered (unit {unit.index} is {unit.status}); "
+            "checkpoint between steps, when every param points at its shard"
+        )
+        return 0
 
     @property
     def requires_sync(self) -> bool:

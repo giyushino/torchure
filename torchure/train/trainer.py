@@ -14,8 +14,8 @@ import torch.nn as nn
 import torchdata
 from tokenizers import Tokenizer
 
-from torchure.checkpoint.checkpointer import Checkpointer
-from torchure.core.collective import all_reduce, barrier
+from torchure.checkpoint.checkpointer import Checkpointer, ShardLayout
+from torchure.core.collective import all_reduce
 from torchure.core.grad_helper import clip_grad_norm
 from torchure.core.mesh import Mesh
 from torchure.dataloader.builder import build_dataloader
@@ -89,6 +89,10 @@ class Trainer:
         self.model = self._build_model()
         self._init_weights(self.model)
         self.model = self._parallelize(self.model)
+        # init ran on the shared seed so every rank built the same model; from
+        # here each dp rank draws its own stream (dropout, diffusion masks).
+        # tp/cp peers share a dp coordinate, so they stay in lockstep.
+        torch.manual_seed(self.seed + 1 + self.mesh.coordinate("dp"))
         self._compile(self.model)
 
         self.objective = self._build_objective()
@@ -117,19 +121,17 @@ class Trainer:
         time_launched = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.run_name = f"{self.config['run_name']}_{time_launched}"
         self.checkpointer_path = f"{PROJECT_DIR}/checkpoints/{self.config['run_name']}"
-        self.checkpointer = Checkpointer(self.checkpointer_path)
+        self.checkpointer = Checkpointer(
+            self.checkpointer_path,
+            rank=rank,
+            world_size=world_size,
+            # snapshot to cpu, write in a background thread while training runs
+            async_save=self.config["checkpointing"].get("async_save", True),
+        )
         self.resume = self.config["checkpointing"]["resume"]
         self.save_steps = self.config["checkpointing"]["save_steps"]
         # logging is the only host sync in the step loop
         self.log_every = self.config.get("log_every", 10)
-        # checkpointing is unsharded (sharded is roadmap phase 3): under fsdp
-        # rank 0 would save only its own shards. fail now, not at the first save.
-        assert self.benchmark or not self.parallel.shard_dims, (
-            f"parallelism={self.parallelism!r} shards model state across "
-            f"{self.parallel.shard_dims} and the checkpointer is still unsharded "
-            "(roadmap phase 3). run with --steps (benchmark mode, no "
-            "checkpointing) until sharded checkpointing lands."
-        )
         # false for "continue" runs that change the schedule: loading the old
         # scheduler state would overwrite total_steps/warmup/decay with the old values
         self.resume_scheduler = self.config["checkpointing"].get("resume_scheduler", True)
@@ -314,27 +316,52 @@ class Trainer:
         # non_blocking relies on pin_memory=True in the dataloader
         return {k: v.to(self.device, non_blocking=True) for k, v in curr_batch.items()}
     
+    def _shard_layout(self) -> ShardLayout:
+        """how this run shards model/optimizer state, for the checkpointer."""
+        return ShardLayout.of(self.model, self.parallel, self.mesh)
+
+    def _writes_model_state(self) -> bool:
+        """
+        one rank per shard writes model/optimizer state: the one at coordinate
+        0 on every dp axis the state is replicated (not sharded) over. that is
+        rank 0 alone under ddp, and the dp_replicate=0 row under fsdp/hsdp.
+        """
+        return all(
+            self.mesh.coordinate(axis) == 0
+            for axis in ("dp_replicate", "dp_shard")
+            if axis not in self.parallel.shard_dims
+        )
+
     @debug_time
     def checkpoint(self, step: int) -> None:
-        # rank 0 writes the replicated state; every rank writes its own dataloader state
+        # one rank per shard writes model/optimizer state, rank 0 the rest;
+        # every rank writes its own dataloader and rng state. no barrier: each
+        # rank commits its own marker and the step is complete when all have
+        if self._writes_model_state():
+            layout = self._shard_layout()
+            self.checkpointer.save_model(self.model, step, layout)
+            self.checkpointer.save_optimizer(self.optimizer, step, layout)
         if self.rank == 0:
-            self.checkpointer.save_model(self.model, step)
-            self.checkpointer.save_optimizer(self.optimizer, step)
             self.checkpointer.save_scheduler(self.scheduler, step)
             self.checkpointer.save_trainer(
                 {
                     "step": step,
-                    "cpu_rng": torch.get_rng_state(),
-                    "cuda_rng": torch.cuda.get_rng_state(self.device),
                     "config": self.config,
                     "wandb_id": self.wandb_run.id if self.wandb_run else None,
                 },
                 step,
             )
-        self.checkpointer.save_dataloader(self.dataloader, step, self.mesh.coordinate("dp"))
-        barrier()
-        if self.rank == 0:
-            self.checkpointer.mark_complete(step)
+        dp_rank = self.mesh.coordinate("dp")
+        self.checkpointer.save_rng(
+            {
+                "cpu_rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state(self.device),
+            },
+            step,
+            dp_rank,
+        )
+        self.checkpointer.save_dataloader(self.dataloader, step, dp_rank)
+        self.checkpointer.commit(step)
             
     def _resume(self) -> int:
         if self.resume is None:
@@ -351,19 +378,22 @@ class Trainer:
 
 
         state = self.checkpointer.load_trainer(step)
-        # per-rank dataloader files would be misread under a different dp size
-        assert state["config"]["mesh"] == self.config["mesh"], (
-            f"resume across a mesh change is unsupported: checkpoint has "
-            f"{state['config']['mesh']}, config has {self.config['mesh']}"
+        # model/optimizer state reshards onto any mesh, but the per-rank
+        # dataloader files would be misread under a different dp layout
+        assert state["config"]["mesh"] == self.config["mesh"] or not self.resume_dataloader, (
+            f"resume across a mesh change (checkpoint {state['config']['mesh']}, "
+            f"config {self.config['mesh']}) can't restore the per-rank dataloader "
+            "state; set checkpointing.resume_dataloader to false to reshuffle"
         )
-        self.checkpointer.load_model(self.model, step)
+        layout = self._shard_layout()
+        self.checkpointer.load_model(self.model, step, layout)
         # load_state_dict overwrites param_groups wholesale; keep this config's
         # hparams and take only per-param state from the checkpoint
         config_hparams = [
             {k: v for k, v in group.items() if k != "params"}
             for group in self.optimizer.param_groups
         ]
-        self.checkpointer.load_optimizer(self.optimizer, step)
+        self.checkpointer.load_optimizer(self.optimizer, step, layout)
         # a resumed scheduler owns lr
         lr_keys = ("lr", "initial_lr") if self.resume_scheduler else ()
         for group, hparams in zip(self.optimizer.param_groups, config_hparams, strict=True):
@@ -381,9 +411,15 @@ class Trainer:
             self.scheduler._last_lr = lrs
         if self.resume_dataloader:
             self.checkpointer.load_dataloader(self.dataloader, step, self.mesh.coordinate("dp"))
-        # TODO: per-rank rng (roadmap 0.3); rank 0's state lands on every rank
-        torch.set_rng_state(state["cpu_rng"])
-        torch.cuda.set_rng_state(state["cuda_rng"], self.device)
+        # each dp rank resumes its own stream. older checkpoints carry only
+        # rank 0's, in trainer.pt. a rank with neither (resume onto a larger
+        # mesh) keeps the seed-derived stream it already has.
+        rng = self.checkpointer.load_rng(step, self.mesh.coordinate("dp"))
+        if rng is None and "cpu_rng" in state:
+            rng = state
+        if rng is not None:
+            torch.set_rng_state(rng["cpu_rng"])
+            torch.cuda.set_rng_state(rng["cuda_rng"], self.device)
         # .get: older checkpoints have no wandb_id
         self.resume_wandb_id = state.get("wandb_id")
         return state["step"]
@@ -467,7 +503,11 @@ class Trainer:
         try:
             self._run_steps(self.start_step, self.num_train_steps, checkpoint=True)
         finally:
-            # so a crash marks the wandb run crashed instead of leaving it "running"
-            if self.wandb_run is not None:
-                self.wandb_run.finish()
+            try:
+                # the last async save must be on disk before the process exits
+                self.checkpointer.wait()
+            finally:
+                # so a crash marks the wandb run crashed instead of leaving it "running"
+                if self.wandb_run is not None:
+                    self.wandb_run.finish()
 
