@@ -7,9 +7,12 @@ shard (optimizer) and a gathered full buffer (forward/backward). that keeps the
 tied embedding tied, lets grad hooks register once, and means the optimizer
 never sees a DTensor.
 
-units: unit 0 = everything outside `model.blocks` (embed, norm, lm_head), held
-unsharded until its backward because the fused CE reads lm_head.weight after
-forward returns. each block is its own unit:
+units: the caller passes the submodules to treat as units (for a transformer,
+its blocks); fsdp never looks at the model's attribute names. unit 0 is the
+root unit, everything NOT inside a passed unit (for a transformer: embed, final
+norm, head). it is held unsharded from forward until its backward, because
+code outside `model.forward` may still read those weights (a fused loss reading
+the head weight, for one). each passed unit goes through:
 
     forward-pre    all_gather; prefetch next unit
     forward-post   reshard (storage resize to 0, not a dropped ref)
@@ -20,6 +23,7 @@ grads are reduce-scattered every microbatch, so `requires_sync` is ignored.
 not done yet: dedicated comm stream, flat per-unit buffers, uneven shards.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 import torch
@@ -89,6 +93,9 @@ class _PendingReduce:
 class FSDP:
     """
     shard `model` along `shard_dim`; a no-op when that axis has size 1.
+    `units` are the submodules gathered/resharded independently, in any order
+    (execution order is recorded on the first forward); params outside them
+    form the root unit. units must not nest or share a param.
     `replicate_dim` adds hsdp: reduce-scatter on shard_dim, then all-reduce on
     replicate_dim. `param_dtype` is the gathered/compute dtype (None = no
     cast); `reduce_dtype` is the grad reduction dtype (None = grad's dtype).
@@ -98,6 +105,7 @@ class FSDP:
         self,
         model: nn.Module,
         mesh: MeshLike,
+        units: Iterable[nn.Module],
         shard_dim: str = "dp_shard",
         replicate_dim: str | None = "dp_replicate",
         param_dtype: torch.dtype | None = None,
@@ -133,7 +141,7 @@ class FSDP:
             return
 
         self._replicate(model)
-        self._build_units(model)
+        self._build_units(model, list(units))
         self._shard()
         self._register_hooks()
 
@@ -155,32 +163,41 @@ class FSDP:
             if self.replicate_size > 1:
                 broadcast(tensor.detach(), self.mesh, self.replicate_dim, src=0)
 
-    def _build_units(self, model: nn.Module) -> None:
-        assert hasattr(model, "blocks"), (
-            "fsdp needs model.blocks (roadmap principle 4: per-block granularity "
-            "is the contract for compile, wrapping, checkpointing and pp splits)"
-        )
-        block_param_ids = {id(p) for b in model.blocks for p in b.parameters()}
+    def _build_units(self, model: nn.Module, modules: list[nn.Module]) -> None:
+        # qualified names, so states (and later the sharded checkpoint) are
+        # keyed the way model.named_parameters() keys them
+        prefix_of = {id(m): name for name, m in model.named_modules()}
+        for module in modules:
+            assert id(module) in prefix_of and module is not model, (
+                f"fsdp unit {type(module).__name__} is not a submodule of the model"
+            )
+        unit_param_ids = {id(p) for m in modules for p in m.parameters()}
 
-        # unit 0: everything NOT in a block -- token_emb, final norm, lm_head.
-        # the tie puts embed and head here together by construction.
+        # unit 0, the root: everything NOT in a passed unit. a weight tied
+        # between two root modules (embed + head) lands here once, because
+        # named_parameters() dedupes.
         root_named = [
             (n, p)
             for n, p in model.named_parameters()
-            if p.requires_grad and id(p) not in block_param_ids
+            if p.requires_grad and id(p) not in unit_param_ids
         ]
         units = [(model, root_named, False)]
-        for block in model.blocks:
-            named = [(n, p) for n, p in block.named_parameters() if p.requires_grad]
-            units.append((block, named, True))
+        for module in modules:
+            prefix = prefix_of[id(module)]
+            named = [
+                (f"{prefix}.{n}", p)
+                for n, p in module.named_parameters()
+                if p.requires_grad
+            ]
+            units.append((module, named, True))
 
         seen: dict[int, int] = {}
         for index, (module, named, reshard) in enumerate(units):
             states = []
             for name, param in named:
                 # a param reachable from two units would be gathered twice
-                # into two storages and get half its grad -- the exact failure
-                # the tied embedding would cause if it were split
+                # into two storages and get half its grad (a weight tied
+                # across units, or one unit nested inside another)
                 assert id(param) not in seen, (
                     f"param {name!r} appears in units {seen[id(param)]} and {index}; "
                     "a shared weight must live in exactly one unit"
@@ -192,16 +209,13 @@ class FSDP:
             self._units.append(unit)
             self._states.extend(states)
 
-        if hasattr(model, "lm_head") and hasattr(model, "token_emb"):
-            assert model.lm_head.weight is model.token_emb.weight, (
-                "expected tied lm_head/token_emb weights. an untied head is fine "
-                "in principle but changes unit 0's memory profile, so fail loudly "
-                "rather than silently train something the notes don't describe"
-            )
-
     def _make_state(self, name: str, param: nn.Parameter) -> _ParamState:
         placement = Shard(0)
         full = param.data
+        assert full.dim() > 0, (
+            f"param {name!r} is 0-dim; Shard(0) needs a dim to split. make it "
+            "shape (1,)-or-larger, or freeze it"
+        )
         assert full.shape[0] % self.group_size == 0, (
             f"param {name!r} has shape {tuple(full.shape)}; dim 0 is not divisible "
             f"by dp_shard={self.group_size}. v0 asserts rather than padding -- "

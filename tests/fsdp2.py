@@ -150,7 +150,7 @@ def test_shard_and_replicate(mesh, dim, device):
     optimizer allocate sharded state.
     """
     model = build_model(seed=dist.get_rank(), device=device)
-    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    fsdp = FSDP(model, mesh, model.blocks, shard_dim=dim, replicate_dim=None)
     reference = build_model(seed=0, device=device)
     g = mesh.size(dim)
 
@@ -180,7 +180,7 @@ def test_shard_and_replicate(mesh, dim, device):
 def test_grad_parity(mesh, dim, device, loss=loss_fn):
     """N ranks x bs=1 under fsdp == 1 process x bs=N, sharded."""
     model = build_model(seed=dist.get_rank(), device=device)
-    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    fsdp = FSDP(model, mesh, model.blocks, shard_dim=dim, replicate_dim=None)
 
     reference = build_model(seed=0, device=device)
     batch = global_batch(mesh.size(dim), device)
@@ -207,7 +207,7 @@ def test_grad_parity_fused_ce(mesh, dim, device):
         # fused_linear_ce's addmm(out_dtype=) only has a cuda kernel
         raise Skip("fused linear ce needs cuda; run with --backend nccl")
     model = build_model(seed=dist.get_rank(), device=device)
-    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    fsdp = FSDP(model, mesh, model.blocks, shard_dim=dim, replicate_dim=None)
     reference = build_model(seed=0, device=device)
     batch = global_batch(mesh.size(dim), device)
     fused_loss_fn(reference, batch).backward()
@@ -227,7 +227,7 @@ def test_matches_ddp(mesh, dim, device):
     both paths have to agree with each other and neither is the reference.
     """
     fsdp_model = build_model(seed=dist.get_rank(), device=device)
-    fsdp = FSDP(fsdp_model, mesh, shard_dim=dim, replicate_dim=None)
+    fsdp = FSDP(fsdp_model, mesh, fsdp_model.blocks, shard_dim=dim, replicate_dim=None)
 
     ddp_model = build_model(seed=dist.get_rank(), device=device)
     ddp = DDP(ddp_model, mesh, dim)
@@ -253,7 +253,7 @@ def test_grad_accumulation(mesh, dim, device, microbatches: int):
     """K microbatches x N ranks == 1 process x bs=(N*K), still sharded."""
     world = mesh.size(dim)
     model = build_model(seed=dist.get_rank(), device=device)
-    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    fsdp = FSDP(model, mesh, model.blocks, shard_dim=dim, replicate_dim=None)
 
     reference = build_model(seed=0, device=device)
     batch = global_batch(world * microbatches, device)
@@ -282,7 +282,7 @@ def test_multi_step(mesh, dim, device):
     stay equal to the reference's slice step after step.
     """
     model = build_model(seed=dist.get_rank(), device=device)
-    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    fsdp = FSDP(model, mesh, model.blocks, shard_dim=dim, replicate_dim=None)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
     reference = build_model(seed=0, device=device)
@@ -370,7 +370,7 @@ def test_multi_step(mesh, dim, device):
 def test_clip_grad_norm(mesh, dim, device):
     """the sharded norm must equal the single-process norm."""
     model = build_model(seed=dist.get_rank(), device=device)
-    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    fsdp = FSDP(model, mesh, model.blocks, shard_dim=dim, replicate_dim=None)
     reference = build_model(seed=0, device=device)
 
     batch = global_batch(mesh.size(dim), device)
@@ -400,7 +400,7 @@ def test_hsdp(mesh, dim, device):
     m = Mesh({"dp_replicate": 2, "dp_shard": 2})
 
     model = build_model(seed=dist.get_rank(), device=device)
-    fsdp = FSDP(model, m, shard_dim="dp_shard", replicate_dim="dp_replicate")
+    fsdp = FSDP(model, m, model.blocks, shard_dim="dp_shard", replicate_dim="dp_replicate")
 
     reference = build_model(seed=0, device=device)
     batch = global_batch(4, device)
@@ -434,7 +434,7 @@ def test_storage_actually_freed(mesh, dim, device):
     after the whole step everything is free either way.
     """
     model = build_model(seed=0, device=device)
-    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    fsdp = FSDP(model, mesh, model.blocks, shard_dim=dim, replicate_dim=None)
 
     seen = []
 
@@ -482,7 +482,7 @@ def test_collective_counts(mesh, dim, device):
     all, is otherwise invisible.
     """
     model = build_model(seed=0, device=device)
-    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    fsdp = FSDP(model, mesh, model.blocks, shard_dim=dim, replicate_dim=None)
 
     counts = {"all_gather": 0, "reduce_scatter": 0}
     real_ag, real_rs = C.all_gather, C.reduce_scatter
@@ -520,7 +520,7 @@ def test_collective_counts(mesh, dim, device):
 def test_prefetch_order(mesh, dim, device):
     """recorded unit order must be module execution order, once."""
     model = build_model(seed=0, device=device)
-    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    fsdp = FSDP(model, mesh, model.blocks, shard_dim=dim, replicate_dim=None)
     loss_fn(model, global_batch(1, device)).backward()
     fsdp.sync()
     assert fsdp._order_checked, "execution order was never pinned"
@@ -547,7 +547,7 @@ def test_noop_at_size_one(mesh, dim, device):
         def coordinate(self, d):
             return 0
 
-    fsdp = FSDP(model, OneMesh(), shard_dim="dp_shard", replicate_dim=None)
+    fsdp = FSDP(model, OneMesh(), model.blocks, shard_dim="dp_shard", replicate_dim=None)
     assert fsdp._units == [] and fsdp._states == [], "size-1 fsdp built state"
     assert [p.data_ptr() for p in model.parameters()] == before, (
         "size-1 fsdp moved a parameter's storage"
@@ -567,7 +567,7 @@ def test_tied_embedding(mesh, dim, device):
     swap, and the shared weight's grad must be the SUM of both contributions.
     """
     model = build_model(seed=0, device=device)
-    fsdp = FSDP(model, mesh, shard_dim=dim, replicate_dim=None)
+    fsdp = FSDP(model, mesh, model.blocks, shard_dim=dim, replicate_dim=None)
 
     assert model.lm_head.weight is model.token_emb.weight
     owners = {

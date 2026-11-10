@@ -217,6 +217,8 @@ class Trainer:
             self.parallel = FSDP(
                 model,
                 self.mesh,
+                # one unit per block, same granularity as _compile
+                units=model.blocks,
                 shard_dim="dp_shard",
                 # hsdp: reduce-scatter on dp_shard, then all_reduce on dp_replicate
                 replicate_dim="dp_replicate" if self.mesh.size("dp_replicate") > 1 else None,
