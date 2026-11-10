@@ -59,3 +59,5 @@ jobs:
         run: uv run --no-sync tests/grad_helper.py --world-size 2
       - name: fsdp2 parity + invariants (gloo, 4 ranks)
         run: uv run --no-sync tests/fsdp2.py --world-size 4
+      - name: tensor parallel equivalence (gloo, up to 4 ranks)
+        run: uv run --no-sync tests/tensor_parallel.py

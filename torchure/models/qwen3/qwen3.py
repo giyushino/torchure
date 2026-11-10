@@ -105,22 +105,18 @@ class Qwen3GroupQueryAttention(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim, eps=norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=norm_eps)
 
-    def split_heads_old(self, x: torch.Tensor) -> torch.Tensor:
-        # (B, S, emb_dim) -> (B, num_heads, S, head_dim)
-        B, S, _ = x.shape
-        return x.reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-     
-    def split_heads(self, x):
-        n_heads = x.shape[-1] // self.head_dim
-        return x.reshape(*x.shape[:2], n_heads, self.head_dim).transpose(1, 2)
-    
-    def split_kv_heads(self, x: torch.Tensor) -> torch.Tensor:
-        B, S, _ = x.shape
-        return x.reshape(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+    # head counts are read off the tensor, not self.num_heads: under tensor
+    # parallel each rank holds only its slice of the heads
+
+    def split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        # (B, S, heads * head_dim) -> (B, heads, S, head_dim)
+        B, S, width = x.shape
+        return x.reshape(B, S, width // self.head_dim, self.head_dim).transpose(1, 2)
 
     def combine_heads(self, x: torch.Tensor) -> torch.Tensor:
-        B, _, S, _ = x.shape
-        return x.transpose(1, 2).reshape(B, S, self.num_heads * self.head_dim)
+        # (B, heads, S, head_dim) -> (B, S, heads * head_dim)
+        B, heads, S, _ = x.shape
+        return x.transpose(1, 2).reshape(B, S, heads * self.head_dim)
 
     def scaled_self_attention_naive(
         self,
@@ -168,8 +164,8 @@ class Qwen3GroupQueryAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         Q = self.q_norm(self.split_heads(self.q_proj(x)))
-        K = self.k_norm(self.split_kv_heads(self.k_proj(x)))
-        V = self.split_kv_heads(self.v_proj(x))
+        K = self.k_norm(self.split_heads(self.k_proj(x)))
+        V = self.split_heads(self.v_proj(x))
 
         Q = apply_rotary(Q, cos, sin)
         K = apply_rotary(K, cos, sin)
@@ -278,6 +274,43 @@ class Qwen3(nn.Module):
         for block in self.blocks:
             block.gqa.o_proj.weight.data.mul_(residual_scale)
             block.ffn.down_proj.weight.data.mul_(residual_scale)
+
+    def tp_plan(self, tp_size: int, vocab_parallel: bool = True) -> dict[str, list[nn.Module]]:
+        """
+        which modules tensor parallel splits and how (see
+        parallelism/tensor_parallel.py for the vocabulary). two regions per
+        block: attention (q/k/v column, o row) and the mlp (gate/up column,
+        down row).
+
+        q/k/v split by whole heads, and a kv head must stay with the q heads
+        that share it, so tp has to divide num_kv_heads. q_norm/k_norm are one
+        weight shared by every head: replicated, but each rank only sees its
+        own heads.
+
+        vocab_parallel shards the tied embedding / lm_head weight by vocab
+        rows; otherwise it is replicated. the norms on the residual stream
+        are always replicated.
+        """
+        gqa = self.blocks[0].gqa
+        assert gqa.num_kv_heads % tp_size == 0, (
+            f"tp={tp_size} must divide num_kv_heads={gqa.num_kv_heads}: shards "
+            "hold whole kv heads together with their q heads"
+        )
+        plan: dict[str, list[nn.Module]] = {
+            "column": [], "row": [], "regions": [], "shared": [],
+            "embeddings": [self.token_emb],
+            "heads": [self.lm_head],
+            "vocab": [self.token_emb, self.lm_head] if vocab_parallel else [],
+            "seq_local": [self.norm],
+        }
+        for block in self.blocks:
+            gqa, ffn = block.gqa, block.ffn
+            plan["column"] += [gqa.q_proj, gqa.k_proj, gqa.v_proj, ffn.gate_proj, ffn.up_proj]
+            plan["row"] += [gqa.o_proj, ffn.down_proj]
+            plan["regions"] += [gqa, ffn]
+            plan["shared"] += [gqa.q_norm, gqa.k_norm]
+            plan["seq_local"] += [block.norm1, block.norm2]
+        return plan
 
     def forward(
         self,

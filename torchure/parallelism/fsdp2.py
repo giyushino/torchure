@@ -51,6 +51,7 @@ from torchure.core.collective import (
     broadcast,
     reduce_scatter,
 )
+from torchure.core.meta import materialize
 from torchure.core.placement import Placements, Replicate, Shard, padded_chunk
 
 # unit lifecycle states
@@ -204,37 +205,21 @@ class FSDP:
         """
         give a meta model real storage: this rank's (padded) shard for every
         trainable param, full tensors for frozen params and buffers. values
-        are uninitialized. a meta Parameter can't be repointed at device
-        storage, so each is replaced, once, wherever it is registered -- which
-        keeps a tied weight tied.
+        are uninitialized.
         """
         coord = self.mesh.coordinate(self.shard_dim)
-        new: dict[int, nn.Parameter] = {}
-        for module in model.modules():
-            for name, old in module._parameters.items():
-                if old is None:
-                    continue
-                if id(old) not in new:
-                    shape = tuple(old.shape)
-                    if old.requires_grad:
-                        assert len(shape) > 0, f"param {name!r} is 0-dim; Shard(0) needs a dim"
-                        length, _, _ = padded_chunk(shape[0], self.group_size, coord)
-                        local = (length, *shape[1:])
-                    else:
-                        local = shape
-                    param = nn.Parameter(
-                        torch.empty(local, dtype=old.dtype, device=device),
-                        requires_grad=old.requires_grad,
-                    )
-                    new[id(old)] = param
-                    if old.requires_grad:
-                        self._meta_shapes[id(param)] = shape
-                module._parameters[name] = new[id(old)]
-            for name, buf in module._buffers.items():
-                if buf is not None:
-                    module._buffers[name] = torch.empty(
-                        buf.shape, dtype=buf.dtype, device=device
-                    )
+
+        def local_shape(param: nn.Parameter) -> tuple[int, ...]:
+            shape = tuple(param.shape)
+            if not param.requires_grad:
+                return shape
+            assert len(shape) > 0, "a 0-dim param can't be sharded; Shard(0) needs a dim"
+            length, _, _ = padded_chunk(shape[0], self.group_size, coord)
+            return (length, *shape[1:])
+
+        shapes = materialize(model, device, local_shape)
+        trainable = {id(p) for p in model.parameters() if p.requires_grad}
+        self._meta_shapes = {k: v for k, v in shapes.items() if k in trainable}
 
     def finish_init(self) -> None:
         """

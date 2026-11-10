@@ -22,6 +22,10 @@ class ARObjective():
         self.ignore_index = ignore_index
         self.fused_linear_ce = fused_linear_ce
         self.ce_chunk_size = ce_chunk_size
+        # the run's tensor parallel, if any (set by the trainer). the fused
+        # path reads the head weight directly, so it has to do what the head's
+        # tp hooks would have done
+        self.tp = None
 
     def compute_loss(self, model: nn.Module, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         if self.fused_linear_ce:
@@ -29,12 +33,15 @@ class ARObjective():
             # next-token shift; the last position has no target
             labels = torch.full_like(batch["labels"], self.ignore_index)
             labels[:, :-1] = batch["labels"][:, 1:]
+            if self.tp is not None:
+                hidden = self.tp.head_input(hidden)
             return fused_linear_cross_entropy(
                 hidden,
                 model.lm_head.weight,
                 labels,
                 self.ignore_index,
                 self.ce_chunk_size,
+                vocab_axis=self.tp.vocab_axis if self.tp is not None else None,
             )
 
         logits = model(batch["input_ids"])

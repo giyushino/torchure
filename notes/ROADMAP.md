@@ -41,7 +41,9 @@ phases 0 and 1 are done. phase 2 (fsdp2 + hsdp) is running and measured
 (FSDP2_H100.md); meta init (2.3), activation checkpointing (2.4) and uneven
 shards landed 11/10. phase 3 (sharded checkpointing with resharding load,
 async save) landed 11/9, so fsdp runs are resumable, and SIGTERM now
-checkpoints and exits. tensor parallel (phase 4) is next.
+checkpoints and exits. tensor parallel (phase 4) landed 11/10: tp over ddp
+or fsdp, vocab-parallel embedding with a parallel fused loss, sequence
+parallel, meta-device init. see the phase 4 status block.
 
 the 7/30 overlap trace (DDP.md) sharpens what phase 2 is *for* on this
 hardware: at 8 gpus the grad all-reduce (442 ms/step) no longer fits inside the
@@ -57,10 +59,11 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
 | `parallelism/data_parallel.py` | **done (phase 1).** bucketed grad all-reduce launched from `register_post_accumulate_grad_hook`, overlapped with backward; flat-buffer buckets with `.grad` repointed at views, oversized params (the tied embedding) reduced in place; dp=1 is a total no-op. `requires_sync` gives no_sync semantics for grad accumulation (1.3). grad parity + accumulation parity tested on gloo (`tests/data_parallel.py`) |
 | `core/grad_helper.py` | **done (phase 1.3).** `clip_grad_norm(params, mesh, max_norm, shard_dims=())` — placement-aware global grad-norm clip, returns the pre-clip norm for logging. local path matches `torch.nn.utils.clip_grad_norm_` and runs at memory-bandwidth limit (~10 ms / 2.1 GiB of grads, ~1.8% of a step); sharded path is what fsdp passes its shard axis to. tests in `tests/grad_helper.py` |
 | `parallelism/fsdp2.py` | **done (phase 2.2, 2.5).** per-param `Shard(0)` along `dp_shard`, hsdp when `dp_replicate > 1`. model-agnostic: the caller passes the unit modules (`units=model.blocks`), everything else is the root unit; fsdp reads no model attribute names. async gather with prefetch, reduce-scatter per microbatch, fp32 sharded masters + bf16 gathered buffers. uneven dims are zero-padded to equal shards. built from a meta-device model it allocates only this rank's shards (`finish_init()` after the model's init). hooks stand down for activation checkpointing's forward re-run. not done: dedicated comm stream, flat per-unit buffers. `tests/fsdp2.py` (gloo, in ci) |
+| `parallelism/tensor_parallel.py` | **done (phase 4).** model-agnostic engine: column linears `Shard(0)`, row linears `Shard(1)`, one forward and one backward collective per region, vocab-parallel embedding / head, sequence parallel, grads of shared params all_reduced in `sync()`. the model supplies the plan (`Qwen3.tp_plan`). composes with ddp or fsdp on the dp axes. builds from a meta model, so no rank holds full weights. `tests/tensor_parallel.py` (gloo, in ci) |
 | `parallelism/{context_parallel,expert_parallel}.py` | empty stubs |
 | models | qwen3 dense (0.6B validated, per-block compile, ~13k tps on A40, 73.5k global on 8x A40); llama3 stubbed |
 | trainer | single-gpu and dp through the same path (world_size=1 is not a special case). lifecycle build → parallelize → init → optimizer → data, so sharded init slots in without reordering. grad accumulation (`global_batch_size / (micro_batch_size × dp)` microbatches) and grad-norm clipping both land in `train_step`; `train_step` returns a metrics dict (loss, grad_norm). no eval loop, no metrics logger, `self.parallel` is DDP or FSDP behind one surface (`requires_sync`, `sync()`, `shard_dims`, `shard_dim_of`), so `train_step` and checkpointing never branch on the strategy. torch is seeded from `config.seed`: one shared seed through init, then a per-dp-rank stream (`seed + 1 + dp coord`) |
-| checkpointing | **done (phase 3).** per-step dirs, `resume: null \| "auto" \| <step>`, full state (model/optimizer/scheduler/dataloader/rng/config). sharded: one rank per shard writes `{model,optimizer}_shard{k}.pt`, load reshards any saved shard count onto the current layout (fsdp ↔ hsdp ↔ ddp) via mmap range reads. per-dp-rank dataloader and rng files. per-rank `.done{rank}of{world}` markers instead of a barrier. async by default (`checkpointing.async_save`): cpu snapshot, background-thread write. a mesh change needs `resume_dataloader: false`. the prefetcher's held batch is saved, so resume no longer skips one. SIGTERM → checkpoint at the next log point → exit (second SIGTERM kills). tests: `tests/checkpointer.py`, `tests/sharded_checkpoint.py` (both in ci) |
+| checkpointing | **done (phase 3; multi-axis layout 11/10).** shard layouts are a grid over one or more axes (dp_shard, tp), each piece a box of the full tensor, so any grid loads onto any other. per-step dirs, `resume: null \| "auto" \| <step>`, full state (model/optimizer/scheduler/dataloader/rng/config). sharded: one rank per shard writes `{model,optimizer}_shard{k}.pt`, load reshards any saved shard count onto the current layout (fsdp ↔ hsdp ↔ ddp) via mmap range reads. per-dp-rank dataloader and rng files. per-rank `.done{rank}of{world}` markers instead of a barrier. async by default (`checkpointing.async_save`): cpu snapshot, background-thread write. a mesh change needs `resume_dataloader: false`. the prefetcher's held batch is saved, so resume no longer skips one. SIGTERM → checkpoint at the next log point → exit (second SIGTERM kills). tests: `tests/checkpointer.py`, `tests/sharded_checkpoint.py` (both in ci) |
 | objectives | AR CE, with the chunked fused-linear-CE landed and wired into `ARObjective` (default on). backward scales the stashed grads in place — see DEV_LOG 7/27 |
 | dataloader | streaming HF + packing (stream + best-fit-decreasing) + stateful + CUDA prefetcher; splits by the mesh's dp coordinate. packing allows cross-document attention (no doc mask); prefetcher skips one batch on resume |
 
@@ -85,6 +88,13 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
   peers sharing a dp coordinate all write the same `rng_dp{c}.pt`, which
   wants a single designated writer once tp exists (same for the dataloader
   file).
+- fixed 11/10: with tp on, only the tp=0 peer writes the per-dp files.
+- fixed 11/10: a repeated SIGTERM within 5 s of the first counts as the same
+  request (a group-wide signal plus torchrun's forwarded copy used to read as
+  "kill now" and skip the checkpoint).
+- **tp replicas are never re-synced.** params replicated over tp (embedding,
+  block norms) stay equal only because peers compute identical grads from
+  identical inputs. a nondeterministic kernel would let them drift.
 - fixed 11/10: `tests/data_parallel.py`, `tests/grad_helper.py` and
   `tests/fsdp2.py` are in ci.
 - **sharded checkpointing at scale**: exercised at 0.6B on 2 gpus with compile
@@ -419,6 +429,59 @@ activations under plain TP; SP shards them along seq between the attention/mlp
 regions (all_gather on entry to attention/mlp, reduce_scatter on exit —
 exactly the fwd/bwd pairs above). worth doing immediately after TP works: it's
 a pure activation-memory win at zero extra comm volume.
+
+**status (2026-11-10): landed.**
+- `parallelism/tensor_parallel.py`: `TP(mesh, column, row, regions, shared,
+  embeddings, heads, vocab, seq_local, sequence_parallel=...)`. the
+  collectives are plain `autograd.Function` pairs behind
+  `torch.compiler.disable`, not functional collectives: a compiled block
+  splits into graphs around them. so exit criterion (d) is NOT met as
+  written; each block is several graphs.
+- `Qwen3.tp_plan(tp_size, vocab_parallel)` is the plan: q/k/v + gate/up
+  column, o + down row, gqa and ffn the regions, q_norm/k_norm shared, the
+  block norms `seq_local`. head counts in the attention reshapes are read off
+  the tensor. default `ffn_dim` is already a multiple of 256, so no rounding
+  knob was needed.
+- **vocab parallel** (config `tp.vocab_parallel`, default on): the tied
+  embedding / lm_head weight is `Shard(0)` over tp. lookup is masked per rank
+  and summed. the loss is `fused_linear_cross_entropy(vocab_axis=...)`: per
+  chunk, all_reduce(max) then all_reduce(sum) of per-row scalars, and one
+  all_reduce of grad_hidden at the end. full logits are never built; calling
+  `lm_head` as a module still returns them (all_gather), for eval.
+- **sequence parallel** (config `tp.sequence_parallel`, default on):
+  activations between regions are sharded along seq; region entry is
+  all_gather / reduce_scatter, exit is reduce_scatter / all_gather. the block
+  norms then get partial grads and are all_reduced with the shared params.
+  needs `seq_len % tp == 0`.
+- **fsdp x tp**: tp cuts first, fsdp shards what tp left on the rank
+  (`mesh: {"dp_shard": 2, "tp": 2}`, `parallelism: "fsdp"`,
+  `configs/qwen3_dense_climbmix_tp_h100.json`). grads: fsdp's reduce-scatter,
+  then `tp.sync()`. `clip_grad_norm(shard_dims_of=...)` sums each grad over
+  exactly the axes it is sharded on.
+- **init**: with tp on, the model is always built on meta. tp rewrites
+  shapes, fsdp (or `core.meta.materialize`) allocates this rank's shards,
+  init is seeded per (dp_shard, tp) cell, then `fsdp.finish_init()` and
+  `tp.finish_init(model)` broadcast what is replicated. no rank holds the
+  full weights.
+- **checkpointing**: `ShardLayout` is a grid of shard axes with per-param
+  `splits`; load copies box overlaps, so tp x fsdp checkpoints reshard to any
+  other grid or to unsharded. old single-axis metadata still loads.
+- verified on cpu (gloo, `tests/tensor_parallel.py`): equivalence with one
+  process holding the full model for ddp and fsdp (incl. padded shards) x
+  tp, with and without vocab / sequence parallel: logits, grads, activation
+  checkpointing, 3 clipped adamw steps with accumulation, checkpoint round
+  trip, and meta init (replicas agree, shards differ, the assembled model
+  matches a full one). `tests/sharded_checkpoint.py` crosses 8 tp layouts.
+- verified on gpu (compile + bf16, tiny model): every combination trains;
+  fsdp=2 x tp=2 with activation checkpointing gives the identical loss to
+  without; SIGTERM -> checkpoint -> resume ends on the same loss as an
+  uninterrupted run.
+- NOT measured: throughput. the gpus were shared with another job at 100%
+  util for every run. plain tp=2 on the tiny model ranged from 26k to 187k
+  tokens/s across runs (one gpu: 177k); vocab + sequence parallel ran at
+  ~16k. nothing here is a number to tune against. measure on idle gpus.
+- not built: hsdp x tp is untested (should follow from fsdp x tp);
+  tp-replicated params are never re-synced (see correctness debt).
 
 **exit criteria:** (a) tp=2 forward logits match single-gpu to fp32 tolerance
 on a tiny model, loss trajectory matches at 0.6B bf16; (b) fsdp2(dp_shard) ×

@@ -20,6 +20,7 @@ from torchure.checkpoint.checkpointer import Checkpointer, ShardLayout
 from torchure.core.collective import all_reduce
 from torchure.core.grad_helper import clip_grad_norm
 from torchure.core.mesh import Mesh
+from torchure.core.meta import materialize
 from torchure.dataloader.builder import build_dataloader, shutdown_workers
 from torchure.dataloader.prefetcher import CUDAPrefetcher
 from torchure.models.builder import build_model
@@ -27,6 +28,7 @@ from torchure.objectives.builder import build_objective
 from torchure.optimizer.builder import build_optimizer, build_scheduler
 from torchure.parallelism.data_parallel import DDP
 from torchure.parallelism.fsdp2 import FSDP
+from torchure.parallelism.tensor_parallel import TP
 from torchure.utils import debug_time, get_project_dir
 
 
@@ -81,19 +83,30 @@ class Trainer:
         torch.cuda.set_device(local_rank)
         self.mesh = self._build_mesh()
         self.dp_size = self.mesh.size("dp")
+        # the mesh drops size-1 axes, so no tp axis means no tensor parallel
+        self.tp_size = self.mesh.sizes.get("tp", 1)
 
         # read here, not in _parallelize, because it also gates checkpointing below
         self.parallelism = self.config.get("parallelism", "ddp")
+        self.tp: TP | None = None
 
         self.ignore_index = self.config["objective"]["config"]["ignore_index"]
         self.tokenizer = Tokenizer.from_pretrained(self.config["data"]["tokenizer"])
 
-        # ddp: build -> init -> replicate. fsdp: build on the meta device ->
-        # shard -> init the shards, so no rank ever holds the full weights.
+        # plain ddp: build -> init -> replicate. anything sharded (fsdp, tp or
+        # both): build on the meta device -> shard -> init the shards, so no
+        # rank ever holds the full weights. tp cuts first; fsdp then shards
+        # what tp left on the rank, and ddp replicates it.
         self.model = self._build_model()
-        if self.parallelism == "fsdp":
-            self.model = self._parallelize(self.model)
+        if self.parallelism == "fsdp" or self.tp_size > 1:
+            self.tp = self._tensor_parallelize(self.model)
+            if self.parallelism == "fsdp":
+                self.model = self._parallelize(self.model)
+            else:
+                materialize(self.model, self.device)
             self._init_shards(self.model)
+            if self.parallelism != "fsdp":
+                self.model = self._parallelize(self.model)
         else:
             self._init_weights(self.model)
             self.model = self._parallelize(self.model)
@@ -105,6 +118,8 @@ class Trainer:
         self._compile(self.model)
 
         self.objective = self._build_objective()
+        # the fused loss reads the head weight directly, bypassing tp's hooks
+        self.objective.tp = self.tp
         self.optimizer = self._build_optimizer(self.model)
         self.scheduler = self._build_scheduler(self.optimizer)
         self.num_train_steps = self.config["optimizer"]["scheduler"]["total_steps"]
@@ -165,6 +180,7 @@ class Trainer:
 
         # set by the SIGTERM handler train() installs; see _stop_requested
         self._sigterm = False
+        self._sigterm_at = 0.0
 
 
     def _setup_wandb(self) -> None:
@@ -209,8 +225,8 @@ class Trainer:
 
     def _build_model(self) -> nn.Module:
         model_cfg = self.config["model"]
-        if self.parallelism == "fsdp":
-            # shapes only: fsdp allocates this rank's shards, nothing more
+        if self.parallelism == "fsdp" or self.tp_size > 1:
+            # shapes only: this rank's shards are allocated later, nothing more
             with torch.device("meta"):
                 return build_model(model_cfg["name"], model_cfg["config"])
         return build_model(model_cfg["name"], model_cfg["config"])
@@ -258,6 +274,27 @@ class Trainer:
             )
         return model
 
+    def _tensor_parallelize(self, model: nn.Module) -> TP | None:
+        """
+        split the model's weights along the mesh's tp axis. the model says
+        which modules split which way. the model is still on meta here, so
+        this only rewrites shapes.
+
+        config `tp`: `vocab_parallel` (default true) shards the embedding /
+        lm_head weight by vocab rows; `sequence_parallel` (default true)
+        shards the activations between tp regions along the sequence.
+        """
+        if self.tp_size == 1:
+            return None
+        tp_cfg = self.config.get("tp", {})
+        sequence_parallel = tp_cfg.get("sequence_parallel", True)
+        seq_len = self.config["data"]["seq_len"]
+        assert not sequence_parallel or seq_len % self.tp_size == 0, (
+            f"sequence parallel needs seq_len {seq_len} divisible by tp {self.tp_size}"
+        )
+        plan = model.tp_plan(self.tp_size, vocab_parallel=tp_cfg.get("vocab_parallel", True))
+        return TP(self.mesh, **plan, dim="tp", sequence_parallel=sequence_parallel)
+
     def _compile(self, model: nn.Module) -> None:
         """
         compile per transformer block: one graph reused across identical blocks,
@@ -281,13 +318,21 @@ class Trainer:
 
     def _init_shards(self, model: nn.Module) -> None:
         """
-        init a model fsdp materialized from meta: each rank fills only its own
-        shards. seeded per shard coordinate, so shards differ from each other
-        while hsdp replicas of one shard agree.
+        init a model materialized from meta: each rank fills only its own
+        shards. seeded per (dp_shard, tp) cell, so shards differ from each
+        other; the finish_init calls then make everything that is replicated
+        (hsdp replicas, params tp doesn't cut, buffers) agree.
         """
-        torch.manual_seed(self.seed + self.mesh.coordinate("dp_shard"))
+        shard = self.mesh.coordinate("dp_shard") if self.parallelism == "fsdp" else 0
+        cell = shard * self.tp_size
+        if self.tp is not None:
+            cell += self.mesh.coordinate("tp")
+        torch.manual_seed(self.seed + cell)
         model.init_weights()
-        self.parallel.finish_init()
+        if self.parallelism == "fsdp":
+            self.parallel.finish_init()
+        if self.tp is not None:
+            self.tp.finish_init(model)
 
     def _build_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
         optim_cfg = self.config["optimizer"]
@@ -355,19 +400,29 @@ class Trainer:
     
     def _shard_layout(self) -> ShardLayout:
         """how this run shards model/optimizer state, for the checkpointer."""
-        return ShardLayout.of(self.model, self.parallel, self.mesh)
+        return ShardLayout.of(self.model, self.parallel, self.mesh, tp=self.tp)
 
     def _writes_model_state(self) -> bool:
         """
         one rank per shard writes model/optimizer state: the one at coordinate
-        0 on every dp axis the state is replicated (not sharded) over. that is
-        rank 0 alone under ddp, and the dp_replicate=0 row under fsdp/hsdp.
+        0 on every axis the state is replicated (not sharded) over. that is
+        rank 0 alone under ddp, the dp_replicate=0 row under fsdp/hsdp, and
+        with tp on, one rank per tp coordinate of those.
         """
+        shard_dims = self.parallel.shard_dims + (self.tp.shard_dims if self.tp else ())
         return all(
             self.mesh.coordinate(axis) == 0
-            for axis in ("dp_replicate", "dp_shard")
-            if axis not in self.parallel.shard_dims
+            for axis in ("dp_replicate", "dp_shard", "tp")
+            if axis in self.mesh.sizes and axis not in shard_dims
         )
+
+    def _writes_dp_state(self) -> bool:
+        """
+        rng, dataloader and prefetcher state is one file per dp coordinate.
+        tp peers share that coordinate and hold identical state, so only the
+        first of them writes it.
+        """
+        return self.tp_size == 1 or self.mesh.coordinate("tp") == 0
 
     @debug_time
     def checkpoint(self, step: int) -> None:
@@ -388,31 +443,39 @@ class Trainer:
                 },
                 step,
             )
-        dp_rank = self.mesh.coordinate("dp")
-        self.checkpointer.save_rng(
-            {
-                "cpu_rng": torch.get_rng_state(),
-                "cuda_rng": torch.cuda.get_rng_state(self.device),
-            },
-            step,
-            dp_rank,
-        )
-        self.checkpointer.save_dataloader(self.dataloader, step, dp_rank)
-        # the loader is one batch ahead of training; that batch is saved here
-        self.checkpointer.save_prefetcher(self.prefetcher.state_dict(), step, dp_rank)
+        if self._writes_dp_state():
+            dp_rank = self.mesh.coordinate("dp")
+            self.checkpointer.save_rng(
+                {
+                    "cpu_rng": torch.get_rng_state(),
+                    "cuda_rng": torch.cuda.get_rng_state(self.device),
+                },
+                step,
+                dp_rank,
+            )
+            self.checkpointer.save_dataloader(self.dataloader, step, dp_rank)
+            # the loader is one batch ahead of training; that batch is saved here
+            self.checkpointer.save_prefetcher(self.prefetcher.state_dict(), step, dp_rank)
         self.checkpointer.commit(step)
 
     def _on_sigterm(self, signum, frame) -> None:
         """
-        first SIGTERM: checkpoint and exit at the next log point. a second one
+        first SIGTERM: checkpoint and exit at the next log point. a later one
         means "now": put the default handler back and die.
+
+        one request often arrives twice within moments: a signal to the whole
+        process group reaches this rank directly and again when torchrun
+        forwards its own copy. repeats inside a short window count as one.
 
         dataloader workers ignore SIGTERM, so a signal sent to the whole
         process group still leaves the run able to reach that log point.
         """
-        if self._sigterm:
+        now = time.monotonic()
+        if self._sigterm and now - self._sigterm_at > 5.0:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             os.kill(os.getpid(), signal.SIGTERM)
+        if not self._sigterm:
+            self._sigterm_at = now
         self._sigterm = True
 
     def _stop_requested(self) -> bool:
@@ -425,6 +488,8 @@ class Trainer:
         flag = torch.tensor(float(self._sigterm), device=self.device)
         if self.dp_size > 1:
             all_reduce(flag, self.mesh, "dp", "max")
+        if self.tp_size > 1:
+            all_reduce(flag, self.mesh, "tp", "max")
         return flag.item() > 0
             
     def _resume(self) -> int:
@@ -511,10 +576,19 @@ class Trainer:
         self.parallel.requires_sync = True
         loss += self.micro_train_step()
         self.parallel.sync()
-        grad_norm = clip_grad_norm(
-            self.model.parameters(), self.mesh, self.max_norm,
-            shard_dims=self.parallel.shard_dims,
-        )
+        if self.tp is None:
+            grad_norm = clip_grad_norm(
+                self.model.parameters(), self.mesh, self.max_norm,
+                shard_dims=self.parallel.shard_dims,
+            )
+        else:
+            # after the dp sync: it reduces these same grad tensors in the background
+            self.tp.sync()
+            dp_dims = self.parallel.shard_dims
+            grad_norm = clip_grad_norm(
+                self.model.parameters(), self.mesh, self.max_norm,
+                shard_dims_of=lambda p: dp_dims + self.tp.shard_dims_of(p),
+            )
         self.optimizer.step()
         self.optimizer.zero_grad()
         self.scheduler.step()

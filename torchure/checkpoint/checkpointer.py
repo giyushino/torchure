@@ -6,20 +6,22 @@ model and optimizer state may be sharded (fsdp). a `ShardLayout` says how THIS
 run lays params out; with the default layout nothing is sharded and the files
 are the plain `model.pt` / `optimizer.pt` this module has always written.
 
-sharded save (num_shards = N > 1): the rank at shard coordinate c writes
-`model_shard{c}.pt` / `optimizer_shard{c}.pt`, its local state_dict as is.
-coordinate 0 also writes `{model,optimizer}_shards.json`, recording N and
-which tensors are split along which dim. everything not listed there is
-replicated and read from shard 0.
+sharded save: a layout has one or more shard AXES (fsdp's dp_shard, tensor
+parallel's tp, or both), and the ranks form a grid over them. the rank at grid
+cell k (row-major) writes `model_shard{k}.pt` / `optimizer_shard{k}.pt`, its
+local state_dict as is. cell 0 also writes `{model,optimizer}_shards.json`:
+the grid, each tensor's unsharded shape, and its `splits` -- which axes cut
+it, along which tensor dim, outermost first. a tensor an axis doesn't cut is
+replicated along that axis and read from coordinate 0.
 
-uneven shards are stored as fsdp holds them, zero-padded to equal length; the
-metadata records each sharded tensor's true size so load can trim the padding
-and re-pad for the current shard count.
+every piece therefore owns a BOX of the full tensor. uneven shards are stored
+as fsdp holds them, zero-padded to equal length; the recorded shape says
+where the real rows end.
 
-load reshards: a checkpoint saved at any N (including the unsharded N=1) loads
-onto any current layout. files are opened with mmap, and each rank reads only
-the byte range of each tensor it owns, so no rank ever materializes the full
-model to take its slice.
+load reshards: a checkpoint saved on any grid (including the unsharded one)
+loads onto any current layout, by copying the overlap of each saved box with
+the box this rank wants. files are opened with mmap, so each rank reads only
+the byte ranges it owns and no rank materializes the full model.
 
 optimizer state follows its param: a state tensor shaped like the param
 (adam's exp_avg / exp_avg_sq) is sharded the same way; anything else (the
@@ -36,7 +38,9 @@ wait() block on the previous one and re-raise anything it failed with. call
 wait() before exiting.
 """
 import copy
+import itertools
 import json
+import math
 import os
 import re
 import threading
@@ -48,92 +52,164 @@ import torch.nn as nn
 from torchure.core.placement import padded_chunk
 
 
+Splits = tuple[tuple[int, int], ...]   # ((shard axis index, tensor dim), ...) outermost first
+
+
 @dataclass(frozen=True)
 class ShardLayout:
     """
-    how the current run shards params: `dims` maps id(param) -> the tensor dim
-    it is split along and `sizes` -> its true unsharded length along that dim
-    (a local shard may be padded), for sharded params only. this rank holds
-    chunk `coord` of `num_shards`. the default is the unsharded layout.
+    how the current run shards params. `counts` is the number of shards along
+    each shard axis and `coords` this rank's cell. for sharded params only,
+    `splits` maps id(param) -> the (axis, tensor dim) cuts applied to it,
+    outermost first, and `shapes` -> its unsharded shape (a local shard may
+    be padded). the default is the unsharded layout.
     """
 
-    num_shards: int = 1
-    coord: int = 0
-    dims: dict[int, int] = field(default_factory=dict)
-    sizes: dict[int, int] = field(default_factory=dict)
+    counts: tuple[int, ...] = ()
+    coords: tuple[int, ...] = ()
+    splits: dict[int, Splits] = field(default_factory=dict)
+    shapes: dict[int, tuple[int, ...]] = field(default_factory=dict)
+
+    @property
+    def num_shards(self) -> int:
+        return math.prod(self.counts)
+
+    @property
+    def index(self) -> int:
+        """this rank's cell, row-major: which shard file it writes."""
+        return _flat(self.coords, self.counts)
 
     @classmethod
-    def of(cls, model: nn.Module, parallel, mesh) -> "ShardLayout":
+    def of(cls, model: nn.Module, parallel, mesh, tp=None) -> "ShardLayout":
         """
-        the layout a parallelism strategy (DDP / FSDP: anything exposing
-        `shard_dims` and `shard_dim_of`) gives `model` on this rank.
+        the layout `model` has on this rank under a data-parallel strategy
+        (DDP / FSDP) and, optionally, tensor parallel on top. both expose
+        `shard_dims`, `shard_dim_of` and `full_shape_of`. tp cuts first: fsdp
+        shards whatever tp left on the rank.
         """
-        if not parallel.shard_dims:
+        sources = [s for s in (tp, parallel) if s is not None and s.shard_dims]
+        if not sources:
             return cls()
-        assert len(parallel.shard_dims) == 1, (
-            f"one shard axis supported, got {parallel.shard_dims}"
-        )
-        axis = parallel.shard_dims[0]
-        dims, sizes = {}, {}
+        for source in sources:
+            assert len(source.shard_dims) == 1, (
+                f"one shard axis per strategy supported, got {source.shard_dims}"
+            )
+        axes = [source.shard_dims[0] for source in sources]
+        splits, shapes = {}, {}
         for param in model.parameters():
-            dim = parallel.shard_dim_of(param)
-            if dim is not None:
-                dims[id(param)] = dim
-                sizes[id(param)] = parallel.full_shape_of(param)[dim]
-        return cls(mesh.size(axis), mesh.coordinate(axis), dims, sizes)
+            cuts, shape = [], None
+            for axis, source in enumerate(sources):
+                dim = source.shard_dim_of(param)
+                if dim is None:
+                    continue
+                cuts.append((axis, dim))
+                if shape is None:
+                    # the outermost strategy that cuts it saw it whole
+                    shape = tuple(source.full_shape_of(param))
+            if cuts:
+                splits[id(param)] = tuple(cuts)
+                shapes[id(param)] = shape
+        return cls(
+            tuple(mesh.size(a) for a in axes),
+            tuple(mesh.coordinate(a) for a in axes),
+            splits,
+            shapes,
+        )
 
 
 UNSHARDED = ShardLayout()
 
 
+def _flat(coords, counts) -> int:
+    index = 0
+    for coord, count in zip(coords, counts, strict=True):
+        index = index * count + coord
+    return index
+
+
+def _box(shape, splits, counts, coords) -> tuple[list[int], list[int], list[int]]:
+    """
+    the part of a tensor of `shape` held at grid cell `coords`: per tensor
+    dim, (first index, number of real entries, stored length). the stored
+    length exceeds the real one where the innermost cut pads.
+    """
+    lo, size, stored = [0] * len(shape), list(shape), list(shape)
+    for axis, dim in splits:
+        length, start, valid = padded_chunk(size[dim], counts[axis], coords[axis])
+        lo[dim] += start
+        size[dim] = valid
+        stored[dim] = length
+    return lo, size, stored
+
+
 def _read(
-    pieces: list[torch.Tensor],
-    saved_dim: int | None,
-    saved_size: int | None,
-    want_dim: int | None,
+    shards: list[dict],
+    pick,
+    shape: tuple[int, ...],
+    saved_splits: Splits,
+    saved_counts: tuple[int, ...],
+    want_splits: Splits,
     layout: ShardLayout,
 ) -> torch.Tensor:
     """
-    one tensor of the current layout, from its saved pieces.
-
-    `pieces` concatenate along `saved_dim` into the full tensor (a single
-    piece when it was saved replicated), followed by any shard padding past
-    `saved_size`. returns the full tensor when `want_dim` is None, else this
-    rank's chunk along `want_dim`, zero-padded to the common chunk length.
-    always an owning copy: the inputs are mmap views, and a view handed to
-    load_state_dict's deepcopy would drag its whole backing storage along.
+    one tensor of the current layout, from its saved pieces. `pick(shard)`
+    fetches the tensor from one saved shard file. returns this rank's box of
+    it (the whole tensor when `want_splits` is empty), zero-padded to the
+    stored length. always an owning copy: the inputs are mmap views, and a
+    view handed to load_state_dict's deepcopy would drag its whole backing
+    storage along.
     """
-    if saved_dim is None:
-        pieces, saved_size = pieces[:1], None
+    want_lo, want_size, want_stored = _box(shape, want_splits, layout.counts, layout.coords)
+    cut_axes = {axis for axis, _ in saved_splits}
+    # along an axis that doesn't cut this tensor every cell holds the same
+    # copy; read coordinate 0
+    cells = itertools.product(
+        *(range(n) if axis in cut_axes else (0,) for axis, n in enumerate(saved_counts))
+    )
+    out = None
+    for cell in cells:
+        lo, size, _ = _box(shape, saved_splits, saved_counts, cell)
+        a = [max(x, y) for x, y in zip(lo, want_lo, strict=True)]
+        b = [
+            min(x + n, y + m)
+            for x, n, y, m in zip(lo, size, want_lo, want_size, strict=True)
+        ]
+        if any(hi <= low for low, hi in zip(a, b, strict=True)):
+            continue
+        piece = pick(shards[_flat(cell, saved_counts)])
+        src = piece[tuple(slice(low - x, hi - x) for low, hi, x in zip(a, b, lo, strict=True))]
+        if list(src.shape) == want_stored:
+            return src.clone()
+        if out is None:
+            out = piece.new_zeros(want_stored)
+        out[tuple(slice(low - x, hi - x) for low, hi, x in zip(a, b, want_lo, strict=True))] = src
+    if out is None:
+        # this rank's box is all padding
+        out = pick(shards[0]).new_zeros(want_stored)
+    return out
 
-    if want_dim is None or (len(pieces) > 1 and saved_dim != want_dim):
-        # the whole tensor: wanted as is, or saved along one dim and wanted
-        # along another, which leaves no range to pick out
-        full = pieces[0] if len(pieces) == 1 else torch.cat(pieces, saved_dim)
-        if saved_size is not None:
-            full = full.narrow(saved_dim, 0, saved_size)
-        if want_dim is None:
-            return full.clone()
-        pieces, saved_size = [full], None
 
-    total = saved_size
-    if total is None:
-        total = sum(p.shape[want_dim] for p in pieces)
-    length, start, valid = padded_chunk(total, layout.num_shards, layout.coord)
-    end = start + valid
-
-    out, offset = [], 0
-    for piece in pieces:
-        n = piece.shape[want_dim]
-        lo, hi = max(start, offset), min(end, offset + n)
-        if lo < hi:
-            out.append(piece.narrow(want_dim, lo - offset, hi - lo))
-        offset += n
-    if valid < length:
-        shape = list(pieces[0].shape)
-        shape[want_dim] = length - valid
-        out.append(pieces[0].new_zeros(shape))
-    return out[0].clone() if len(out) == 1 else torch.cat(out, want_dim)
+def _legacy_meta(meta: dict, shards: list[dict], pick_of) -> dict:
+    """
+    the single-axis metadata written before layouts had more than one axis
+    (`num_shards`, `dims`, optional `sizes`), in the current form.
+    `pick_of(name, key)` fetches a tensor from a shard.
+    """
+    out = {"counts": [meta["num_shards"]], "splits": {}, "shapes": {}}
+    if any(isinstance(v, dict) for v in meta["dims"].values()):
+        out["followers"] = {}
+    for name, dims in meta["dims"].items():
+        keys = dims if isinstance(dims, dict) else {None: dims}
+        dim = next(iter(keys.values()))
+        sample = [pick_of(name, next(iter(keys)))(shard) for shard in shards]
+        shape = list(sample[0].shape)
+        # no size recorded: written before padding existed, so nothing is padded
+        shape[dim] = meta.get("sizes", {}).get(name, sum(p.shape[dim] for p in sample))
+        out["splits"][name] = [[0, dim]]
+        out["shapes"][name] = shape
+        if isinstance(dims, dict):
+            out["followers"][name] = list(dims)
+    return out
 
 
 def _snapshot(obj):
@@ -253,66 +329,64 @@ class Checkpointer:
             mmap=mmap,
         )
 
-    def _save_shard(
-        self, state: dict, step: int, stem: str, layout: ShardLayout, dims: dict, sizes: dict
-    ) -> None:
-        """this rank's shard of `state`, plus the metadata if it is shard 0."""
+    def _save_shard(self, state: dict, step: int, stem: str, layout: ShardLayout, meta: dict) -> None:
+        """this rank's shard of `state`, plus the metadata if it is cell 0."""
         step_dir = self._step_dir(step, create=True)
         if layout.num_shards == 1:
             self._put(state, step, f"{stem}.pt")
             return
-        self._put(state, step, f"{stem}_shard{layout.coord}.pt")
-        if layout.coord == 0:
+        self._put(state, step, f"{stem}_shard{layout.index}.pt")
+        if layout.index == 0:
             # tiny, so written inline even when async; the marker gates it
-            meta = {"num_shards": layout.num_shards, "dims": dims, "sizes": sizes}
+            meta = {"counts": list(layout.counts), **meta}
             with open(os.path.join(step_dir, f"{stem}_shards.json"), "w") as f:
                 json.dump(meta, f, indent=1)
 
-    def _load_shards(self, step: int, stem: str) -> tuple[list[dict], dict, dict]:
-        """every shard's saved state (mmapped), and the saved dims and sizes."""
+    def _load_shards(self, step: int, stem: str, pick_of) -> tuple[list[dict], dict]:
+        """every shard's saved state (mmapped), and the saved metadata."""
         meta_path = os.path.join(self._step_dir(step), f"{stem}_shards.json")
         if not os.path.exists(meta_path):
-            return [self._load(step, f"{stem}.pt", mmap=True)], {}, {}
+            return [self._load(step, f"{stem}.pt", mmap=True)], {"counts": [], "splits": {}, "shapes": {}}
         with open(meta_path) as f:
             meta = json.load(f)
-        shards = [
-            self._load(step, f"{stem}_shard{k}.pt", mmap=True)
-            for k in range(meta["num_shards"])
-        ]
-        # no sizes: written before padding existed, so nothing is padded
-        return shards, meta["dims"], meta.get("sizes", {})
+        count = meta["num_shards"] if "num_shards" in meta else math.prod(meta["counts"])
+        shards = [self._load(step, f"{stem}_shard{k}.pt", mmap=True) for k in range(count)]
+        if "num_shards" in meta:
+            meta = _legacy_meta(meta, shards, pick_of)
+        return shards, meta
 
     def save_model(self, model: nn.Module, step: int, layout: ShardLayout = UNSHARDED) -> None:
         # remove_duplicate=False: a tied weight is two state_dict keys
         named = [
             (name, p)
             for name, p in model.named_parameters(remove_duplicate=False)
-            if id(p) in layout.dims
+            if id(p) in layout.splits
         ]
-        dims = {name: layout.dims[id(p)] for name, p in named}
-        sizes = {name: layout.sizes[id(p)] for name, p in named}
-        self._save_shard(model.state_dict(), step, "model", layout, dims, sizes)
+        meta = {
+            "splits": {name: layout.splits[id(p)] for name, p in named},
+            "shapes": {name: layout.shapes[id(p)] for name, p in named},
+        }
+        self._save_shard(model.state_dict(), step, "model", layout, meta)
 
     def save_optimizer(
         self, optimizer: torch.optim.Optimizer, step: int, layout: ShardLayout = UNSHARDED
     ) -> None:
         state = optimizer.state_dict()
         params = [p for group in optimizer.param_groups for p in group["params"]]
-        dims: dict[str, dict[str, int]] = {}
-        sizes: dict[str, int] = {}
+        meta: dict = {"splits": {}, "shapes": {}, "followers": {}}
         for idx, param_state in state["state"].items():
             param = params[idx]
-            if id(param) not in layout.dims:
+            if id(param) not in layout.splits:
                 continue
-            followers = {
-                key: layout.dims[id(param)]
-                for key, value in param_state.items()
+            followers = [
+                key for key, value in param_state.items()
                 if torch.is_tensor(value) and value.shape == param.shape
-            }
+            ]
             if followers:
-                dims[str(idx)] = followers
-                sizes[str(idx)] = layout.sizes[id(param)]
-        self._save_shard(state, step, "optimizer", layout, dims, sizes)
+                meta["splits"][str(idx)] = layout.splits[id(param)]
+                meta["shapes"][str(idx)] = layout.shapes[id(param)]
+                meta["followers"][str(idx)] = followers
+        self._save_shard(state, step, "optimizer", layout, meta)
 
     def save_scheduler(self, scheduler: torch.optim.lr_scheduler.LRScheduler, step: int) -> None:
         self._save(scheduler, step, "scheduler.pt")
@@ -348,50 +422,62 @@ class Checkpointer:
         return self._load(step, "trainer.pt")
 
     def load_model(self, model: nn.Module, step: int, layout: ShardLayout = UNSHARDED) -> None:
-        shards, saved_dims, saved_sizes = self._load_shards(step, "model")
-        want_dims = {
-            name: layout.dims[id(p)]
+        shards, meta = self._load_shards(
+            step, "model", lambda name, key: (lambda shard: shard[name])
+        )
+        want = {
+            name: layout.splits[id(p)]
             for name, p in model.named_parameters(remove_duplicate=False)
-            if id(p) in layout.dims
+            if id(p) in layout.splits
         }
-        state = {
-            name: _read(
-                [shard[name] for shard in shards],
-                saved_dims.get(name),
-                saved_sizes.get(name),
-                want_dims.get(name),
+        state = {}
+        for name, value in shards[0].items():
+            state[name] = _read(
+                shards,
+                lambda shard, name=name: shard[name],
+                tuple(meta["shapes"].get(name, value.shape)),
+                tuple(map(tuple, meta["splits"].get(name, ()))),
+                tuple(meta["counts"]),
+                want.get(name, ()),
                 layout,
             )
-            for name in shards[0]
-        }
         model.load_state_dict(state)
 
     def load_optimizer(
         self, optimizer: torch.optim.Optimizer, step: int, layout: ShardLayout = UNSHARDED
     ) -> None:
-        shards, saved_dims, saved_sizes = self._load_shards(step, "optimizer")
+        shards, meta = self._load_shards(
+            step, "optimizer",
+            lambda idx, key: (lambda shard: shard["state"][int(idx)][key]),
+        )
         params = [p for group in optimizer.param_groups for p in group["params"]]
         state: dict = {}
         for idx, saved in shards[0]["state"].items():
             param = params[idx]
-            want_dim = layout.dims.get(id(param))
+            want = layout.splits.get(id(param), ())
             # the param's unsharded shape, to spot state that follows it when
             # the checkpoint itself was saved unsharded
-            full_shape = list(param.shape)
-            if want_dim is not None:
-                full_shape[want_dim] = layout.sizes[id(param)]
+            full_shape = tuple(layout.shapes.get(id(param), param.shape))
+            followers = meta.get("followers", {}).get(str(idx), ())
             state[idx] = {}
             for key, value in saved.items():
                 if not torch.is_tensor(value):
                     state[idx][key] = value
                     continue
-                saved_dim = saved_dims.get(str(idx), {}).get(key)
-                follows = saved_dim is not None or list(value.shape) == full_shape
+                if key in followers:
+                    shape = tuple(meta["shapes"][str(idx)])
+                    saved_splits = tuple(map(tuple, meta["splits"][str(idx)]))
+                    follows = True
+                else:
+                    shape, saved_splits = tuple(value.shape), ()
+                    follows = shape == full_shape
                 state[idx][key] = _read(
-                    [shard["state"][idx][key] for shard in shards],
-                    saved_dim,
-                    saved_sizes.get(str(idx)),
-                    want_dim if follows else None,
+                    shards,
+                    lambda shard, idx=idx, key=key: shard["state"][idx][key],
+                    shape,
+                    saved_splits,
+                    tuple(meta["counts"]),
+                    want if follows else (),
                     layout,
                 )
         optimizer.load_state_dict(
