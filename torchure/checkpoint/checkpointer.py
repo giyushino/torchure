@@ -12,6 +12,10 @@ coordinate 0 also writes `{model,optimizer}_shards.json`, recording N and
 which tensors are split along which dim. everything not listed there is
 replicated and read from shard 0.
 
+uneven shards are stored as fsdp holds them, zero-padded to equal length; the
+metadata records each sharded tensor's true size so load can trim the padding
+and re-pad for the current shard count.
+
 load reshards: a checkpoint saved at any N (including the unsharded N=1) loads
 onto any current layout. files are opened with mmap, and each rank reads only
 the byte range of each tensor it owns, so no rank ever materializes the full
@@ -41,18 +45,22 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 
+from torchure.core.placement import padded_chunk
+
 
 @dataclass(frozen=True)
 class ShardLayout:
     """
     how the current run shards params: `dims` maps id(param) -> the tensor dim
-    it is split along, for sharded params only. this rank holds chunk `coord`
-    of `num_shards`. the default is the unsharded layout.
+    it is split along and `sizes` -> its true unsharded length along that dim
+    (a local shard may be padded), for sharded params only. this rank holds
+    chunk `coord` of `num_shards`. the default is the unsharded layout.
     """
 
     num_shards: int = 1
     coord: int = 0
     dims: dict[int, int] = field(default_factory=dict)
+    sizes: dict[int, int] = field(default_factory=dict)
 
     @classmethod
     def of(cls, model: nn.Module, parallel, mesh) -> "ShardLayout":
@@ -66,47 +74,53 @@ class ShardLayout:
             f"one shard axis supported, got {parallel.shard_dims}"
         )
         axis = parallel.shard_dims[0]
-        dims = {}
+        dims, sizes = {}, {}
         for param in model.parameters():
             dim = parallel.shard_dim_of(param)
             if dim is not None:
                 dims[id(param)] = dim
-        return cls(mesh.size(axis), mesh.coordinate(axis), dims)
+                sizes[id(param)] = parallel.full_shape_of(param)[dim]
+        return cls(mesh.size(axis), mesh.coordinate(axis), dims, sizes)
 
 
 UNSHARDED = ShardLayout()
 
 
 def _read(
-    pieces: list[torch.Tensor], saved_dim: int | None, want_dim: int | None,
+    pieces: list[torch.Tensor],
+    saved_dim: int | None,
+    saved_size: int | None,
+    want_dim: int | None,
     layout: ShardLayout,
 ) -> torch.Tensor:
     """
     one tensor of the current layout, from its saved pieces.
 
     `pieces` concatenate along `saved_dim` into the full tensor (a single
-    piece when it was saved replicated). returns the full tensor when
-    `want_dim` is None, else this rank's chunk along `want_dim`. always an
-    owning copy: the inputs are mmap views, and a view handed to
+    piece when it was saved replicated), followed by any shard padding past
+    `saved_size`. returns the full tensor when `want_dim` is None, else this
+    rank's chunk along `want_dim`, zero-padded to the common chunk length.
+    always an owning copy: the inputs are mmap views, and a view handed to
     load_state_dict's deepcopy would drag its whole backing storage along.
     """
     if saved_dim is None:
-        pieces = pieces[:1]
-    if want_dim is None:
-        return pieces[0].clone() if len(pieces) == 1 else torch.cat(pieces, saved_dim)
+        pieces, saved_size = pieces[:1], None
 
-    if len(pieces) > 1 and saved_dim != want_dim:
-        # saved along one dim, wanted along another: no range to pick out
-        pieces, saved_dim = [torch.cat(pieces, saved_dim)], None
+    if want_dim is None or (len(pieces) > 1 and saved_dim != want_dim):
+        # the whole tensor: wanted as is, or saved along one dim and wanted
+        # along another, which leaves no range to pick out
+        full = pieces[0] if len(pieces) == 1 else torch.cat(pieces, saved_dim)
+        if saved_size is not None:
+            full = full.narrow(saved_dim, 0, saved_size)
+        if want_dim is None:
+            return full.clone()
+        pieces, saved_size = [full], None
 
-    total = sum(p.shape[want_dim] for p in pieces)
-    assert total % layout.num_shards == 0, (
-        f"dim {want_dim} of size {total} is not divisible by "
-        f"num_shards={layout.num_shards}"
-    )
-    length = total // layout.num_shards
-    start = layout.coord * length
-    end = start + length
+    total = saved_size
+    if total is None:
+        total = sum(p.shape[want_dim] for p in pieces)
+    length, start, valid = padded_chunk(total, layout.num_shards, layout.coord)
+    end = start + valid
 
     out, offset = [], 0
     for piece in pieces:
@@ -115,6 +129,10 @@ def _read(
         if lo < hi:
             out.append(piece.narrow(want_dim, lo - offset, hi - lo))
         offset += n
+    if valid < length:
+        shape = list(pieces[0].shape)
+        shape[want_dim] = length - valid
+        out.append(pieces[0].new_zeros(shape))
     return out[0].clone() if len(out) == 1 else torch.cat(out, want_dim)
 
 
@@ -235,7 +253,9 @@ class Checkpointer:
             mmap=mmap,
         )
 
-    def _save_shard(self, state: dict, step: int, stem: str, layout: ShardLayout, dims: dict) -> None:
+    def _save_shard(
+        self, state: dict, step: int, stem: str, layout: ShardLayout, dims: dict, sizes: dict
+    ) -> None:
         """this rank's shard of `state`, plus the metadata if it is shard 0."""
         step_dir = self._step_dir(step, create=True)
         if layout.num_shards == 1:
@@ -244,31 +264,34 @@ class Checkpointer:
         self._put(state, step, f"{stem}_shard{layout.coord}.pt")
         if layout.coord == 0:
             # tiny, so written inline even when async; the marker gates it
-            meta = {"num_shards": layout.num_shards, "dims": dims}
+            meta = {"num_shards": layout.num_shards, "dims": dims, "sizes": sizes}
             with open(os.path.join(step_dir, f"{stem}_shards.json"), "w") as f:
                 json.dump(meta, f, indent=1)
 
-    def _load_shards(self, step: int, stem: str) -> tuple[list[dict], dict]:
-        """every shard's saved state (mmapped) and the saved-sharding metadata."""
+    def _load_shards(self, step: int, stem: str) -> tuple[list[dict], dict, dict]:
+        """every shard's saved state (mmapped), and the saved dims and sizes."""
         meta_path = os.path.join(self._step_dir(step), f"{stem}_shards.json")
         if not os.path.exists(meta_path):
-            return [self._load(step, f"{stem}.pt", mmap=True)], {}
+            return [self._load(step, f"{stem}.pt", mmap=True)], {}, {}
         with open(meta_path) as f:
             meta = json.load(f)
         shards = [
             self._load(step, f"{stem}_shard{k}.pt", mmap=True)
             for k in range(meta["num_shards"])
         ]
-        return shards, meta["dims"]
+        # no sizes: written before padding existed, so nothing is padded
+        return shards, meta["dims"], meta.get("sizes", {})
 
     def save_model(self, model: nn.Module, step: int, layout: ShardLayout = UNSHARDED) -> None:
-        dims = {
-            # remove_duplicate=False: a tied weight is two state_dict keys
-            name: layout.dims[id(p)]
+        # remove_duplicate=False: a tied weight is two state_dict keys
+        named = [
+            (name, p)
             for name, p in model.named_parameters(remove_duplicate=False)
             if id(p) in layout.dims
-        }
-        self._save_shard(model.state_dict(), step, "model", layout, dims)
+        ]
+        dims = {name: layout.dims[id(p)] for name, p in named}
+        sizes = {name: layout.sizes[id(p)] for name, p in named}
+        self._save_shard(model.state_dict(), step, "model", layout, dims, sizes)
 
     def save_optimizer(
         self, optimizer: torch.optim.Optimizer, step: int, layout: ShardLayout = UNSHARDED
@@ -276,6 +299,7 @@ class Checkpointer:
         state = optimizer.state_dict()
         params = [p for group in optimizer.param_groups for p in group["params"]]
         dims: dict[str, dict[str, int]] = {}
+        sizes: dict[str, int] = {}
         for idx, param_state in state["state"].items():
             param = params[idx]
             if id(param) not in layout.dims:
@@ -287,7 +311,8 @@ class Checkpointer:
             }
             if followers:
                 dims[str(idx)] = followers
-        self._save_shard(state, step, "optimizer", layout, dims)
+                sizes[str(idx)] = layout.sizes[id(param)]
+        self._save_shard(state, step, "optimizer", layout, dims, sizes)
 
     def save_scheduler(self, scheduler: torch.optim.lr_scheduler.LRScheduler, step: int) -> None:
         self._save(scheduler, step, "scheduler.pt")
@@ -302,6 +327,16 @@ class Checkpointer:
     def save_rng(self, state: dict, step: int, dp_rank: int = 0) -> None:
         self._put(state, step, f"rng_dp{dp_rank}.pt")
 
+    def save_prefetcher(self, state: dict, step: int, dp_rank: int = 0) -> None:
+        self._put(state, step, f"prefetcher_dp{dp_rank}.pt")
+
+    def load_prefetcher(self, step: int, dp_rank: int = 0) -> dict | None:
+        """the batch this dp rank had prefetched but not consumed, if saved."""
+        name = f"prefetcher_dp{dp_rank}.pt"
+        if not os.path.exists(os.path.join(self._step_dir(step), name)):
+            return None
+        return self._load(step, name)
+
     def load_rng(self, step: int, dp_rank: int = 0) -> dict | None:
         """this dp rank's rng state, or None if the checkpoint has none for it."""
         name = f"rng_dp{dp_rank}.pt"
@@ -313,7 +348,7 @@ class Checkpointer:
         return self._load(step, "trainer.pt")
 
     def load_model(self, model: nn.Module, step: int, layout: ShardLayout = UNSHARDED) -> None:
-        shards, saved_dims = self._load_shards(step, "model")
+        shards, saved_dims, saved_sizes = self._load_shards(step, "model")
         want_dims = {
             name: layout.dims[id(p)]
             for name, p in model.named_parameters(remove_duplicate=False)
@@ -323,6 +358,7 @@ class Checkpointer:
             name: _read(
                 [shard[name] for shard in shards],
                 saved_dims.get(name),
+                saved_sizes.get(name),
                 want_dims.get(name),
                 layout,
             )
@@ -333,7 +369,7 @@ class Checkpointer:
     def load_optimizer(
         self, optimizer: torch.optim.Optimizer, step: int, layout: ShardLayout = UNSHARDED
     ) -> None:
-        shards, saved_dims = self._load_shards(step, "optimizer")
+        shards, saved_dims, saved_sizes = self._load_shards(step, "optimizer")
         params = [p for group in optimizer.param_groups for p in group["params"]]
         state: dict = {}
         for idx, saved in shards[0]["state"].items():
@@ -343,7 +379,7 @@ class Checkpointer:
             # the checkpoint itself was saved unsharded
             full_shape = list(param.shape)
             if want_dim is not None:
-                full_shape[want_dim] *= layout.num_shards
+                full_shape[want_dim] = layout.sizes[id(param)]
             state[idx] = {}
             for key, value in saved.items():
                 if not torch.is_tensor(value):
@@ -354,6 +390,7 @@ class Checkpointer:
                 state[idx][key] = _read(
                     [shard["state"][idx][key] for shard in shards],
                     saved_dim,
+                    saved_sizes.get(str(idx)),
                     want_dim if follows else None,
                     layout,
                 )

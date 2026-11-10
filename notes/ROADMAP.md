@@ -38,9 +38,10 @@ these already shaped the code; write them down so future phases don't drift:
 ## current state (2026-11-09)
 
 phases 0 and 1 are done. phase 2 (fsdp2 + hsdp) is running and measured
-(FSDP2_H100.md); meta init (2.3) and activation checkpointing (2.4) are still
-owed. phase 3 (sharded checkpointing with resharding load, async save) landed
-11/9, so fsdp runs are resumable. tensor parallel (phase 4) is next.
+(FSDP2_H100.md); meta init (2.3), activation checkpointing (2.4) and uneven
+shards landed 11/10. phase 3 (sharded checkpointing with resharding load,
+async save) landed 11/9, so fsdp runs are resumable, and SIGTERM now
+checkpoints and exits. tensor parallel (phase 4) is next.
 
 the 7/30 overlap trace (DDP.md) sharpens what phase 2 is *for* on this
 hardware: at 8 gpus the grad all-reduce (442 ms/step) no longer fits inside the
@@ -55,19 +56,27 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
 | `core/placement.py`, `core/dtensor.py` | **done (phase 2.1).** `Shard / Replicate / Partial` value types and a bookkeeping `DTensor` with an explicit redistribute table; no op dispatch. tests in `tests/placement.py`, `tests/dtensor.py` |
 | `parallelism/data_parallel.py` | **done (phase 1).** bucketed grad all-reduce launched from `register_post_accumulate_grad_hook`, overlapped with backward; flat-buffer buckets with `.grad` repointed at views, oversized params (the tied embedding) reduced in place; dp=1 is a total no-op. `requires_sync` gives no_sync semantics for grad accumulation (1.3). grad parity + accumulation parity tested on gloo (`tests/data_parallel.py`) |
 | `core/grad_helper.py` | **done (phase 1.3).** `clip_grad_norm(params, mesh, max_norm, shard_dims=())` — placement-aware global grad-norm clip, returns the pre-clip norm for logging. local path matches `torch.nn.utils.clip_grad_norm_` and runs at memory-bandwidth limit (~10 ms / 2.1 GiB of grads, ~1.8% of a step); sharded path is what fsdp passes its shard axis to. tests in `tests/grad_helper.py` |
-| `parallelism/fsdp2.py` | **done (phase 2.2, 2.5).** per-param `Shard(0)` along `dp_shard`, hsdp when `dp_replicate > 1`. model-agnostic: the caller passes the unit modules (`units=model.blocks`), everything else is the root unit; fsdp reads no model attribute names. async gather with prefetch, reduce-scatter per microbatch, fp32 sharded masters + bf16 gathered buffers. not done: dedicated comm stream, flat per-unit buffers, uneven shards (asserts), meta init. `tests/fsdp2.py` (gloo, not in ci) |
+| `parallelism/fsdp2.py` | **done (phase 2.2, 2.5).** per-param `Shard(0)` along `dp_shard`, hsdp when `dp_replicate > 1`. model-agnostic: the caller passes the unit modules (`units=model.blocks`), everything else is the root unit; fsdp reads no model attribute names. async gather with prefetch, reduce-scatter per microbatch, fp32 sharded masters + bf16 gathered buffers. uneven dims are zero-padded to equal shards. built from a meta-device model it allocates only this rank's shards (`finish_init()` after the model's init). hooks stand down for activation checkpointing's forward re-run. not done: dedicated comm stream, flat per-unit buffers. `tests/fsdp2.py` (gloo, in ci) |
 | `parallelism/{context_parallel,expert_parallel}.py` | empty stubs |
 | models | qwen3 dense (0.6B validated, per-block compile, ~13k tps on A40, 73.5k global on 8x A40); llama3 stubbed |
 | trainer | single-gpu and dp through the same path (world_size=1 is not a special case). lifecycle build → parallelize → init → optimizer → data, so sharded init slots in without reordering. grad accumulation (`global_batch_size / (micro_batch_size × dp)` microbatches) and grad-norm clipping both land in `train_step`; `train_step` returns a metrics dict (loss, grad_norm). no eval loop, no metrics logger, `self.parallel` is DDP or FSDP behind one surface (`requires_sync`, `sync()`, `shard_dims`, `shard_dim_of`), so `train_step` and checkpointing never branch on the strategy. torch is seeded from `config.seed`: one shared seed through init, then a per-dp-rank stream (`seed + 1 + dp coord`) |
-| checkpointing | **done (phase 3).** per-step dirs, `resume: null \| "auto" \| <step>`, full state (model/optimizer/scheduler/dataloader/rng/config). sharded: one rank per shard writes `{model,optimizer}_shard{k}.pt`, load reshards any saved shard count onto the current layout (fsdp ↔ hsdp ↔ ddp) via mmap range reads. per-dp-rank dataloader and rng files. per-rank `.done{rank}of{world}` markers instead of a barrier. async by default (`checkpointing.async_save`): cpu snapshot, background-thread write. a mesh change needs `resume_dataloader: false`. tests: `tests/checkpointer.py`, `tests/sharded_checkpoint.py` (both in ci) |
+| checkpointing | **done (phase 3).** per-step dirs, `resume: null \| "auto" \| <step>`, full state (model/optimizer/scheduler/dataloader/rng/config). sharded: one rank per shard writes `{model,optimizer}_shard{k}.pt`, load reshards any saved shard count onto the current layout (fsdp ↔ hsdp ↔ ddp) via mmap range reads. per-dp-rank dataloader and rng files. per-rank `.done{rank}of{world}` markers instead of a barrier. async by default (`checkpointing.async_save`): cpu snapshot, background-thread write. a mesh change needs `resume_dataloader: false`. the prefetcher's held batch is saved, so resume no longer skips one. SIGTERM → checkpoint at the next log point → exit (second SIGTERM kills). tests: `tests/checkpointer.py`, `tests/sharded_checkpoint.py` (both in ci) |
 | objectives | AR CE, with the chunked fused-linear-CE landed and wired into `ARObjective` (default on). backward scales the stashed grads in place — see DEV_LOG 7/27 |
 | dataloader | streaming HF + packing (stream + best-fit-decreasing) + stateful + CUDA prefetcher; splits by the mesh's dp coordinate. packing allows cross-document attention (no doc mask); prefetcher skips one batch on resume |
 
 ### known correctness debt
 
-- **prefetcher one-batch skip on resume** — the prefetcher pulls batch N+1
-  before `checkpoint()` snapshots the dataloader, so the saved position is one
-  batch ahead of what was consumed. data loss only, but "exact resume" isn't.
+- fixed 11/10: prefetcher one-batch skip on resume. the held batch is saved
+  as `prefetcher_dp{c}.pt` and handed back first on resume.
+- **the trainer's dataloader workers ignore SIGTERM** (so a group-wide
+  SIGTERM leaves the run able to reach its checkpoint). opt-in via
+  `build_dataloader(shield_sigterm=True)`; the trainer pairs it with an atexit
+  teardown (`dataloader.builder.shutdown_workers`). other callers
+  (`eval_ppl.py`) get ordinary workers.
+- **the SIGTERM stop is only checked at log points**, so the worst case
+  before the checkpoint starts is `log_every` steps. torchrun gives its
+  workers a fixed grace period after forwarding the signal before it
+  SIGKILLs them; a large `log_every` × step time, or a slow save, can exceed it.
 - fixed: checkpoint done marker (per-rank `.done` markers; `latest()` skips a
   step any rank didn't finish).
 - fixed 11/9: rank 0's rng used to land on every rank at resume. each dp rank
@@ -76,12 +85,14 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
   peers sharing a dp coordinate all write the same `rng_dp{c}.pt`, which
   wants a single designated writer once tp exists (same for the dataloader
   file).
-- **`tests/data_parallel.py`, `tests/grad_helper.py` and `tests/fsdp2.py`
-  aren't in ci** despite being gloo/cpu and being the most valuable tests in
-  the tree.
-- **sharded checkpointing is only exercised small**: gloo tests and a
-  2-gpu tiny-model trainer smoke with compile off. no run at real model
-  size, with compile on, or on a shared filesystem across nodes yet.
+- fixed 11/10: `tests/data_parallel.py`, `tests/grad_helper.py` and
+  `tests/fsdp2.py` are in ci.
+- **sharded checkpointing at scale**: exercised at 0.6B on 2 gpus with compile
+  and activation checkpointing on (SIGTERM mid-run, resume, loss matches the
+  uninterrupted run). not yet on a shared filesystem across nodes.
+- **meta init, activation checkpointing and the SIGTERM path have no
+  committed tests**; they were checked with scratch scripts and the 0.6B
+  run. padded shards are covered by `tests/sharded_checkpoint.py`.
 - **the benchmark numbers are boost-clock numbers.** throughput decays 2–3%
   over a run as the card power-caps (measured 7/30: `SwPowerCap` from step 0,
   clocks 1665 → 1590 MHz as it heats 70 → 79 °C). rounds 1–2 were 10–30 step
@@ -215,9 +226,28 @@ vector, and a regression test that grads below the threshold are left
 mutation-checked — disabling the suppression or reintroducing the clamp bug
 makes them fail.
 
-## phase 2: DTensor + FSDP2 — DONE except 2.3 (meta init) and activation checkpointing in 2.4
+## phase 2: DTensor + FSDP2 — DONE except the comm stream and flat buffers
 
-status: 2.1, 2.2, 2.5 landed; numbers in FSDP2_H100.md. one deviation from
+status: all of 2.1-2.5 landed; numbers in FSDP2_H100.md (measured before
+11/10, so without meta init or activation checkpointing).
+
+- 2.3 meta init: the fsdp path builds on `meta`, fsdp materializes this
+  rank's shards, and `init_weights` fills them seeded per shard coordinate.
+  shards are therefore NOT a slice of what a single process would init:
+  statistically the same model, not bitwise. it requires the model's init to
+  be elementwise and to set buffers too (`init_weights` contract). ddp keeps
+  build → init → replicate.
+- 2.4 activation checkpointing: `"activation_checkpointing": true` in the
+  config; per block, non-reentrant. 0.6B / micro_bs 4 / seq 4096 on fsdp
+  dp_shard=2: peak 28.19 → 8.60 GiB. throughput cost not measured (the box
+  was shared during the run).
+- uneven shards: padded in fsdp (`placement.padded_chunk`), not in `Shard`,
+  which still asserts even division for dtensor's redistribute.
+- comm stream / flat per-unit buffers: not built. a flat gather is one
+  collective per unit instead of one per param, but nccl's output is
+  rank-major, so each param needs a copy out of the flat buffer (and grads a
+  copy in). whether that beats ~11 small collectives per block needs a
+  profile on an idle box first. one deviation from
 the 2.2 text below: units are not derived from `model.blocks` inside fsdp —
 the caller passes them (`FSDP(model, mesh, units)`), and fsdp holds no
 model-specific code. params are plain tensors with placements recorded

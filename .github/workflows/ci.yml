@@ -53,3 +53,9 @@ jobs:
         run: uv run --no-sync tests/checkpointer.py
       - name: sharded checkpoint resharding (gloo, up to 4 ranks)
         run: uv run --no-sync tests/sharded_checkpoint.py
+      - name: ddp grad parity (gloo, 4 ranks)
+        run: uv run --no-sync tests/data_parallel.py --world-size 4
+      - name: grad clipping (gloo, 2 ranks)
+        run: uv run --no-sync tests/grad_helper.py --world-size 2
+      - name: fsdp2 parity + invariants (gloo, 4 ranks)
+        run: uv run --no-sync tests/fsdp2.py --world-size 4

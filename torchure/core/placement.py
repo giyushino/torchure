@@ -154,6 +154,25 @@ class Partial(Placement):
         return f"Partial({self.op})"
 
 
+def padded_chunk(global_size: int, group_size: int, coord: int) -> tuple[int, int, int]:
+    """
+    the padded layout for a dim that need not divide evenly: every rank holds
+    a chunk of `length = ceil(global / group)` rows so the collectives see
+    equal sizes, of which only the first `valid` are real; the rest is zero
+    padding. rank `coord` owns global rows [start, start + valid).
+
+    returns (length, start, valid). trailing ranks may own fewer rows than
+    `length`, or none. with even division this is exactly Shard's layout.
+    `Shard` itself still asserts even division: this is the opt-in used by
+    fsdp and the checkpointer, which both know how to trim the padding.
+    """
+    assert 0 <= coord < group_size, f"coord {coord} out of range for {group_size}"
+    length = -(-global_size // group_size)
+    start = min(coord * length, global_size)
+    valid = min(start + length, global_size) - start
+    return length, start, valid
+
+
 # one entry per mesh axis, in the mesh's own axis order.
 Placements = tuple[Placement, ...]
 

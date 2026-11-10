@@ -106,6 +106,9 @@ class DDP:
         """the tensor dim `param` is sharded along; ddp shards nothing."""
         return None
 
+    def full_shape_of(self, param: nn.Parameter) -> tuple[int, ...]:
+        return tuple(param.shape)
+
     def _replicate(self, model: nn.Module):
         for tensor in [*model.parameters(), *model.buffers()]:
             broadcast(tensor.detach(), self.mesh, self.dim, src=0)

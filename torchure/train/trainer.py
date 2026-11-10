@@ -4,8 +4,10 @@ training orchestrator: build -> init -> parallelize -> compile -> optimizer -> d
 TODO: replace the @debug_time profiling decorators with a real profiler
 """
 
+import atexit
 import json
 import os
+import signal
 import time
 from datetime import datetime
 
@@ -18,7 +20,7 @@ from torchure.checkpoint.checkpointer import Checkpointer, ShardLayout
 from torchure.core.collective import all_reduce
 from torchure.core.grad_helper import clip_grad_norm
 from torchure.core.mesh import Mesh
-from torchure.dataloader.builder import build_dataloader
+from torchure.dataloader.builder import build_dataloader, shutdown_workers
 from torchure.dataloader.prefetcher import CUDAPrefetcher
 from torchure.models.builder import build_model
 from torchure.objectives.builder import build_objective
@@ -86,9 +88,16 @@ class Trainer:
         self.ignore_index = self.config["objective"]["config"]["ignore_index"]
         self.tokenizer = Tokenizer.from_pretrained(self.config["data"]["tokenizer"])
 
+        # ddp: build -> init -> replicate. fsdp: build on the meta device ->
+        # shard -> init the shards, so no rank ever holds the full weights.
         self.model = self._build_model()
-        self._init_weights(self.model)
-        self.model = self._parallelize(self.model)
+        if self.parallelism == "fsdp":
+            self.model = self._parallelize(self.model)
+            self._init_shards(self.model)
+        else:
+            self._init_weights(self.model)
+            self.model = self._parallelize(self.model)
+        self.model.activation_checkpointing = self.config.get("activation_checkpointing", False)
         # init ran on the shared seed so every rank built the same model; from
         # here each dp rank draws its own stream (dropout, diffusion masks).
         # tp/cp peers share a dp coordinate, so they stay in lockstep.
@@ -140,12 +149,22 @@ class Trainer:
         self.resume_dataloader = self.config["checkpointing"].get("resume_dataloader", True)
         # set by _resume so wandb reattaches to the existing run
         self.resume_wandb_id: str | None = None
+        # the batch the prefetcher held at the checkpoint, set by _resume
+        self._resumed_batch: dict[str, torch.Tensor] | None = None
         self.start_step = self._resume()
         self._setup_wandb()
 
         # must come after _resume restores the dataloader state
         self.dataloader_iter = iter(self.dataloader)
-        self.prefetcher = CUDAPrefetcher(self.dataloader_iter, self.device)
+        # workers ignore SIGTERM (see builder._ignore_sigterm), so they must be
+        # torn down explicitly on every exit path or the process hangs at exit
+        atexit.register(shutdown_workers, self.dataloader_iter)
+        self.prefetcher = CUDAPrefetcher(
+            self.dataloader_iter, self.device, first_batch=self._resumed_batch
+        )
+
+        # set by the SIGTERM handler train() installs; see _stop_requested
+        self._sigterm = False
 
 
     def _setup_wandb(self) -> None:
@@ -190,6 +209,10 @@ class Trainer:
 
     def _build_model(self) -> nn.Module:
         model_cfg = self.config["model"]
+        if self.parallelism == "fsdp":
+            # shapes only: fsdp allocates this rank's shards, nothing more
+            with torch.device("meta"):
+                return build_model(model_cfg["name"], model_cfg["config"])
         return build_model(model_cfg["name"], model_cfg["config"])
 
     def _parallelize(self, model: nn.Module) -> nn.Module:
@@ -227,6 +250,7 @@ class Trainer:
                 param_dtype=_DTYPES[fsdp_cfg.get("param_dtype", "bfloat16")],
                 reduce_dtype=_DTYPES[fsdp_cfg.get("reduce_dtype", "float32")],
                 prefetch=fsdp_cfg.get("prefetch", 1),
+                device=self.device,
             )
         else:
             raise ValueError(
@@ -255,6 +279,16 @@ class Trainer:
         # don't cast norm weights to bf16: bf16 spacing at 1.0 (~0.004) is far
         # larger than an adamw update (~lr), so the gains would never move
 
+    def _init_shards(self, model: nn.Module) -> None:
+        """
+        init a model fsdp materialized from meta: each rank fills only its own
+        shards. seeded per shard coordinate, so shards differ from each other
+        while hsdp replicas of one shard agree.
+        """
+        torch.manual_seed(self.seed + self.mesh.coordinate("dp_shard"))
+        model.init_weights()
+        self.parallel.finish_init()
+
     def _build_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
         optim_cfg = self.config["optimizer"]
         return build_optimizer(model, optim_cfg["name"], optim_cfg["config"])
@@ -271,7 +305,10 @@ class Trainer:
     def _build_dataloader(self) -> torchdata.stateful_dataloader.StatefulDataLoader:
         return build_dataloader(
             self.config["data"], self.tokenizer, self.ignore_index, 
-            self.mesh.coordinate("dp"), self.mesh.size("dp")
+            self.mesh.coordinate("dp"), self.mesh.size("dp"),
+            # so a job-wide SIGTERM can't kill the workers before the
+            # checkpoint; __init__ registers the matching teardown
+            shield_sigterm=True,
         )
 
     def _build_mesh(self) -> Mesh:
@@ -361,7 +398,34 @@ class Trainer:
             dp_rank,
         )
         self.checkpointer.save_dataloader(self.dataloader, step, dp_rank)
+        # the loader is one batch ahead of training; that batch is saved here
+        self.checkpointer.save_prefetcher(self.prefetcher.state_dict(), step, dp_rank)
         self.checkpointer.commit(step)
+
+    def _on_sigterm(self, signum, frame) -> None:
+        """
+        first SIGTERM: checkpoint and exit at the next log point. a second one
+        means "now": put the default handler back and die.
+
+        dataloader workers ignore SIGTERM, so a signal sent to the whole
+        process group still leaves the run able to reach that log point.
+        """
+        if self._sigterm:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGTERM)
+        self._sigterm = True
+
+    def _stop_requested(self) -> bool:
+        """
+        collective: has any rank been sent SIGTERM? ranks get the signal at
+        different moments, so they agree on it here, at a point every rank
+        reaches on the same step. only called at log points, which already
+        sync with the host.
+        """
+        flag = torch.tensor(float(self._sigterm), device=self.device)
+        if self.dp_size > 1:
+            all_reduce(flag, self.mesh, "dp", "max")
+        return flag.item() > 0
             
     def _resume(self) -> int:
         if self.resume is None:
@@ -410,7 +474,12 @@ class Trainer:
                 group["lr"] = lr
             self.scheduler._last_lr = lrs
         if self.resume_dataloader:
-            self.checkpointer.load_dataloader(self.dataloader, step, self.mesh.coordinate("dp"))
+            dp_rank = self.mesh.coordinate("dp")
+            self.checkpointer.load_dataloader(self.dataloader, step, dp_rank)
+            # older checkpoints have none: they resume one batch ahead
+            held = self.checkpointer.load_prefetcher(step, dp_rank)
+            if held is not None:
+                self._resumed_batch = held["next_batch"]
         # each dp rank resumes its own stream. older checkpoints carry only
         # rank 0's, in trainer.pt. a rank with neither (resume onto a larger
         # mesh) keeps the seed-derived stream it already has.
@@ -475,6 +544,8 @@ class Trainer:
             done = step + 1
             save = checkpoint and (done % self.save_steps == 0 or done == end)
             if save or done % self.log_every == 0 or done == end:
+                stop = checkpoint and self._stop_requested()
+                save = save or stop
                 if self.dp_size > 1:
                     all_reduce(loss_sum, self.mesh, "dp", "avg")
                 loss = loss_sum.item() / window
@@ -490,6 +561,10 @@ class Trainer:
                 window = 0
                 if save:
                     self.checkpoint(done)
+                if stop:
+                    if self.rank == 0:
+                        print(f"SIGTERM: checkpointed step {done}, exiting")
+                    break
                 t0 = time.perf_counter()
 
         if self.rank == 0:
@@ -500,9 +575,12 @@ class Trainer:
         self._run_steps(0, n_steps, checkpoint=False)
 
     def train(self) -> None:
+        signal.signal(signal.SIGTERM, self._on_sigterm)
         try:
             self._run_steps(self.start_step, self.num_train_steps, checkpoint=True)
         finally:
+            # past the loop nothing answers the flag, so SIGTERM kills again
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
             try:
                 # the last async save must be on disk before the process exits
                 self.checkpointer.wait()

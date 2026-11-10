@@ -20,7 +20,8 @@ and is close rather than exact only because a different rank count reduces
 grads in a different order.
 
 the layouts crossed: fsdp at two shard counts, hsdp, and unsharded (which is
-also the legacy `model.pt` on-disk format, in both directions).
+also the legacy `model.pt` on-disk format, in both directions). 3 shards
+divides none of the model's dims, so those scenarios cover padded shards.
 """
 
 import os
@@ -36,7 +37,7 @@ import torch.nn.functional as F
 from torchure.checkpoint.checkpointer import Checkpointer, ShardLayout
 from torchure.core import collective as C
 from torchure.core.mesh import Mesh
-from torchure.core.placement import Shard
+from torchure.core.placement import padded_chunk
 from torchure.models.qwen3.qwen3 import Qwen3
 from torchure.parallelism.data_parallel import DDP
 from torchure.parallelism.fsdp2 import FSDP
@@ -50,7 +51,7 @@ CFG = {
     "vocab_size": 64,
 }
 SEQ = 16
-GLOBAL_BATCH = 4
+GLOBAL_BATCH = 12
 CKPT_STEP = 3
 END_STEP = 6
 
@@ -63,6 +64,10 @@ SCENARIOS = [
     ("hsdp2x2 -> fsdp4", (2, 2), (1, 4)),
     ("fsdp4 -> hsdp2x2", (1, 4), (2, 2)),
     ("fsdp4 -> fsdp4", (1, 4), (1, 4)),
+    ("fsdp3 (padded) -> fsdp4", (1, 3), (1, 4)),
+    ("fsdp4 -> fsdp3 (padded)", (1, 4), (1, 3)),
+    ("fsdp3 (padded) -> unsharded", (1, 3), (1, 1)),
+    ("unsharded -> fsdp3 (padded)", (1, 1), (1, 3)),
 ]
 
 
@@ -97,11 +102,11 @@ def train_step(model, parallel, optimizer, mesh: Mesh, step: int) -> None:
     optimizer.zero_grad()
 
 
-def full(tensor: torch.Tensor, sharded: bool, mesh: Mesh) -> torch.Tensor:
-    """a collective when sharded: every rank must call it."""
+def full(tensor: torch.Tensor, sharded: bool, mesh: Mesh, rows: int) -> torch.Tensor:
+    """a collective when sharded: every rank must call it. trims shard padding."""
     if not sharded:
         return tensor.clone()
-    return C.all_gather(tensor.contiguous(), mesh, "dp_shard", gather_dim=0)
+    return C.all_gather(tensor.contiguous(), mesh, "dp_shard", gather_dim=0)[:rows].clone()
 
 
 def full_state(model, parallel, optimizer, mesh: Mesh) -> dict:
@@ -109,17 +114,24 @@ def full_state(model, parallel, optimizer, mesh: Mesh) -> dict:
     out = {}
     for name, p in model.named_parameters():
         sharded = parallel.shard_dim_of(p) is not None
-        out[f"param/{name}"] = full(p.data, sharded, mesh)
+        rows = parallel.full_shape_of(p)[0]
+        out[f"param/{name}"] = full(p.data, sharded, mesh, rows)
         for key in ("exp_avg", "exp_avg_sq"):
-            out[f"{key}/{name}"] = full(optimizer.state[p][key], sharded, mesh)
+            out[f"{key}/{name}"] = full(optimizer.state[p][key], sharded, mesh, rows)
         out[f"step/{name}"] = optimizer.state[p]["step"].clone()
     return out
 
 
 def local_expected(ref: torch.Tensor, sharded: bool, mesh: Mesh) -> torch.Tensor:
+    """this rank's shard of a full tensor: its rows, zero-padded to shard length."""
     if not sharded:
         return ref
-    return Shard(0).local_slice(ref, mesh.size("dp_shard"), mesh.coordinate("dp_shard"))
+    length, start, valid = padded_chunk(
+        ref.shape[0], mesh.size("dp_shard"), mesh.coordinate("dp_shard")
+    )
+    out = ref.new_zeros((length, *ref.shape[1:]))
+    out[:valid] = ref[start:start + valid]
+    return out
 
 
 def writes_model_state(parallel, mesh: Mesh) -> bool:
@@ -235,7 +247,7 @@ def _worker(rank: int, world_size: int, phase: str, spec: tuple, tmp: str, port:
 
 
 def main() -> None:
-    port = 29600
+    port = 29700 + os.getpid() % 200
     failed = []
     for name, save_spec, resume_spec in SCENARIOS:
         tmp = tempfile.mkdtemp(prefix="torchure_shard_ckpt_")

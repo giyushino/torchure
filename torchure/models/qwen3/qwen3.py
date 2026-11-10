@@ -9,6 +9,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -32,13 +33,20 @@ class Qwen3RotaryEmbedding(nn.Module):
         super().__init__()
         assert head_dim % 2 == 0, "RoPE requires even head_dim"
 
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, head_dim, 2).float() / head_dim)
-        )
-        self.register_buffer("inv_freq", inv_freq, False)
+        self.head_dim = head_dim
+        self.base = base
+        self.register_buffer("inv_freq", torch.empty(head_dim // 2), False)
 
         # cos/sin per (seq_len, device) for the packed, no-mask training path
         self._cache: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
+        self.init_buffers()
+
+    @torch.no_grad()
+    def init_buffers(self) -> None:
+        """(re)compute inv_freq in place, e.g. after a meta-device build."""
+        exponent = torch.arange(0, self.head_dim, 2, device=self.inv_freq.device).float()
+        self.inv_freq.copy_(1.0 / (self.base ** (exponent / self.head_dim)))
+        self._cache.clear()
 
     def _cos_sin(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # (B, S, 1) * (1, 1, D/2) -> (B, S, D/2)
@@ -241,13 +249,21 @@ class Qwen3(nn.Module):
         self.norm = nn.RMSNorm(emb_dim, eps=norm_eps)
         self.lm_head = nn.Linear(emb_dim, vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight
+        # recompute each block's activations in backward instead of storing
+        # them: trades roughly one extra forward for most activation memory
+        self.activation_checkpointing = False
 
     def init_weights(self, std: float = 0.02) -> None:
         """
         gpt/llama-style init. projections that write into the residual stream
         (o_proj, down_proj) are scaled by 1/sqrt(2 * num_layers) so variance
         doesn't compound with depth.
+
+        initializes ALL state, buffers included, so it is also what gives a
+        model built on the meta device its values. every init here is
+        elementwise, so it stays correct when fsdp hands it shards.
         """
+        self.rope.init_buffers()
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=std)
@@ -286,8 +302,12 @@ class Qwen3(nn.Module):
         cos, sin = self.rope(position_ids, cacheable=cacheable)
         hidden_states: list[torch.Tensor] = [x] if return_hidden_states else []
 
+        use_checkpoint = self.activation_checkpointing and torch.is_grad_enabled()
         for block in self.blocks:
-            x = block(x, cos, sin, attention_mask)
+            if use_checkpoint:
+                x = checkpoint(block, x, cos, sin, attention_mask, use_reentrant=False)
+            else:
+                x = block(x, cos, sin, attention_mask)
             if return_hidden_states:
                 hidden_states.append(x)
 

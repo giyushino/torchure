@@ -20,7 +20,22 @@ the head weight, for one). each passed unit goes through:
     post-backward  reduce_scatter grads -> sharded fp32, reshard
 
 grads are reduce-scattered every microbatch, so `requires_sync` is ignored.
-not done yet: dedicated comm stream, flat per-unit buffers, uneven shards.
+
+uneven shards: a param whose dim 0 doesn't divide by the shard count is padded.
+every rank's shard has ceil(rows / shards) rows, zero-filled past the rows it
+owns; the gathered buffer carries the padding at its tail and the param is a
+view of the real rows. padding rows get zero grads, so they stay zero.
+
+meta init: built from a model on the `meta` device, fsdp allocates only this
+rank's shards (never the full weights) and the caller then runs the model's
+init on them, followed by `finish_init()`.
+
+activation checkpointing: a checkpointed unit's forward is re-run inside its
+backward. the forward hooks stand down for that re-run (the backward-pre hook
+has already gathered the unit, and resharding there would free weights the
+backward is about to read).
+
+not done yet: dedicated comm stream, flat per-unit buffers.
 """
 
 from collections.abc import Iterable
@@ -36,7 +51,7 @@ from torchure.core.collective import (
     broadcast,
     reduce_scatter,
 )
-from torchure.core.placement import Placements, Replicate, Shard
+from torchure.core.placement import Placements, Replicate, Shard, padded_chunk
 
 # unit lifecycle states
 _FREE = "free"            # params point at shards; buffer storage is 0 bytes
@@ -66,7 +81,10 @@ class _ParamState:
     name: str
     param: nn.Parameter
     sharded: torch.Tensor           # fp32 Shard(0) master; param.data when free
-    unsharded: torch.Tensor         # compute-dtype full buffer; storage 0 when free
+    unsharded: torch.Tensor         # compute-dtype gathered buffer (incl. padding); storage 0 when free
+    full: torch.Tensor              # view of `unsharded` without the padding; param.data when gathered
+    full_shape: tuple[int, ...]     # the param's true unsharded shape
+    valid: int                      # rows of `sharded` this rank owns; the rest is padding
     placements: Placements          # layout over (dp_replicate, dp_shard)
     sharded_grad: torch.Tensor | None = None
 
@@ -79,6 +97,7 @@ class _Unit:
     reshard_after_forward: bool
     status: str = _FREE
     pending: int = 0                # params still owing a grad this backward
+    in_backward: bool = False       # between backward-pre and post-backward
     works: list = field(default_factory=list)
 
 
@@ -99,6 +118,11 @@ class FSDP:
     `replicate_dim` adds hsdp: reduce-scatter on shard_dim, then all-reduce on
     replicate_dim. `param_dtype` is the gathered/compute dtype (None = no
     cast); `reduce_dtype` is the grad reduction dtype (None = grad's dtype).
+
+    a `model` built on the meta device is materialized sharded on `device`,
+    with uninitialized values: run the model's init next, then finish_init().
+    that init sees shards, so it must be elementwise (normal_, zeros_, ones_),
+    not derived from a weight's shape.
     """
 
     def __init__(
@@ -111,6 +135,7 @@ class FSDP:
         param_dtype: torch.dtype | None = None,
         reduce_dtype: torch.dtype | None = torch.float32,
         prefetch: int = 1,
+        device: torch.device | None = None,
     ):
         self.model = model
         self.mesh = mesh
@@ -137,11 +162,22 @@ class FSDP:
         self._exec_order: list[int] = []
         self._order_checked = False
 
+        # id(param) -> true unsharded shape, for params materialized from meta
+        self._meta_shapes: dict[int, tuple[int, ...]] = {}
+        self._from_meta = any(p.is_meta for p in model.parameters())
+
         if self.group_size == 1:
             # no-op: not one hook registered, not one buffer allocated
+            assert not self._from_meta, (
+                "a meta model needs a shard axis of size > 1 to materialize on"
+            )
             return
 
-        self._replicate(model)
+        if self._from_meta:
+            assert device is not None, "a meta model needs `device` to materialize on"
+            self._materialize(model, device)
+        else:
+            self._replicate(model)
         self._build_units(model, list(units))
         self._shard()
         self._register_hooks()
@@ -163,6 +199,59 @@ class FSDP:
             broadcast(tensor.detach(), self.mesh, self.shard_dim, src=0)
             if self.replicate_size > 1:
                 broadcast(tensor.detach(), self.mesh, self.replicate_dim, src=0)
+
+    def _materialize(self, model: nn.Module, device: torch.device) -> None:
+        """
+        give a meta model real storage: this rank's (padded) shard for every
+        trainable param, full tensors for frozen params and buffers. values
+        are uninitialized. a meta Parameter can't be repointed at device
+        storage, so each is replaced, once, wherever it is registered -- which
+        keeps a tied weight tied.
+        """
+        coord = self.mesh.coordinate(self.shard_dim)
+        new: dict[int, nn.Parameter] = {}
+        for module in model.modules():
+            for name, old in module._parameters.items():
+                if old is None:
+                    continue
+                if id(old) not in new:
+                    shape = tuple(old.shape)
+                    if old.requires_grad:
+                        assert len(shape) > 0, f"param {name!r} is 0-dim; Shard(0) needs a dim"
+                        length, _, _ = padded_chunk(shape[0], self.group_size, coord)
+                        local = (length, *shape[1:])
+                    else:
+                        local = shape
+                    param = nn.Parameter(
+                        torch.empty(local, dtype=old.dtype, device=device),
+                        requires_grad=old.requires_grad,
+                    )
+                    new[id(old)] = param
+                    if old.requires_grad:
+                        self._meta_shapes[id(param)] = shape
+                module._parameters[name] = new[id(old)]
+            for name, buf in module._buffers.items():
+                if buf is not None:
+                    module._buffers[name] = torch.empty(
+                        buf.shape, dtype=buf.dtype, device=device
+                    )
+
+    def finish_init(self) -> None:
+        """
+        call once after initializing a model that was materialized from meta.
+        re-zeros the padding the init wrote over, and broadcasts so replicas
+        (and buffers on every rank) are identical whatever the ranks' rngs did.
+        """
+        if self.group_size == 1:
+            return
+        for st in self._states:
+            st.sharded[st.valid:].zero_()
+            if self.replicate_size > 1:
+                broadcast(st.sharded, self.mesh, self.replicate_dim, src=0)
+        for buf in self.model.buffers():
+            broadcast(buf, self.mesh, self.shard_dim, src=0)
+            if self.replicate_size > 1:
+                broadcast(buf, self.mesh, self.replicate_dim, src=0)
 
     def _build_units(self, model: nn.Module, modules: list[nn.Module]) -> None:
         # qualified names, so states (and later the sharded checkpoint) are
@@ -214,32 +303,41 @@ class FSDP:
 
     def _make_state(self, name: str, param: nn.Parameter) -> _ParamState:
         placement = Shard(0)
-        full = param.data
-        assert full.dim() > 0, (
+        from_meta = id(param) in self._meta_shapes
+        full_shape = self._meta_shapes[id(param)] if from_meta else tuple(param.shape)
+        assert len(full_shape) > 0, (
             f"param {name!r} is 0-dim; Shard(0) needs a dim to split. make it "
             "shape (1,)-or-larger, or freeze it"
         )
-        assert full.shape[0] % self.group_size == 0, (
-            f"param {name!r} has shape {tuple(full.shape)}; dim 0 is not divisible "
-            f"by dp_shard={self.group_size}. v0 asserts rather than padding -- "
-            "padding would go in placement.Shard (pad the shard, trim after the "
-            "gather) and the unpadded size would have to reach the checkpoint"
-        )
         coord = self.mesh.coordinate(self.shard_dim)
-        # .clone() so the master owns its storage: a bare narrow() view would
-        # keep the whole unsharded tensor alive and save exactly nothing
-        sharded = (
-            placement.local_slice(full, self.group_size, coord).contiguous().clone()
-        )
+        length, start, valid = padded_chunk(full_shape[0], self.group_size, coord)
+        rest = full_shape[1:]
 
-        buf_dtype = self.param_dtype or full.dtype
-        unsharded = torch.empty(full.shape, dtype=buf_dtype, device=full.device)
+        if from_meta:
+            # _materialize already allocated exactly this rank's shard
+            sharded = param.data
+        else:
+            # owns its storage: a narrow() view would keep the whole unsharded
+            # tensor alive and save exactly nothing
+            sharded = torch.zeros(
+                (length, *rest), dtype=param.dtype, device=param.device
+            )
+            sharded[:valid].copy_(param.data.narrow(0, start, valid))
+
+        buf_dtype = self.param_dtype or param.dtype
+        unsharded = torch.empty(
+            (length * self.group_size, *rest), dtype=buf_dtype, device=sharded.device
+        )
+        # shares the buffer's storage, so allocating / freeing that covers both
+        full = unsharded.narrow(0, 0, full_shape[0])
         _free_storage(unsharded)
 
         placements: Placements = (
             (Replicate(), placement) if self.replicate_size > 1 else (placement,)
         )
-        return _ParamState(name, param, sharded, unsharded, placements)
+        return _ParamState(
+            name, param, sharded, unsharded, full, full_shape, valid, placements
+        )
 
     def _shard(self) -> None:
         """point every param at its master shard and drop the full weights."""
@@ -292,7 +390,7 @@ class FSDP:
             work.wait()
         unit.works.clear()
         for st in unit.params:
-            st.param.data = st.unsharded
+            st.param.data = st.full
             self._detach_grad(st)
         unit.status = _UNSHARDED
 
@@ -347,6 +445,10 @@ class FSDP:
     def _make_forward_pre(self, unit: _Unit):
         @torch.compiler.disable
         def hook(module, args):
+            if unit.in_backward:
+                # activation checkpointing re-running this forward inside its
+                # backward: already gathered, and nothing to prefetch
+                return
             if not self._order_checked:
                 self._exec_order.append(unit.index)
             self._wait_gather(unit)
@@ -361,6 +463,9 @@ class FSDP:
     def _make_forward_post(self, unit: _Unit):
         @torch.compiler.disable
         def hook(module, args, output):
+            if unit.in_backward:
+                # the backward that triggered this re-run still needs the weights
+                return
             self._reshard(unit)
 
         return hook
@@ -368,6 +473,7 @@ class FSDP:
     def _make_backward_pre(self, unit: _Unit):
         @torch.compiler.disable
         def hook(module, grad_output):
+            unit.in_backward = True
             self._wait_gather(unit)
             for prv in self._neighbours(unit.index, forward=False):
                 self._start_gather(prv)
@@ -417,12 +523,17 @@ class FSDP:
             st.param.grad = None
             if self.reduce_dtype is not None and grad.dtype != self.reduce_dtype:
                 grad = grad.to(self.reduce_dtype)
+            pad = st.unsharded.shape[0] - grad.shape[0]
+            if pad:
+                # zero grads for the padding rows, so they stay zero
+                grad = torch.cat([grad, grad.new_zeros((pad, *grad.shape[1:]))])
             out, work = reduce_scatter(
                 grad, self.mesh, self.shard_dim, "avg", scatter_dim=0, async_op=True
             )
             self._pending.append(_PendingReduce(st, out, work, grad))
 
         self._reshard(unit)
+        unit.in_backward = False
 
         self._fired.add(unit.index)
         if len(self._fired) == len(self._units):
@@ -499,6 +610,11 @@ class FSDP:
             "checkpoint between steps, when every param points at its shard"
         )
         return 0
+
+    def full_shape_of(self, param: nn.Parameter) -> tuple[int, ...]:
+        """`param`'s true unsharded shape (its local shard may be padded)."""
+        entry = self._by_param.get(id(param))
+        return tuple(param.shape) if entry is None else entry[1].full_shape
 
     @property
     def requires_sync(self) -> bool:
