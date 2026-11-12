@@ -43,6 +43,43 @@ def _chunk_fwd(
     return loss_sum, grad_hidden, grad_logits
 
 
+def _new_grad_weight(weight: torch.Tensor) -> torch.Tensor | None:
+    """the fp32 buffer grad_W accumulates into, or None for a frozen weight."""
+    return torch.zeros_like(weight, dtype=torch.float32) if weight.requires_grad else None
+
+
+def _stash_grads(ctx, loss_sum, n_valid, grad_hidden, grad_weight) -> torch.Tensor:
+    """
+    keep the sum-reduced grads for backward and return the mean loss. plain
+    ctx attributes, not save_for_backward, so backward can scale them in
+    place and drop them early.
+    """
+    ctx.n_valid = n_valid
+    ctx.grad_hidden = grad_hidden
+    ctx.grad_weight = grad_weight
+    return loss_sum / n_valid
+
+
+def _scaled_grads(ctx, grad_out) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """backward for both variants: the stashed grads, scaled by grad_out / n_valid."""
+    if ctx.n_valid is None:
+        raise RuntimeError(
+            "fused_linear_cross_entropy: backward called twice. the stashed "
+            "grads are consumed in place on the first call, so retain_graph "
+            "does not work through this op"
+        )
+    grad_hidden, grad_weight = ctx.grad_hidden, ctx.grad_weight
+    scale = grad_out / ctx.n_valid
+    # drop ctx refs so the buffers free as soon as autograd consumes them
+    ctx.grad_hidden = ctx.grad_weight = ctx.n_valid = None
+
+    # in place: grad_weight is a full fp32 (V, D), a copy would double it
+    grad_hidden.mul_(scale.to(grad_hidden.dtype))
+    if grad_weight is not None:
+        grad_weight.mul_(scale)
+    return grad_hidden, grad_weight
+
+
 class _FusedLinearCE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, labels, ignore_index, chunk_size):
@@ -51,16 +88,11 @@ class _FusedLinearCE(torch.autograd.Function):
 
         loss_sum = torch.zeros((), dtype=torch.float32, device=hidden.device)
         grad_hidden = torch.empty_like(hidden)
-        grad_weight = (
-            torch.zeros_like(weight, dtype=torch.float32)
-            if weight.requires_grad else None
-        )
+        grad_weight = _new_grad_weight(weight)
 
         for s in range(0, N, chunk_size):
             e = min(s + chunk_size, N)
-            chunk_loss, gh, grad_logits = _chunk_fwd(
-                hidden[s:e], w, labels[s:e], ignore_index
-            )
+            chunk_loss, gh, grad_logits = _chunk_fwd(hidden[s:e], w, labels[s:e], ignore_index)
             loss_sum += chunk_loss
             grad_hidden[s:e] = gh
             if grad_weight is not None:
@@ -74,31 +106,11 @@ class _FusedLinearCE(torch.autograd.Function):
             del grad_logits
 
         n_valid = (labels != ignore_index).sum().clamp_min(1)
-        # plain ctx attributes, not save_for_backward, so backward can scale
-        # them in place and drop them early
-        ctx.n_valid = n_valid
-        ctx.grad_hidden = grad_hidden
-        ctx.grad_weight = grad_weight
-        return loss_sum / n_valid
+        return _stash_grads(ctx, loss_sum, n_valid, grad_hidden, grad_weight)
 
     @staticmethod
     def backward(ctx, grad_out):
-        if ctx.n_valid is None:
-            raise RuntimeError(
-                "fused_linear_cross_entropy: backward called twice. the stashed "
-                "grads are consumed in place on the first call, so retain_graph "
-                "does not work through this op"
-            )
-        grad_hidden, grad_weight = ctx.grad_hidden, ctx.grad_weight
-        scale = grad_out / ctx.n_valid
-        # drop ctx refs so the buffers free as soon as autograd consumes them
-        ctx.grad_hidden = ctx.grad_weight = ctx.n_valid = None
-
-        # in place: grad_weight is a full fp32 (V, D), a copy would double it
-        grad_hidden.mul_(scale.to(grad_hidden.dtype))
-        if grad_weight is not None:
-            grad_weight.mul_(scale)
-        return grad_hidden, grad_weight, None, None, None
+        return (*_scaled_grads(ctx, grad_out), None, None, None)
 
 
 # ---- vocab-parallel variant ------------------------------------------------
@@ -140,6 +152,7 @@ _VP_COMPILED: dict = {}
 
 
 def _vp(fn, device: torch.device):
+    """`fn` compiled (once) on cuda, as is on cpu."""
     if device.type != "cuda":
         return fn
     if fn not in _VP_COMPILED:
@@ -162,10 +175,7 @@ class _VocabParallelFusedLinearCE(torch.autograd.Function):
 
         loss_sum = torch.zeros((), dtype=torch.float32, device=device)
         grad_hidden = torch.empty_like(hidden)
-        grad_weight = (
-            torch.zeros_like(weight, dtype=torch.float32)
-            if weight.requires_grad else None
-        )
+        grad_weight = _new_grad_weight(weight)
 
         for s in range(0, N, chunk_size):
             e = min(s + chunk_size, N)
@@ -198,27 +208,11 @@ class _VocabParallelFusedLinearCE(torch.autograd.Function):
         all_reduce(grad_hidden, mesh, axis, "sum")
 
         n_valid = valid_all.sum().clamp_min(1)
-        ctx.n_valid = n_valid
-        ctx.grad_hidden = grad_hidden
-        ctx.grad_weight = grad_weight
-        return loss_sum / n_valid
+        return _stash_grads(ctx, loss_sum, n_valid, grad_hidden, grad_weight)
 
     @staticmethod
     def backward(ctx, grad_out):
-        if ctx.n_valid is None:
-            raise RuntimeError(
-                "fused_linear_cross_entropy: backward called twice. the stashed "
-                "grads are consumed in place on the first call, so retain_graph "
-                "does not work through this op"
-            )
-        grad_hidden, grad_weight = ctx.grad_hidden, ctx.grad_weight
-        scale = grad_out / ctx.n_valid
-        ctx.grad_hidden = ctx.grad_weight = ctx.n_valid = None
-
-        grad_hidden.mul_(scale.to(grad_hidden.dtype))
-        if grad_weight is not None:
-            grad_weight.mul_(scale)
-        return grad_hidden, grad_weight, None, None, None, None, None
+        return (*_scaled_grads(ctx, grad_out), None, None, None, None, None)
 
 
 def fused_linear_cross_entropy(

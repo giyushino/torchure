@@ -64,6 +64,24 @@ class MeshLike(Protocol):
         ...
 
 
+def _check_output(output_tensor: torch.Tensor, like: torch.Tensor, shape: tuple, dim: int) -> None:
+    """a caller-provided destination buffer must already be in the collective's layout."""
+    assert dim == 0, (
+        f"a caller-provided output_tensor needs the gather/scatter dim to be 0, got {dim}: "
+        "the buffer is in stacked-along-0 layout, not the returned view's layout"
+    )
+    assert tuple(output_tensor.shape) == shape, (
+        f"output_tensor shape {tuple(output_tensor.shape)} != expected {shape}"
+    )
+    assert output_tensor.dtype == like.dtype, (
+        f"output_tensor dtype {output_tensor.dtype} != input dtype {like.dtype}"
+    )
+    assert output_tensor.device == like.device, (
+        f"output_tensor device {output_tensor.device} != input device {like.device}"
+    )
+    assert output_tensor.is_contiguous(), "output_tensor must be contiguous"
+
+
 def all_reduce(
     tensor: torch.Tensor,
     mesh: MeshLike,
@@ -125,28 +143,12 @@ def all_gather(
     expected_shape = (group_size * input_tensor.size(0), *input_tensor.size()[1:])
 
     if output_tensor is None:
-        output_tensor = torch.empty(
-            expected_shape, dtype=tensor.dtype, device=tensor.device
-        )
+        output_tensor = torch.empty(expected_shape, dtype=tensor.dtype, device=tensor.device)
     else:
-        assert gather_dim == 0, (
-            f"caller-provided output_tensor requires gather_dim=0, got {gather_dim}; "
-            "the buffer is in stacked-along-0 layout, not the returned view's layout"
-        )
-        assert tuple(output_tensor.shape) == expected_shape, (
-            f"output_tensor shape {tuple(output_tensor.shape)} != expected {expected_shape}"
-        )
-        assert output_tensor.dtype == tensor.dtype, (
-            f"output_tensor dtype {output_tensor.dtype} != input dtype {tensor.dtype}"
-        )
-        assert output_tensor.device == tensor.device, (
-            f"output_tensor device {output_tensor.device} != input device {tensor.device}"
-        )
-        assert output_tensor.is_contiguous(), "output_tensor must be contiguous"
+        _check_output(output_tensor, tensor, expected_shape, gather_dim)
 
     work = dist.all_gather_into_tensor(
-        output_tensor=output_tensor, input_tensor=input_tensor, 
-        group=group, async_op = async_op
+        output_tensor=output_tensor, input_tensor=input_tensor, group=group, async_op=async_op
     )
     out = output_tensor.movedim(0, gather_dim)
     return (out, work) if async_op else out
@@ -160,7 +162,7 @@ def reduce_scatter(
     scatter_dim: int = 0,
     *,
     async_op: bool = False,
-    output_tensor: torch.Tensor | None = None
+    output_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, dist.Work]:
     """
     reduce across the group, then each rank keeps only its coordinate-th
@@ -175,7 +177,10 @@ def reduce_scatter(
     """
     group = mesh.get_group(dim)
     group_size = mesh.size(dim)
-    assert tensor.shape[scatter_dim] % group_size == 0, f"shape[{scatter_dim}]={tensor.shape[scatter_dim]} not divisible by group size {group_size}"
+    assert tensor.shape[scatter_dim] % group_size == 0, (
+        f"shape[{scatter_dim}]={tensor.shape[scatter_dim]} not divisible by "
+        f"group size {group_size}"
+    )
 
     # gloo avg emulation. must happen before .contiguous() (which may copy),
     # and out of place: unlike all_reduce, the input must not be mutated
@@ -186,26 +191,13 @@ def reduce_scatter(
     input_tensor = tensor.movedim(scatter_dim, 0).contiguous()
     expected_shape = (input_tensor.size(0) // group_size, *input_tensor.size()[1:])
     if output_tensor is None:
-        output_tensor = torch.empty(
-            expected_shape, dtype=tensor.dtype, device=tensor.device
-        )
+        output_tensor = torch.empty(expected_shape, dtype=tensor.dtype, device=tensor.device)
     else:
-        assert scatter_dim == 0, (
-            f"caller-provided output_tensor requires gather_dim=0, got {scatter_dim}; "
-            "the buffer is in stacked-along-0 layout, not the returned view's layout"
-        )
-        assert tuple(output_tensor.shape) == expected_shape, (
-            f"output_tensor shape {tuple(output_tensor.shape)} != expected {expected_shape}"
-        )
-        assert output_tensor.dtype == tensor.dtype, (
-            f"output_tensor dtype {output_tensor.dtype} != input dtype {tensor.dtype}"
-        )
-        assert output_tensor.device == tensor.device, (
-            f"output_tensor device {output_tensor.device} != input device {tensor.device}"
-        )
-        assert output_tensor.is_contiguous(), "output_tensor must be contiguous"
+        _check_output(output_tensor, tensor, expected_shape, scatter_dim)
 
-    work = dist.reduce_scatter_tensor(output=output_tensor, input=input_tensor, op=_OPS[op], group=group, async_op=async_op)
+    work = dist.reduce_scatter_tensor(
+        output=output_tensor, input=input_tensor, op=_OPS[op], group=group, async_op=async_op
+    )
     out = output_tensor.movedim(0, scatter_dim)
     return (out, work) if async_op else out
 
@@ -231,10 +223,9 @@ def all_to_all(
     assert tensor.shape[split_dim] % group_size == 0
     assert not async_op, "all_to_all is sync-only (v0)"
     input_tensor = tensor.movedim(split_dim, 0).contiguous()
-    output_tensor = torch.empty_like(input_tensor, dtype=tensor.dtype, device=tensor.device)
+    output_tensor = torch.empty_like(input_tensor)
     dist.all_to_all_single(output=output_tensor, input=input_tensor, group=group)
-    chunks = output_tensor.chunk(group_size, dim=0)
-    chunks = [c.movedim(0, split_dim) for c in chunks]
+    chunks = [c.movedim(0, split_dim) for c in output_tensor.chunk(group_size, dim=0)]
     return torch.cat(chunks, dim=concat_dim)
 
 

@@ -19,7 +19,6 @@ numbers come from:
 
 import argparse
 import os
-
 from datetime import timedelta
 
 import torch
@@ -36,8 +35,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="benchmark mode: run exactly N steps (no checkpointing) and print "
-             "tps/peak mem. this is what CHANGES.md numbers come from; omit to "
-             "run the config's full schedule",
+             "tps/peak mem. omit to run the config's full schedule",
     )
     return parser.parse_args()
 

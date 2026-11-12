@@ -68,9 +68,14 @@ def build_dataloader(
     data_cfg, tokenizer: Tokenizer, ignore_id: int, dp_rank: int, dp_size: int,
     shield_sigterm: bool = False,
 ):
-    # shield_sigterm: workers ignore SIGTERM (see _ignore_sigterm). only for a
-    # caller that calls shutdown_workers() before exit; off by default so a
-    # plain script can't hang at exit.
+    """
+    a streaming hf dataset -> shuffle -> this dp rank's shards -> tokenize and
+    pack into seq_len rows -> micro batches.
+
+    shield_sigterm: workers ignore SIGTERM (see _ignore_sigterm). only for a
+    caller that calls shutdown_workers() before exit; off by default so a
+    plain script can't hang at exit.
+    """
     # an explicit split returns an IterableDataset (not a Dict), which
     # split_dataset_by_node needs. `config` is the hf subset name, or None.
     # TODO: doesn't handle hf datasets stored as json
@@ -116,8 +121,5 @@ def build_dataloader(
         persistent_workers=num_workers > 0,
         # fork can deadlock on fsspec's background threads inherited from the parent
         multiprocessing_context="spawn" if num_workers > 0 else None,
-        pin_memory=True
+        pin_memory=True,
     )
-
-
-

@@ -5,7 +5,6 @@ TODO: replace the @debug_time profiling decorators with a real profiler
 """
 
 import atexit
-import json
 import os
 import signal
 import time
@@ -29,8 +28,12 @@ from torchure.optimizer.builder import build_optimizer, build_scheduler
 from torchure.parallelism.data_parallel import DDP
 from torchure.parallelism.fsdp2 import FSDP
 from torchure.parallelism.tensor_parallel import TP
-from torchure.utils import debug_time, get_project_dir
+from torchure.utils import debug_time, get_project_dir, load_json
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -42,7 +45,7 @@ torch.set_float32_matmul_precision("high")
 PROJECT_DIR = get_project_dir()
 
 # config strings -> dtypes for fsdp's mixed precision. None means "no cast":
-# gathered params keep the fp32 master dtype (what an fp32 debug run wants).
+# gathered params keep the fp32 master dtype (what an fp32 debug run wants)
 _DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
@@ -51,15 +54,9 @@ _DTYPES = {
     "none": None,
 }
 
-def load_json(train_config_path: str) -> dict:
-    with open(train_config_path, 'r') as file:
-        return json.load(file)
-
-try:
-    import wandb
-    HAS_WANDB = True
-except ImportError:
-    HAS_WANDB = False
+# fixed, because order matters: the last axis gets stride 1 (tp peers on
+# adjacent ranks), and mesh.flatten needs its axes in spec order
+MESH_AXIS_ORDER = ("pp", "dp_replicate", "dp_shard", "cp", "tp", "ep")
 
 
 class Trainer:
@@ -86,30 +83,17 @@ class Trainer:
         # the mesh drops size-1 axes, so no tp axis means no tensor parallel
         self.tp_size = self.mesh.sizes.get("tp", 1)
 
-        # read here, not in _parallelize, because it also gates checkpointing below
+        # "ddp" | "fsdp"
         self.parallelism = self.config.get("parallelism", "ddp")
+        # set by _build_model: the data-parallel strategy (DDP | FSDP) and the
+        # tensor-parallel one, if any
+        self.parallel: DDP | FSDP
         self.tp: TP | None = None
 
         self.ignore_index = self.config["objective"]["config"]["ignore_index"]
         self.tokenizer = Tokenizer.from_pretrained(self.config["data"]["tokenizer"])
 
-        # plain ddp: build -> init -> replicate. anything sharded (fsdp, tp or
-        # both): build on the meta device -> shard -> init the shards, so no
-        # rank ever holds the full weights. tp cuts first; fsdp then shards
-        # what tp left on the rank, and ddp replicates it.
         self.model = self._build_model()
-        if self.parallelism == "fsdp" or self.tp_size > 1:
-            self.tp = self._tensor_parallelize(self.model)
-            if self.parallelism == "fsdp":
-                self.model = self._parallelize(self.model)
-            else:
-                materialize(self.model, self.device)
-            self._init_shards(self.model)
-            if self.parallelism != "fsdp":
-                self.model = self._parallelize(self.model)
-        else:
-            self._init_weights(self.model)
-            self.model = self._parallelize(self.model)
         self.model.activation_checkpointing = self.config.get("activation_checkpointing", False)
         # init ran on the shared seed so every rank built the same model; from
         # here each dp rank draws its own stream (dropout, diffusion masks).
@@ -117,13 +101,15 @@ class Trainer:
         torch.manual_seed(self.seed + 1 + self.mesh.coordinate("dp"))
         self._compile(self.model)
 
-        self.objective = self._build_objective()
+        obj_cfg = self.config["objective"]
+        self.objective = build_objective(obj_cfg["name"], obj_cfg["config"])
         # the fused loss reads the head weight directly, bypassing tp's hooks
         self.objective.tp = self.tp
-        self.optimizer = self._build_optimizer(self.model)
-        self.scheduler = self._build_scheduler(self.optimizer)
-        self.num_train_steps = self.config["optimizer"]["scheduler"]["total_steps"]
-        self.max_norm = self.config["optimizer"].get("max_norm")
+        optim_cfg = self.config["optimizer"]
+        self.optimizer = build_optimizer(self.model, optim_cfg["name"], optim_cfg["config"])
+        self.scheduler = build_scheduler(self.optimizer, optim_cfg["scheduler"])
+        self.num_train_steps = optim_cfg["scheduler"]["total_steps"]
+        self.max_norm = optim_cfg.get("max_norm")
 
         self.dataloader = self._build_dataloader()
         self.global_batch_size = self.config["data"]["global_batch_size"]
@@ -170,18 +156,17 @@ class Trainer:
         self._setup_wandb()
 
         # must come after _resume restores the dataloader state
-        self.dataloader_iter = iter(self.dataloader)
+        dataloader_iter = iter(self.dataloader)
         # workers ignore SIGTERM (see builder._ignore_sigterm), so they must be
         # torn down explicitly on every exit path or the process hangs at exit
-        atexit.register(shutdown_workers, self.dataloader_iter)
+        atexit.register(shutdown_workers, dataloader_iter)
         self.prefetcher = CUDAPrefetcher(
-            self.dataloader_iter, self.device, first_batch=self._resumed_batch
+            dataloader_iter, self.device, first_batch=self._resumed_batch
         )
 
         # set by the SIGTERM handler train() installs; see _stop_requested
         self._sigterm = False
         self._sigterm_at = 0.0
-
 
     def _setup_wandb(self) -> None:
         """rank 0 only. runs after _resume so it can reattach to the checkpointed run id."""
@@ -189,7 +174,7 @@ class Trainer:
         wandb_cfg = self.config.get("wandb", {})
         if not wandb_cfg.get("enabled", False) or self.rank != 0 or self.benchmark:
             return
-        assert HAS_WANDB, (
+        assert wandb is not None, (
             "wandb.enabled is true in the config but wandb isn't installed: "
             "uv sync --extra wandb"
         )
@@ -224,14 +209,36 @@ class Trainer:
         )
 
     def _build_model(self) -> nn.Module:
-        model_cfg = self.config["model"]
-        if self.parallelism == "fsdp" or self.tp_size > 1:
-            # shapes only: this rank's shards are allocated later, nothing more
-            with torch.device("meta"):
-                return build_model(model_cfg["name"], model_cfg["config"])
-        return build_model(model_cfg["name"], model_cfg["config"])
+        """
+        build, initialize and parallelize the model; sets self.parallel and
+        self.tp.
 
-    def _parallelize(self, model: nn.Module) -> nn.Module:
+        plain ddp: build -> init -> replicate. anything sharded (fsdp, tp or
+        both): build on the meta device (shapes only) -> shard -> init the
+        shards, so no rank ever holds the full weights. tp cuts first; fsdp
+        then shards what tp left on the rank, and ddp replicates it.
+        """
+        model_cfg = self.config["model"]
+        if self.parallelism != "fsdp" and self.tp_size == 1:
+            model = build_model(model_cfg["name"], model_cfg["config"])
+            model.to(self.device)
+            model.init_weights()
+            self._parallelize(model)
+            return model
+
+        with torch.device("meta"):
+            model = build_model(model_cfg["name"], model_cfg["config"])
+        self.tp = self._tensor_parallelize(model)
+        if self.parallelism == "fsdp":
+            self._parallelize(model)  # allocates this rank's shards
+            self._init_shards(model)
+        else:
+            materialize(model, self.device)
+            self._init_shards(model)
+            self._parallelize(model)  # ddp, replicating what tp left
+        return model
+
+    def _parallelize(self, model: nn.Module) -> None:
         """
         attach the data-parallel strategy as `self.parallel`. the trainer only
         uses `requires_sync`, `sync()`, and `shard_dims`, so train_step never
@@ -272,7 +279,6 @@ class Trainer:
             raise ValueError(
                 f"unknown parallelism {self.parallelism!r}; expected 'ddp' or 'fsdp'"
             )
-        return model
 
     def _tensor_parallelize(self, model: nn.Module) -> TP | None:
         """
@@ -327,12 +333,6 @@ class Trainer:
         # gives the final norm a fused kernel for bf16 input x fp32 weight
         model.norm.compile(mode=mode)
 
-    def _init_weights(self, model: nn.Module) -> None:
-        model.to(self.device)
-        model.init_weights()
-        # don't cast norm weights to bf16: bf16 spacing at 1.0 (~0.004) is far
-        # larger than an adamw update (~lr), so the gains would never move
-
     def _init_shards(self, model: nn.Module) -> None:
         """
         init a model materialized from meta: each rank fills only its own
@@ -351,23 +351,11 @@ class Trainer:
         if self.tp is not None:
             self.tp.finish_init(model)
 
-    def _build_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
-        optim_cfg = self.config["optimizer"]
-        return build_optimizer(model, optim_cfg["name"], optim_cfg["config"])
-
-    def _build_scheduler(self, optimizer: torch.optim.Optimizer) -> torch.optim.lr_scheduler.LRScheduler:
-        scheduler_cfg = self.config["optimizer"]["scheduler"]
-        return build_scheduler(optimizer, scheduler_cfg)
-
-    def _build_objective(self):
-        obj_cfg = self.config["objective"]
-        return build_objective(obj_cfg["name"], obj_cfg["config"])
-    
     @debug_time
     def _build_dataloader(self) -> torchdata.stateful_dataloader.StatefulDataLoader:
         return build_dataloader(
-            self.config["data"], self.tokenizer, self.ignore_index, 
-            self.mesh.coordinate("dp"), self.mesh.size("dp"),
+            self.config["data"], self.tokenizer, self.ignore_index,
+            self.mesh.coordinate("dp"), self.dp_size,
             # so a job-wide SIGTERM can't kill the workers before the
             # checkpoint; __init__ registers the matching teardown
             shield_sigterm=True,
@@ -375,12 +363,8 @@ class Trainer:
 
     def _build_mesh(self) -> Mesh:
         """
-        canonicalize the config's mesh spec and add the flattened `dp` axis.
-        `dp: N` is shorthand for `dp_shard: N`.
-
-        the spec is rebuilt in a fixed axis order because order matters: the
-        last axis gets stride 1 (tp/cp on adjacent ranks), and mesh.flatten
-        requires its axes in spec order.
+        canonicalize the config's mesh spec (into MESH_AXIS_ORDER) and add the
+        flattened `dp` axis. `dp: N` is shorthand for `dp_shard: N`.
         """
         # copy: self.config["mesh"] is saved in checkpoints and checked on resume
         mesh_cfg = dict(self.config["mesh"])
@@ -392,10 +376,8 @@ class Trainer:
         if "dp" in mesh_cfg:
             mesh_cfg["dp_shard"] = mesh_cfg.pop("dp")
 
-        AXIS_ORDER = ("pp", "dp_replicate", "dp_shard", "cp", "tp", "ep")
-
         spec = {}
-        for axis in AXIS_ORDER:
+        for axis in MESH_AXIS_ORDER:
             size = mesh_cfg.pop(axis, 1)
             # size-1 axes cost world_size new_group calls, so drop them, except
             # the dp axes, which flatten() needs
@@ -406,15 +388,6 @@ class Trainer:
         mesh.flatten(("dp_replicate", "dp_shard"), "dp")
         return mesh
 
-
-    def get_batch_prefetcher(self) -> dict[str, torch.Tensor]:
-        return next(self.prefetcher)
-    
-    def get_batch(self) -> dict[str, torch.Tensor]:
-        curr_batch = next(self.dataloader_iter)
-        # non_blocking relies on pin_memory=True in the dataloader
-        return {k: v.to(self.device, non_blocking=True) for k, v in curr_batch.items()}
-    
     def _shard_layout(self) -> ShardLayout:
         """how this run shards model/optimizer state, for the checkpointer."""
         return ShardLayout.of(self.model, self.parallel, self.mesh, tp=self.tp)
@@ -508,20 +481,33 @@ class Trainer:
         if self.tp_size > 1:
             all_reduce(flag, self.mesh, "tp", "max")
         return flag.item() > 0
-            
-    def _resume(self) -> int:
-        if self.resume is None:
-            return 0
-        if self.resume == "auto":
-            step = self.checkpointer.latest()
-            if step is None:
-                return 0
-        elif isinstance(self.resume, int):
-            step = self.checkpointer.valid_step(self.resume)
-            assert step is not None, "non valid step to resume from"
-        else:
-            raise ValueError("invalid value for resume, must be either None, 'auto', or valid integer training step")
 
+    def _resume_step(self) -> int | None:
+        """
+        the checkpoint step to resume from, per `checkpointing.resume`: null
+        (start fresh), "auto" (the latest complete step, if any) or an
+        explicit step. None means start fresh.
+        """
+        if self.resume is None:
+            return None
+        if self.resume == "auto":
+            return self.checkpointer.latest()
+        if isinstance(self.resume, int):
+            step = self.checkpointer.valid_step(self.resume)
+            assert step is not None, (
+                f"checkpointing.resume={self.resume}: no complete checkpoint at that "
+                f"step in {self.checkpointer_path}"
+            )
+            return step
+        raise ValueError(
+            f"checkpointing.resume={self.resume!r}: expected null, 'auto' or a training step"
+        )
+
+    def _resume(self) -> int:
+        """restore everything from a checkpoint; returns the step to start at."""
+        step = self._resume_step()
+        if step is None:
+            return 0
 
         state = self.checkpointer.load_trainer(step)
         # model/optimizer state reshards onto any mesh, but the per-rank
@@ -533,14 +519,41 @@ class Trainer:
         )
         layout = self._shard_layout()
         self.checkpointer.load_model(self.model, step, layout)
-        # load_state_dict overwrites param_groups wholesale; keep this config's
-        # hparams and take only per-param state from the checkpoint
+        self._resume_optimizer(step, layout)
+
+        dp_rank = self.mesh.coordinate("dp")
+        if self.resume_dataloader:
+            self.checkpointer.load_dataloader(self.dataloader, step, dp_rank)
+            # older checkpoints have none: they resume one batch ahead
+            held = self.checkpointer.load_prefetcher(step, dp_rank)
+            if held is not None:
+                self._resumed_batch = held["next_batch"]
+        # each dp rank resumes its own stream. older checkpoints carry only
+        # rank 0's, in trainer.pt. a rank with neither (resume onto a larger
+        # mesh) keeps the seed-derived stream it already has.
+        rng = self.checkpointer.load_rng(step, dp_rank)
+        if rng is None and "cpu_rng" in state:
+            rng = state
+        if rng is not None:
+            torch.set_rng_state(rng["cpu_rng"])
+            torch.cuda.set_rng_state(rng["cuda_rng"], self.device)
+        # .get: older checkpoints have no wandb_id
+        self.resume_wandb_id = state.get("wandb_id")
+        return state["step"]
+
+    def _resume_optimizer(self, step: int, layout: ShardLayout) -> None:
+        """
+        optimizer and scheduler state. per-param state (adam moments) always
+        comes from the checkpoint and hparams from this config, except lr,
+        which belongs to the scheduler when that is resumed too.
+        """
+        # load_state_dict overwrites param_groups wholesale, so save this
+        # config's hparams and put them back
         config_hparams = [
             {k: v for k, v in group.items() if k != "params"}
             for group in self.optimizer.param_groups
         ]
         self.checkpointer.load_optimizer(self.optimizer, step, layout)
-        # a resumed scheduler owns lr
         lr_keys = ("lr", "initial_lr") if self.resume_scheduler else ()
         for group, hparams in zip(self.optimizer.param_groups, config_hparams, strict=True):
             group.update({k: v for k, v in hparams.items() if k not in lr_keys})
@@ -555,28 +568,14 @@ class Trainer:
             for group, lr in zip(self.optimizer.param_groups, lrs, strict=True):
                 group["lr"] = lr
             self.scheduler._last_lr = lrs
-        if self.resume_dataloader:
-            dp_rank = self.mesh.coordinate("dp")
-            self.checkpointer.load_dataloader(self.dataloader, step, dp_rank)
-            # older checkpoints have none: they resume one batch ahead
-            held = self.checkpointer.load_prefetcher(step, dp_rank)
-            if held is not None:
-                self._resumed_batch = held["next_batch"]
-        # each dp rank resumes its own stream. older checkpoints carry only
-        # rank 0's, in trainer.pt. a rank with neither (resume onto a larger
-        # mesh) keeps the seed-derived stream it already has.
-        rng = self.checkpointer.load_rng(step, self.mesh.coordinate("dp"))
-        if rng is None and "cpu_rng" in state:
-            rng = state
-        if rng is not None:
-            torch.set_rng_state(rng["cpu_rng"])
-            torch.cuda.set_rng_state(rng["cuda_rng"], self.device)
-        # .get: older checkpoints have no wandb_id
-        self.resume_wandb_id = state.get("wandb_id")
-        return state["step"]
+
+    def _grad_shard_dims(self, param: nn.Parameter) -> tuple[str, ...]:
+        """the mesh axes `param`'s grad is sharded over (for the global grad norm)."""
+        dims = self.parallel.shard_dims
+        return dims if self.tp is None else dims + self.tp.shard_dims_of(param)
 
     def micro_train_step(self) -> torch.Tensor:
-        batch = self.get_batch_prefetcher()
+        batch = next(self.prefetcher)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             loss = self.objective.compute_loss(self.model, batch) / self.microbatches_per_step
 
@@ -593,19 +592,13 @@ class Trainer:
         self.parallel.requires_sync = True
         loss += self.micro_train_step()
         self.parallel.sync()
-        if self.tp is None:
-            grad_norm = clip_grad_norm(
-                self.model.parameters(), self.mesh, self.max_norm,
-                shard_dims=self.parallel.shard_dims,
-            )
-        else:
+        if self.tp is not None:
             # after the dp sync: it reduces these same grad tensors in the background
             self.tp.sync()
-            dp_dims = self.parallel.shard_dims
-            grad_norm = clip_grad_norm(
-                self.model.parameters(), self.mesh, self.max_norm,
-                shard_dims_of=lambda p: dp_dims + self.tp.shard_dims_of(p),
-            )
+        grad_norm = clip_grad_norm(
+            self.model.parameters(), self.mesh, self.max_norm,
+            shard_dims_of=self._grad_shard_dims,
+        )
         self.optimizer.step()
         self.optimizer.zero_grad()
         self.scheduler.step()
@@ -644,9 +637,11 @@ class Trainer:
                 step_time = (time.perf_counter() - t0) / window
                 if self.rank == 0:
                     self._log_metrics(loss, gnorm, done, tokens_per_step, step_time)
-                    print(f"step={done} || loss={loss:.4f} || gnorm={gnorm:.3f} "
+                    print(
+                        f"step={done} || loss={loss:.4f} || gnorm={gnorm:.3f} "
                         f"|| lr={self.scheduler.get_last_lr()[0]:.2e} "
-                        f"|| tps={tokens_per_step / step_time:.0f}")
+                        f"|| tps={tokens_per_step / step_time:.0f}"
+                    )
                 loss_sum.zero_()
                 gnorm_sum.zero_()
                 window = 0
@@ -679,4 +674,3 @@ class Trainer:
                 # so a crash marks the wandb run crashed instead of leaving it "running"
                 if self.wandb_run is not None:
                     self.wandb_run.finish()
-

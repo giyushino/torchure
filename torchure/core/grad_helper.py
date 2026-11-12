@@ -1,7 +1,9 @@
 """
-grad operations
+gradient operations that have to know how grads are laid out across the mesh.
 """
+
 import torch
+
 from torchure.core.collective import all_reduce
 
 
@@ -44,4 +46,3 @@ def clip_grad_norm(params, mesh, max_norm, shard_dims=(), shard_dims_of=None) ->
     clip_coef = torch.clamp(max_norm / (total + 1e-6), max=1.0)
     torch._foreach_mul_(grads, clip_coef)
     return total
-    

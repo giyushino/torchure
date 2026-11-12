@@ -121,6 +121,7 @@ UNSHARDED = ShardLayout()
 
 
 def _flat(coords, counts) -> int:
+    """row-major index of grid cell `coords` in a grid of `counts`."""
     index = 0
     for coord, count in zip(coords, counts, strict=True):
         index = index * count + coord
@@ -140,6 +141,11 @@ def _box(shape, splits, counts, coords) -> tuple[list[int], list[int], list[int]
         size[dim] = valid
         stored[dim] = length
     return lo, size, stored
+
+
+def _index(start: list[int], stop: list[int], origin: list[int]) -> tuple[slice, ...]:
+    """the global range [start, stop) as an index into a box that begins at `origin`."""
+    return tuple(slice(a - o, b - o) for a, b, o in zip(start, stop, origin, strict=True))
 
 
 def _read(
@@ -169,20 +175,22 @@ def _read(
     out = None
     for cell in cells:
         lo, size, _ = _box(shape, saved_splits, saved_counts, cell)
-        a = [max(x, y) for x, y in zip(lo, want_lo, strict=True)]
-        b = [
-            min(x + n, y + m)
-            for x, n, y, m in zip(lo, size, want_lo, want_size, strict=True)
+        # intersection of the saved box and the wanted one, in global indices
+        start = [max(a, b) for a, b in zip(lo, want_lo, strict=True)]
+        stop = [
+            min(a + n, b + m)
+            for a, n, b, m in zip(lo, size, want_lo, want_size, strict=True)
         ]
-        if any(hi <= low for low, hi in zip(a, b, strict=True)):
+        if any(b <= a for a, b in zip(start, stop, strict=True)):
             continue
         piece = pick(shards[_flat(cell, saved_counts)])
-        src = piece[tuple(slice(low - x, hi - x) for low, hi, x in zip(a, b, lo, strict=True))]
+        src = piece[_index(start, stop, lo)]
         if list(src.shape) == want_stored:
+            # one saved piece covers the whole box
             return src.clone()
         if out is None:
             out = piece.new_zeros(want_stored)
-        out[tuple(slice(low - x, hi - x) for low, hi, x in zip(a, b, want_lo, strict=True))] = src
+        out[_index(start, stop, want_lo)] = src
     if out is None:
         # this rank's box is all padding
         out = pick(shards[0]).new_zeros(want_stored)
@@ -239,15 +247,17 @@ class Checkpointer:
         self.world_size = world_size
         self.async_save = async_save
         os.makedirs(self.checkpoint_save_path, exist_ok=True)
-        self._begun: int | None = None          # step whose files are being written
+        self._begun: int | None = None               # step whose files are being written
         self._queue: list[tuple[str, object]] = []   # async: (path, snapshot) not yet written
-        self._thread: threading.Thread | None = None
-        self._error: BaseException | None = None
-    
+        self._thread: threading.Thread | None = None  # async: the save in flight
+        self._error: BaseException | None = None      # async: what the last save died of
+
     def latest(self) -> int | None:
+        """the newest complete step, or None."""
         return max(self._steps(), default=None)
 
     def valid_step(self, step: int) -> int | None:
+        """`step` if it is a complete checkpoint, else None."""
         return step if step in self._steps() else None
 
     def _steps(self) -> list[int]:
@@ -329,9 +339,10 @@ class Checkpointer:
             mmap=mmap,
         )
 
-    def _save_shard(self, state: dict, step: int, stem: str, layout: ShardLayout, meta: dict) -> None:
+    def _save_shard(
+        self, state: dict, step: int, stem: str, layout: ShardLayout, meta: dict
+    ) -> None:
         """this rank's shard of `state`, plus the metadata if it is cell 0."""
-        step_dir = self._step_dir(step, create=True)
         if layout.num_shards == 1:
             self._put(state, step, f"{stem}.pt")
             return
@@ -339,14 +350,19 @@ class Checkpointer:
         if layout.index == 0:
             # tiny, so written inline even when async; the marker gates it
             meta = {"counts": list(layout.counts), **meta}
-            with open(os.path.join(step_dir, f"{stem}_shards.json"), "w") as f:
+            with open(os.path.join(self._step_dir(step), f"{stem}_shards.json"), "w") as f:
                 json.dump(meta, f, indent=1)
 
     def _load_shards(self, step: int, stem: str, pick_of) -> tuple[list[dict], dict]:
-        """every shard's saved state (mmapped), and the saved metadata."""
+        """
+        every shard's saved state (mmapped), and the saved metadata.
+        `pick_of` is only needed to upgrade legacy metadata (see _legacy_meta).
+        """
         meta_path = os.path.join(self._step_dir(step), f"{stem}_shards.json")
         if not os.path.exists(meta_path):
-            return [self._load(step, f"{stem}.pt", mmap=True)], {"counts": [], "splits": {}, "shapes": {}}
+            # saved unsharded: one file, nothing cut
+            unsharded = {"counts": [], "splits": {}, "shapes": {}}
+            return [self._load(step, f"{stem}.pt", mmap=True)], unsharded
         with open(meta_path) as f:
             meta = json.load(f)
         count = meta["num_shards"] if "num_shards" in meta else math.prod(meta["counts"])
@@ -372,7 +388,9 @@ class Checkpointer:
         self, optimizer: torch.optim.Optimizer, step: int, layout: ShardLayout = UNSHARDED
     ) -> None:
         state = optimizer.state_dict()
+        # state_dict keys per-param state by position across the param groups
         params = [p for group in optimizer.param_groups for p in group["params"]]
+        # followers: the state tensors shaped like their param, sharded with it
         meta: dict = {"splits": {}, "shapes": {}, "followers": {}}
         for idx, param_state in state["state"].items():
             param = params[idx]
@@ -404,19 +422,18 @@ class Checkpointer:
     def save_prefetcher(self, state: dict, step: int, dp_rank: int = 0) -> None:
         self._put(state, step, f"prefetcher_dp{dp_rank}.pt")
 
-    def load_prefetcher(self, step: int, dp_rank: int = 0) -> dict | None:
-        """the batch this dp rank had prefetched but not consumed, if saved."""
-        name = f"prefetcher_dp{dp_rank}.pt"
+    def _load_if_saved(self, step: int, name: str) -> dict | None:
         if not os.path.exists(os.path.join(self._step_dir(step), name)):
             return None
         return self._load(step, name)
 
+    def load_prefetcher(self, step: int, dp_rank: int = 0) -> dict | None:
+        """the batch this dp rank had prefetched but not consumed, if saved."""
+        return self._load_if_saved(step, f"prefetcher_dp{dp_rank}.pt")
+
     def load_rng(self, step: int, dp_rank: int = 0) -> dict | None:
         """this dp rank's rng state, or None if the checkpoint has none for it."""
-        name = f"rng_dp{dp_rank}.pt"
-        if not os.path.exists(os.path.join(self._step_dir(step), name)):
-            return None
-        return self._load(step, name)
+        return self._load_if_saved(step, f"rng_dp{dp_rank}.pt")
 
     def load_trainer(self, step: int) -> dict:
         return self._load(step, "trainer.pt")
@@ -465,10 +482,12 @@ class Checkpointer:
                     state[idx][key] = value
                     continue
                 if key in followers:
+                    # saved sharded, alongside its param
                     shape = tuple(meta["shapes"][str(idx)])
                     saved_splits = tuple(map(tuple, meta["splits"][str(idx)]))
                     follows = True
                 else:
+                    # saved whole: it follows the param if it has its shape
                     shape, saved_splits = tuple(value.shape), ()
                     follows = shape == full_shape
                 state[idx][key] = _read(

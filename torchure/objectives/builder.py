@@ -1,9 +1,8 @@
 """
-registry to store the objectives
-we can have this because we want to
-decouple the models from the loss
-functions
+objective registry. objectives own the loss, so models stay decoupled from
+loss functions.
 """
+
 from torchure.objectives.autoregressive import ARObjective
 
 OBJECTIVE_REGISTRY = {

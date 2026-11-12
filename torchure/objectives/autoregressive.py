@@ -3,14 +3,13 @@ autoregressive next-token objective
 """
 
 import torch
-
 import torch.nn as nn
 
 from torchure.loss.cross_entropy import cross_entropy_loss
 from torchure.loss.fused_linear_ce import fused_linear_cross_entropy
 
 
-class ARObjective():
+class ARObjective:
     def __init__(
         self,
         ignore_index: int = -100,
@@ -46,7 +45,3 @@ class ARObjective():
 
         logits = model(batch["input_ids"])
         return cross_entropy_loss(batch["labels"], logits, self.ignore_index)
-
-if __name__ == "__main__":
-    test = ARObjective()
-    print("works")

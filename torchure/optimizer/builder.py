@@ -16,7 +16,7 @@ OPTIMIZER_REGISTRY = {
 
 SCHEDULER_REGISTRY = {
     "wsd": WarmupStableDecayScheduler,
-    "cosine": CosineAnnealingScheduler
+    "cosine": CosineAnnealingScheduler,
 }
 
 
@@ -40,4 +40,3 @@ def build_scheduler(optimizer: optim.Optimizer, scheduler_config: dict) -> optim
     scheduler_type = scheduler_cfg.pop("type")
     scheduler_cfg["optimizer"] = optimizer
     return SCHEDULER_REGISTRY[scheduler_type](**scheduler_cfg)
-

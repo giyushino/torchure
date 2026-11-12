@@ -2,35 +2,23 @@
 placement value types: how one tensor is laid out along ONE mesh axis.
 
 a tensor's full layout is a `Placements` tuple with one entry per mesh axis,
-so a 2-axis (dp_replicate, dp_shard) mesh describes fsdp's master weights as
-`(Replicate(), Shard(0))`. it is a tuple even though fsdp v0 only ever shards
-along one axis: making it a scalar now means hsdp and tp both rewrite every
-call site.
+so on a (dp_replicate, dp_shard) mesh fsdp's master weights are
+`(Replicate(), Shard(0))`.
 
-the dividing line against core/dtensor.py: **anything here needs no process
-group.** these are value types plus the pure-local math (local shape, local
-slice) that happens to need no communication. every operation that launches a
-collective lives in dtensor.py's redistribute table. that keeps this module
-importable and unit-testable with no init_process_group and no mp.spawn --
-tests/placement.py is the only test file in the tree that doesn't need a
-distributed harness.
+nothing here needs a process group: these are value types plus the purely
+local math (local shape, local slice). everything that launches a collective
+lives in core/dtensor.py's redistribute table.
 
-frozen dataclasses on purpose: `frozen=True` gives __eq__ and __hash__
-together, which is what lets redistribute dispatch on placement values and
-what lets phase 3 put them in checkpoint metadata dicts. every field is a
-plain int/str for the same reason -- whatever serializer phase 3 picks will
-work without touching this file.
+the dataclasses are frozen so placements compare and hash by value:
+redistribute dispatches on them, and they can key dicts.
 """
 
 from dataclasses import dataclass
+from typing import get_args
 
 import torch
 
 from torchure.core.collective import ReduceOpName
-
-# kept in sync with collective._OPS by the assert in Partial.__post_init__;
-# duplicated as a tuple here only so this module doesn't reach into a private
-_LEGAL_OPS: tuple[str, ...] = ("sum", "avg", "max", "min")
 
 
 class Placement:
@@ -42,16 +30,12 @@ class Placement:
 @dataclass(frozen=True)
 class Shard(Placement):
     """
-    the tensor is split along tensor dim `dim` across this mesh axis; rank at
-    coordinate c holds chunk c. v0 requires even division and says so loudly
-    rather than padding.
+    the tensor is split along tensor dim `dim` across this mesh axis; the rank
+    at coordinate c holds chunk c. the split must be even (no padding; see
+    `padded_chunk` for the opt-in padded layout).
 
-    `dim` must be non-negative. it cannot be normalized at construction (the
-    tensor's rank isn't known yet), so allowing negatives would make
-    Shard(-1) and Shard(1) describe the same layout of a 2-d tensor while
-    comparing unequal and hashing differently -- every dict keyed on
-    placements would then silently hold two entries for one placement and the
-    redistribute table would miss. cheap to forbid, expensive to debug.
+    `dim` must be non-negative: Shard(-1) and Shard(1) would describe the
+    same layout of a 2-d tensor yet compare unequal.
     """
 
     dim: int
@@ -61,9 +45,8 @@ class Shard(Placement):
             f"Shard(dim) must be an int, got {type(self.dim).__name__}"
         )
         assert self.dim >= 0, (
-            f"Shard({self.dim}): negative dims are rejected because they can't be "
-            "normalized without a tensor rank, and Shard(-1) != Shard(ndim-1) "
-            "would silently split the placement's identity"
+            f"Shard({self.dim}): negative dims are rejected, because Shard(-1) and "
+            "Shard(ndim-1) would be the same layout but compare unequal"
         )
 
     def __repr__(self) -> str:
@@ -73,15 +56,11 @@ class Shard(Placement):
         """size of this rank's chunk along `dim`, asserting even division."""
         assert global_size % group_size == 0, (
             f"cannot shard dim of size {global_size} across {group_size} ranks: "
-            "not divisible. v0 does not pad -- the fix when a model needs it is "
-            "to pad the shard to ceil(global/group) and trim after the gather, "
-            "which also means the checkpoint has to record the unpadded size"
+            "not divisible, and Shard does not pad"
         )
         return global_size // group_size
 
-    def local_shape(
-        self, global_shape: tuple[int, ...], group_size: int
-    ) -> tuple[int, ...]:
+    def local_shape(self, global_shape: tuple[int, ...], group_size: int) -> tuple[int, ...]:
         """the per-rank shape of a tensor whose global shape is `global_shape`."""
         assert self.dim < len(global_shape), (
             f"Shard({self.dim}) but the tensor has only {len(global_shape)} dims"
@@ -90,9 +69,7 @@ class Shard(Placement):
         local[self.dim] = self.local_numel_along_dim(global_shape[self.dim], group_size)
         return tuple(local)
 
-    def global_shape(
-        self, local_shape: tuple[int, ...], group_size: int
-    ) -> tuple[int, ...]:
+    def global_shape(self, local_shape: tuple[int, ...], group_size: int) -> tuple[int, ...]:
         """inverse of local_shape: what the ranks' chunks concatenate into."""
         assert self.dim < len(local_shape), (
             f"Shard({self.dim}) but the tensor has only {len(local_shape)} dims"
@@ -101,17 +78,12 @@ class Shard(Placement):
         full[self.dim] *= group_size
         return tuple(full)
 
-    def local_slice(
-        self, tensor: torch.Tensor, group_size: int, coord: int
-    ) -> torch.Tensor:
+    def local_slice(self, tensor: torch.Tensor, group_size: int, coord: int) -> torch.Tensor:
         """
-        this rank's chunk of a full tensor. this is the Replicate -> Shard(d)
-        cell of the redistribute table, and the only cell needing NO
-        communication, which is why it lives here rather than in dtensor.py.
+        this rank's chunk of a full tensor (Replicate -> Shard, no comm).
 
-        returns a VIEW. callers that want to own the storage (fsdp's master
-        shards do) must .contiguous().clone() it -- otherwise the full tensor
-        stays alive behind the view and the sharding saves nothing.
+        returns a VIEW: a caller that wants the full tensor freed must copy
+        the chunk into storage of its own.
         """
         n = self.local_numel_along_dim(tensor.shape[self.dim], group_size)
         assert 0 <= coord < group_size, f"coord {coord} out of range for {group_size}"
@@ -130,25 +102,19 @@ class Replicate(Placement):
 class Partial(Placement):
     """
     every rank holds a partial contribution; the true value is the reduction
-    of all ranks' local tensors under `op`. this is what an unsharded gradient
-    is before it has been reduced -- each rank computed it from its own
-    microbatch -- which makes `Partial -> Shard(0)` exactly fsdp's grad
-    reduce-scatter.
+    of all ranks' local tensors under `op`. an unsharded gradient is this
+    before it has been reduced (each rank computed it from its own
+    microbatch), which makes `Partial -> Shard(0)` fsdp's grad reduce-scatter.
 
-    `op` reuses collective.ReduceOpName rather than inventing a second
-    vocabulary for reductions, and is validated here so a typo fails at
-    construction instead of inside a collective. note Partial("sum") and
-    Partial("avg") are NOT interchangeable: confusing them is a silent factor
-    of group_size, which is the same bug class the reduce_scatter "avg" path
-    already had.
+    Partial("sum") and Partial("avg") are not interchangeable: confusing them
+    is a silent factor of group_size.
     """
 
     op: ReduceOpName = "sum"
 
     def __post_init__(self) -> None:
-        assert self.op in _LEGAL_OPS, (
-            f"Partial(op={self.op!r}) is not one of {_LEGAL_OPS}"
-        )
+        legal = get_args(ReduceOpName)
+        assert self.op in legal, f"Partial(op={self.op!r}) is not one of {legal}"
 
     def __repr__(self) -> str:
         return f"Partial({self.op})"
@@ -163,8 +129,7 @@ def padded_chunk(global_size: int, group_size: int, coord: int) -> tuple[int, in
 
     returns (length, start, valid). trailing ranks may own fewer rows than
     `length`, or none. with even division this is exactly Shard's layout.
-    `Shard` itself still asserts even division: this is the opt-in used by
-    fsdp and the checkpointer, which both know how to trim the padding.
+    used by fsdp and the checkpointer, which both know how to trim the padding.
     """
     assert 0 <= coord < group_size, f"coord {coord} out of range for {group_size}"
     length = -(-global_size // group_size)
@@ -173,7 +138,7 @@ def padded_chunk(global_size: int, group_size: int, coord: int) -> tuple[int, in
     return length, start, valid
 
 
-# one entry per mesh axis, in the mesh's own axis order.
+# one entry per mesh axis, in the mesh's own axis order
 Placements = tuple[Placement, ...]
 
 

@@ -33,7 +33,7 @@ all numbers are bf16, seq_len 4096, global tokens/sec.
 
 cells are tps / mfu (989 TFLOPS peak, `6N + 12·L·H·head_dim·seq` flops/token).
 no grad accumulation; mb = micro batch per gpu. hsdp = fsdp within a node,
-replicated across nodes. fsdp is torchure's own fsdp2 (branch `claude_fsdp`).
+replicated across nodes. fsdp is torchure's own fsdp2 (`parallelism/fsdp2.py`).
 
 **qwen3 0.6B**
 

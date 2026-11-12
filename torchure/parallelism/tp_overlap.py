@@ -95,7 +95,7 @@ def _gather_matmul(ring: _Ring, x_rows, weights, overlap: bool):
     Ys = [x_rows.new_empty(ring.g * n, w.shape[0]) for w in weights]
     if not overlap:
         all_gather(x_rows, ring.mesh, ring.axis, 0, output_tensor=X)
-        for Y, W in zip(Ys, weights):
+        for Y, W in zip(Ys, weights, strict=True):
             torch.mm(X, W.t(), out=Y)
         return X, Ys
 
@@ -108,7 +108,7 @@ def _gather_matmul(ring: _Ring, x_rows, weights, overlap: bool):
         if s < ring.g - 1:
             nxt = (ring.r - s - 1) % ring.g
             _, work = ring.send_recv(cur, ring.chunk(X, nxt))
-        for Y, W in zip(Ys, weights):
+        for Y, W in zip(Ys, weights, strict=True):
             torch.mm(cur, W.t(), out=ring.chunk(Y, k))
         if work is not None:
             work.wait()
@@ -184,7 +184,7 @@ class _Column(torch.autograd.Function):
 
         def partial_of(k):
             p = _partial_sum(
-                (None if G is None else ring.chunk(G, k), W) for G, W in zip(Gs, Ws)
+                (None if G is None else ring.chunk(G, k), W) for G, W in zip(Gs, Ws, strict=True)
             )
             rows = X.shape[0] if k is None else X.shape[0] // ring.g
             p = X.new_zeros(rows, X.shape[1], dtype=ctx.x_dtype) if p is None else p.to(ctx.x_dtype)

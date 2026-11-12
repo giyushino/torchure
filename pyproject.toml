@@ -7,9 +7,7 @@ authors = [{name="giyushino", email="allanzhang440@gmail.com" }]
 requires-python = "==3.14.*"
 keywords = ["pytorch", "training"]
 
-# i want minimal deps, but this will likely
-# grow considerably in the future
-# scalene -> for gpu + cpu profiling
+# kept minimal on purpose
 dependencies = [
     "torch==2.10",
     "numpy==2.4.6",
@@ -37,4 +35,3 @@ line-length = 100
 # catches real bugs (mutable defaults, raise NotImplemented, silent zips).
 # ratchet more rules in over time; don't add formatting churn retroactively.
 extend-select = ["B"]
-

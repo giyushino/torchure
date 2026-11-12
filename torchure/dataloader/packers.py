@@ -18,8 +18,6 @@ import torch
 
 from tokenizers import Tokenizer
 
-from torchure.utils import Node
-
 
 class Packer:
     """
@@ -63,6 +61,7 @@ class Packer:
             lost = n_tokens - n_blocks * self.seq_len
             print(f"{type(self).__name__}: lost {lost} tokens")
 
+
 class ListPacker(Packer):
     """extend a flat python list, then slice."""
 
@@ -80,6 +79,47 @@ class ListPacker(Packer):
             for i in range(n_blocks)
         ]
 
+
+class _SpaceTree:
+    """
+    segment tree over the possible amounts of free space, [low, high]. a leaf
+    holds its own space value if some open bin has exactly that much free
+    (else 0), and an inner node the max of its children, so the smallest
+    available space >= a size is found in O(log(high - low)).
+    """
+
+    def __init__(self, low: int, high: int):
+        self.low = low
+        self.high = high
+        self.value = 0
+        self.left: _SpaceTree | None = None
+        self.right: _SpaceTree | None = None
+        if low < high:
+            mid = (low + high) // 2
+            self.left = _SpaceTree(low, mid)
+            self.right = _SpaceTree(mid + 1, high)
+
+    def search(self, size: int) -> int | None:
+        """the smallest available space >= size, or None."""
+        if self.value < size:
+            return None
+        if self.low == self.high:
+            return self.low
+        # left holds the smaller spaces, so prefer it: that is the best fit
+        if self.left.value >= size:
+            return self.left.search(size)
+        return self.right.search(size)
+
+    def update(self, space: int, available: bool) -> None:
+        """mark whether any open bin has exactly `space` free."""
+        if self.low == self.high:
+            self.value = space if available else 0
+            return
+        child = self.left if space <= self.left.high else self.right
+        child.update(space, available)
+        self.value = max(self.left.value, self.right.value)
+
+
 class ListPackerBestFit(Packer):
     """
     best-fit-decreasing packing (https://arxiv.org/pdf/2404.10830).
@@ -87,9 +127,6 @@ class ListPackerBestFit(Packer):
     long docs emit full seq_len blocks as-is; their remainders and short docs
     are packed into seq_len bins, and unfilled bins are padded with pad_id.
     nothing is dropped, so the output differs from the stream packers.
-
-    a segment tree over remaining space (0..seq_len) gives O(log seq_len) best
-    fit: search(c) returns the smallest open space >= c.
     """
 
     def pack(self, docs: list[list[int]]) -> list[list[int]]:
@@ -107,7 +144,7 @@ class ListPackerBestFit(Packer):
         items.sort(key=len, reverse=True)
 
         # space_to_bin: remaining space -> open bins with exactly that much
-        free = Node.build(0, seq_len)
+        free = _SpaceTree(0, seq_len)
         space_to_bin: dict[int, list[int]] = {}
         bins: list[list[int]] = []
 
@@ -196,6 +233,3 @@ PACKERS: dict[str, type[Packer]] = {
 BESTFIT_PACKERS: dict[str, type[Packer]] = {
     "bestfit": ListPackerBestFit,
 }
-
-
-

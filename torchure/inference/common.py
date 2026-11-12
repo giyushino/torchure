@@ -3,7 +3,6 @@ shared model/tokenizer/checkpoint loading for one-off inference scripts
 (perplexity eval, chat repl). these run outside the Trainer/DDP path
 entirely -- single process, straight off a checkpoint dir on disk.
 """
-import json
 import os
 
 import torch
@@ -11,12 +10,9 @@ import torch
 from tokenizers import Tokenizer
 
 from torchure.models.builder import build_model
-from torchure.utils import get_project_dir
+from torchure.utils import get_project_dir, load_json
 
-
-def load_config(config_path: str) -> dict:
-    with open(config_path) as f:
-        return json.load(f)
+load_config = load_json
 
 
 def load_model_and_tokenizer(config: dict, step: int, device: str):

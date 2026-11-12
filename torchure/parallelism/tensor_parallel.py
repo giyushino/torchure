@@ -251,9 +251,13 @@ class TP:
         self.sequence_parallel = sequence_parallel and self.group_size > 1
         # the tensor dim activations are sharded along between regions, or None
         self._seq_dim = seq_dim if self.sequence_parallel else None
-        assert overlap in tp_overlap.MODES, f"tp overlap {overlap!r}: expected one of {tp_overlap.MODES}"
+        assert overlap in tp_overlap.MODES, (
+            f"tp overlap {overlap!r}: expected one of {tp_overlap.MODES}"
+        )
         assert overlap == "none" or sequence_parallel, "tp overlap needs sequence parallel"
         self.overlap = overlap if self.group_size > 1 else "none"
+        # overlap only: each region's column linears, and their outputs parked
+        # between the region's pre hook and the linears' own forward
         self._region_columns: dict[int, list[nn.Linear]] = {}
         self._column_out: dict[int, torch.Tensor] = {}
 
@@ -261,7 +265,9 @@ class TP:
         # through the module, not by param id: materializing a meta model
         # replaces the Parameter objects
         self._entries: list[tuple[nn.Module, str, int, tuple[int, ...]]] = []
+        # id(original param) -> (original, sharded), so a tied weight is sharded once
         self._replaced: dict[int, tuple[nn.Parameter, nn.Parameter]] = {}
+        # cache for _lookup()
         self._by_id: dict[int, tuple[int, tuple[int, ...]]] | None = None
         self._shared_modules: list[nn.Module] = []
         self._vocab_rows: dict[int, int] = {}       # id(module) -> rows per rank
@@ -414,7 +420,7 @@ class TP:
             args[0], [c.weight for c in cols], self.mesh, self.dim, self._seq_dim,
             overlap=self.overlap == "collective_matmul",
         )
-        for linear, out in zip(cols, outs):
+        for linear, out in zip(cols, outs, strict=True):
             self._column_out[id(linear)] = out
         return (x_full, *args[1:])
 

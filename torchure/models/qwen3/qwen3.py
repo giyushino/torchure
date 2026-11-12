@@ -4,8 +4,6 @@ self contained dense qwen3
 TODO: maybe remove the rope cache, it doesn't seem to give any speedup
 """
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,12 +11,8 @@ from torch.utils.checkpoint import checkpoint
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """
-    tensor = [a, b, c, d, e, f, g, h]
-    rotate_half(tensor) = [-e, -f, -g, -h, a, b, c, d]
-    """
-    x1 = x[...,:x.shape[-1] // 2]
-    x2 = x[...,x.shape[-1] // 2:]
+    """[a, b, c, d, e, f, g, h] -> [-e, -f, -g, -h, a, b, c, d]"""
+    x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -118,36 +112,11 @@ class Qwen3GroupQueryAttention(nn.Module):
         B, heads, S, _ = x.shape
         return x.transpose(1, 2).reshape(B, S, heads * self.head_dim)
 
-    def scaled_self_attention_naive(
-        self,
-        Q: torch.Tensor,
-        K: torch.Tensor,
-        V: torch.Tensor,
-        attention_mask: torch.Tensor | None
-    ):
-        # (B, H, S, S)
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        mask_value = torch.finfo(attn_scores.dtype).min
-
-        S = Q.size(-2)
-        causal_mask = torch.triu(
-            torch.ones(S, S, device=Q.device, dtype=torch.bool),
-            diagonal=1
-        )
-        attn_scores = attn_scores.masked_fill(causal_mask, mask_value)
-
-        if attention_mask is not None:
-            key_padding_mask = ~attention_mask[:, None, None, :].bool()
-            attn_scores = attn_scores.masked_fill(key_padding_mask, mask_value)
-
-        attn_probs = torch.softmax(attn_scores, dim=-1)
-        return torch.matmul(attn_probs, V)
-
     def scaled_self_attention(self, Q, K, V, attention_mask):
         # no mask (packed training): is_causal lets sdpa use the flash kernel
         if attention_mask is None:
             return F.scaled_dot_product_attention(Q, K, V, is_causal=True, enable_gqa=True)
-  
+
         # padding: is_causal can't be combined with a mask, so build one bool
         # mask (True = attend)
         S = Q.size(-2)
@@ -171,7 +140,6 @@ class Qwen3GroupQueryAttention(nn.Module):
         K = apply_rotary(K, cos, sin)
 
         attn_output = self.scaled_self_attention(Q, K, V, attention_mask)
-
         return self.o_proj(self.combine_heads(attn_output))
 
 
@@ -183,11 +151,9 @@ class SwiGLU(nn.Module):
         self.down_proj = nn.Linear(ffn_dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(
-            nn.functional.silu(self.gate_proj(x)) * self.up_proj(x)
-        )
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
-    
+
 class Qwen3TransformerBlock(nn.Module):
     def __init__(
         self,
@@ -206,7 +172,7 @@ class Qwen3TransformerBlock(nn.Module):
         if ffn_dim is None:
             # 8/3 * emb_dim rounded up to a multiple of 256
             ffn_dim = 256 * ((int(8 * emb_dim / 3) + 255) // 256)
-        self.ffn  = SwiGLU(emb_dim, ffn_dim)
+        self.ffn = SwiGLU(emb_dim, ffn_dim)
 
     def forward(
         self,
@@ -215,12 +181,10 @@ class Qwen3TransformerBlock(nn.Module):
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-
         x = x + self.gqa(self.norm1(x), cos, sin, attention_mask)
         x = x + self.ffn(self.norm2(x))
-
         return x
-        
+
 
 class Qwen3(nn.Module):
     def __init__(

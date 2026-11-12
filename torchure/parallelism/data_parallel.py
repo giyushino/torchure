@@ -22,9 +22,15 @@ from torchure.core.collective import MeshLike, all_reduce, broadcast
 
 
 class _Bucket:
+    """
+    params whose grads are all-reduced together. with more than one param the
+    grads live in `flat`, each param's `.grad` being one of its `views`; a
+    lone param is reduced through its own `.grad`.
+    """
+
     def __init__(self, params: list[nn.Parameter]):
         self.params = params
-        self.pending = len(params)
+        self.pending = len(params)  # params still owing a grad this backward
         self.flat = None
         self.views = None
         if len(params) > 1:
@@ -68,12 +74,11 @@ class DDP:
                 buckets.append(_Bucket(run))
                 run = []
                 run_bytes = 0
-            run.append(param) 
+            run.append(param)
             run_bytes += n_bytes
 
         if run:
             buckets.append(_Bucket(run))
-      
         return buckets
 
     def _on_grad_ready(self, param: nn.Parameter) -> None:
@@ -96,7 +101,7 @@ class DDP:
             grad = bucket.flat
         _, work = all_reduce(grad, self.mesh, self.dim, "avg", async_op=True)
         self._works.append(work)
-         
+
     @property
     def shard_dims(self) -> tuple[str, ...]:
         """mesh axes param/grad state is sharded over; none for ddp."""
@@ -125,7 +130,3 @@ class DDP:
         for work in self._works:
             work.wait()
         self._works.clear()
-
-
-if __name__ == "__main__":
-    print("1")

@@ -7,6 +7,9 @@ MODEL_REGISTRY = {
     "llama3_2": None,
 }
 
+
 def build_model(model_name: str, model_config: dict) -> nn.Module:
-    assert model_name in MODEL_REGISTRY.keys(), "model name not in registry"
+    assert MODEL_REGISTRY.get(model_name) is not None, (
+        f"model {model_name!r} is not implemented; registry: {list(MODEL_REGISTRY)}"
+    )
     return MODEL_REGISTRY[model_name](**model_config)
