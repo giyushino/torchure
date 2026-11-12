@@ -282,7 +282,10 @@ class Trainer:
 
         config `tp`: `vocab_parallel` (default true) shards the embedding /
         lm_head weight by vocab rows; `sequence_parallel` (default true)
-        shards the activations between tp regions along the sequence.
+        shards the activations between tp regions along the sequence (or the
+        batch, `sp_dim: "batch"`); `overlap` ("none" | "backward" |
+        "collective_matmul", see parallelism/tp_overlap.py) hides the sp
+        collectives behind the region's matmuls.
         """
         if self.tp_size == 1:
             return None
@@ -293,7 +296,21 @@ class Trainer:
             f"sequence parallel needs seq_len {seq_len} divisible by tp {self.tp_size}"
         )
         plan = model.tp_plan(self.tp_size, vocab_parallel=tp_cfg.get("vocab_parallel", True))
-        return TP(self.mesh, **plan, dim="tp", sequence_parallel=sequence_parallel)
+        # the dim sp shards activations along between regions: "seq" (1) or
+        # "batch" (0). batch keeps each rank's chunk contiguous, so gathers and
+        # scatters need no layout copies; it needs micro_batch % tp == 0
+        sp_dim = tp_cfg.get("sp_dim", "seq")
+        assert sp_dim in ("seq", "batch"), f"tp.sp_dim {sp_dim!r}: expected 'seq' or 'batch'"
+        if sp_dim == "batch":
+            micro = self.config["data"]["micro_batch_size"]
+            assert micro % self.tp_size == 0, (
+                f"tp.sp_dim 'batch' needs micro_batch_size {micro} divisible by tp {self.tp_size}"
+            )
+        return TP(
+            self.mesh, **plan, dim="tp", sequence_parallel=sequence_parallel,
+            seq_dim=0 if sp_dim == "batch" else 1,
+            overlap=tp_cfg.get("overlap", "none"),
+        )
 
     def _compile(self, model: nn.Module) -> None:
         """

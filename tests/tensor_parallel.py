@@ -79,10 +79,15 @@ class Scenario:
     fsdp: bool = False
     vocab: bool = False
     sp: bool = False
+    batch_sp: bool = False     # sp shards the batch dim instead of the sequence
+    overlap: str = "none"
 
     @property
     def name(self) -> str:
-        opts = [o for o, on in (("vocab", self.vocab), ("sp", self.sp)) if on]
+        opts = [o for o, on in (
+            ("vocab", self.vocab), ("sp", self.sp), ("batch-sp", self.batch_sp),
+            (f"overlap={self.overlap}", self.overlap != "none"),
+        ) if on]
         return (
             f"{'fsdp' if self.fsdp else 'ddp'} dp={self.dp} x tp={self.tp}"
             + (f" + {' + '.join(opts)}" if opts else "")
@@ -98,6 +103,15 @@ SCENARIOS = [
     Scenario(2, 2, fsdp=True, vocab=True, sp=True),
     # 3 shards divide none of the dims: fsdp pads what tp left
     Scenario(3, 2, fsdp=True, vocab=True, sp=True),
+    Scenario(1, 2, sp=True, batch_sp=True),
+    # fused overlap ops: sequence-sharded (a layout copy each way) and
+    # batch-sharded rows, ring lengths 2 and 4
+    Scenario(1, 2, sp=True, overlap="backward"),
+    Scenario(2, 2, vocab=True, sp=True, overlap="collective_matmul"),
+    Scenario(1, 4, vocab=True, sp=True, overlap="collective_matmul"),
+    Scenario(1, 2, sp=True, batch_sp=True, overlap="collective_matmul"),
+    Scenario(2, 2, fsdp=True, vocab=True, sp=True, batch_sp=True, overlap="backward"),
+    Scenario(3, 2, fsdp=True, vocab=True, sp=True, overlap="collective_matmul"),
 ]
 
 
@@ -118,6 +132,8 @@ def parallelize(model: Qwen3, mesh: Mesh, sc: Scenario, tp_only: bool = False):
         mesh,
         **model.tp_plan(sc.tp, vocab_parallel=sc.vocab),
         sequence_parallel=sc.sp,
+        seq_dim=0 if sc.batch_sp else 1,
+        overlap=sc.overlap,
     )
     if tp_only:
         return tp

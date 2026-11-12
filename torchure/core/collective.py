@@ -238,34 +238,53 @@ def all_to_all(
     return torch.cat(chunks, dim=concat_dim)
 
 
+class _P2PWork:
+    """the requests of one batched send/recv, waited together like a dist.Work."""
+
+    def __init__(self, reqs):
+        self._reqs = reqs
+
+    def wait(self) -> None:
+        for req in self._reqs:
+            req.wait()
+
+
 def ring_send_recv(
     tensor: torch.Tensor,
     mesh: MeshLike,
     dim: str,
     *,
     async_op: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, dist.Work]:
+    output_tensor: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, "dist.Work | _P2PWork"]:
     """
     simultaneously send `tensor` to coordinate+1 and receive from
-    coordinate-1 (mod size) along `dim`. returns the received tensor
-    (newly allocated, same shape/dtype as the input).
+    coordinate-1 (mod size) along `dim`. returns the received tensor (same
+    shape/dtype as the input): `output_tensor` if given (must be contiguous),
+    else newly allocated.
 
-    sync-only for now; cp overlap would return the recv req as the work handle.
+    async_op=True returns (recv, work). until work.wait() the recv tensor is
+    garbage and the sent tensor must stay alive and unmodified.
     """
-    assert not async_op, "ring_send_recv is sync-only (v0)"
     group = mesh.get_group(dim)
     group_size = mesh.size(dim)
     coord = mesh.coordinate(dim)
     if group_size == 1:
         # backends don't support send/recv to self
-        return tensor.clone()
+        out = tensor.clone() if output_tensor is None else output_tensor.copy_(tensor)
+        return (out, _P2PWork([])) if async_op else out
 
     # P2POp wants global ranks
     dst = dist.get_global_rank(group, (coord + 1) % group_size)
     src = dist.get_global_rank(group, (coord - 1) % group_size)
 
     send_tensor = tensor.contiguous()
-    recv_tensor = torch.empty_like(send_tensor)
+    if output_tensor is None:
+        recv_tensor = torch.empty_like(send_tensor)
+    else:
+        assert output_tensor.shape == send_tensor.shape and output_tensor.dtype == send_tensor.dtype
+        assert output_tensor.is_contiguous(), "output_tensor must be contiguous"
+        recv_tensor = output_tensor
     # batched: blocking send-then-recv on every rank would deadlock
     reqs = dist.batch_isend_irecv(
         [
@@ -273,8 +292,10 @@ def ring_send_recv(
             dist.P2POp(dist.irecv, recv_tensor, src, group=group),
         ]
     )
-    for req in reqs:
-        req.wait()
+    work = _P2PWork(reqs)
+    if async_op:
+        return recv_tensor, work
+    work.wait()
     return recv_tensor
 
 

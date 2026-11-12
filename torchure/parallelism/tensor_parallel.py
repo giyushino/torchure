@@ -83,6 +83,13 @@ tp.sync() must come after the data-parallel sync: that one is still reducing
 the same grad tensors in the background until it returns. tp composes with
 ddp or fsdp on the dp axes: fsdp shards whatever tp left on this rank.
 
+comm/compute overlap (`overlap`, needs sequence parallel): "backward" or
+"collective_matmul" swap each region's entry gather + column linears and its
+row linear + exit scatter for the fused ops in tp_overlap.py. the region's
+pre hook runs every column linear at once and parks the outputs; the column
+linears' own forward just hands them back, and the row linear's forward is
+the fused matmul + reduce_scatter.
+
 compile: the collectives are opaque to torch.compile (`compiler.disable`), so
 a compiled block splits into graphs around them and they run eagerly between.
 
@@ -102,6 +109,7 @@ from torchure.core.collective import (
     reduce_scatter,
 )
 from torchure.core.placement import Shard
+from torchure.parallelism import tp_overlap
 
 
 def _local(x: torch.Tensor, mesh: MeshLike, axis: str, dim: int) -> torch.Tensor:
@@ -235,6 +243,7 @@ class TP:
         dim: str = "tp",
         sequence_parallel: bool = False,
         seq_dim: int = 1,
+        overlap: str = "none",
     ):
         self.mesh = mesh
         self.dim = dim
@@ -242,6 +251,11 @@ class TP:
         self.sequence_parallel = sequence_parallel and self.group_size > 1
         # the tensor dim activations are sharded along between regions, or None
         self._seq_dim = seq_dim if self.sequence_parallel else None
+        assert overlap in tp_overlap.MODES, f"tp overlap {overlap!r}: expected one of {tp_overlap.MODES}"
+        assert overlap == "none" or sequence_parallel, "tp overlap needs sequence parallel"
+        self.overlap = overlap if self.group_size > 1 else "none"
+        self._region_columns: dict[int, list[nn.Linear]] = {}
+        self._column_out: dict[int, torch.Tensor] = {}
 
         # (module, attribute, sharded tensor dim, unsharded shape). looked up
         # through the module, not by param id: materializing a meta model
@@ -256,6 +270,7 @@ class TP:
         if self.group_size == 1:
             return
 
+        column, row = list(column), list(row)
         for linear in column:
             self._shard(linear, "weight", 0)
             if linear.bias is not None:
@@ -283,9 +298,23 @@ class TP:
         if self.sequence_parallel:
             self._shared_modules += list(seq_local)
 
+        column_ids, row_ids = {id(m) for m in column}, {id(m) for m in row}
         for region in regions:
-            region.register_forward_pre_hook(self._region_pre)
-            region.register_forward_hook(self._region_post)
+            if self.overlap == "none":
+                region.register_forward_pre_hook(self._region_pre)
+                region.register_forward_hook(self._region_post)
+                continue
+            cols = [m for m in region.modules() if id(m) in column_ids]
+            rows = [m for m in region.modules() if id(m) in row_ids]
+            assert cols and len(rows) == 1, (
+                f"overlap needs a region with column linears and one row linear, "
+                f"got {len(cols)} column and {len(rows)} row in {type(region).__name__}"
+            )
+            self._region_columns[id(region)] = cols
+            for linear in cols:
+                linear.forward = self._make_column_forward(linear)
+            rows[0].forward = self._make_row_forward(rows[0])
+            region.register_forward_pre_hook(self._fused_region_pre)
         for emb in embeddings:
             if id(emb) in vocab_ids:
                 emb.register_forward_pre_hook(self._embedding_pre)
@@ -375,6 +404,36 @@ class TP:
 
     def _region_post(self, module: nn.Module, args: tuple, output: torch.Tensor) -> torch.Tensor:
         return _exit_region(output, self.mesh, self.dim, self._seq_dim)
+
+    # opaque to dynamo like the collectives: traced, the per-region lookup
+    # guards on the module and recompiles once per region
+    @torch.compiler.disable
+    def _fused_region_pre(self, module: nn.Module, args: tuple) -> tuple:
+        cols = self._region_columns[id(module)]
+        x_full, *outs = tp_overlap.column(
+            args[0], [c.weight for c in cols], self.mesh, self.dim, self._seq_dim,
+            overlap=self.overlap == "collective_matmul",
+        )
+        for linear, out in zip(cols, outs):
+            self._column_out[id(linear)] = out
+        return (x_full, *args[1:])
+
+    def _make_column_forward(self, linear: nn.Linear):
+        @torch.compiler.disable
+        def forward(x: torch.Tensor) -> torch.Tensor:
+            # computed by the region's pre hook; x is the gathered input it returned
+            out = self._column_out.pop(id(linear))
+            return out if linear.bias is None else out + linear.bias
+        return forward
+
+    def _make_row_forward(self, linear: nn.Linear):
+        @torch.compiler.disable
+        def forward(x: torch.Tensor) -> torch.Tensor:
+            return tp_overlap.row(
+                x, linear.weight, self.mesh, self.dim, self._seq_dim,
+                overlap=self.overlap == "collective_matmul",
+            )
+        return forward
 
     def _embedding_pre(self, module: nn.Module, args: tuple) -> tuple:
         # ids -> row indices into this rank's shard; ids it doesn't hold look
