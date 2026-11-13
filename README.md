@@ -65,3 +65,50 @@ replicated across nodes. fsdp is torchure's own fsdp2 (`parallelism/fsdp2.py`).
 | 8x A40 | ~73.5k | 69% |
 | 8x A6000 | ~86.4k | 60% |
 | 4x H100 NVL | ~198k | 92% |
+
+### tensor parallel, 4x H100 NVL (nvlink pairs 0-1 and 2-3)
+
+cells are tps / mfu (835 TFLOPS peak, same flops formula) / peak mem. 50-step
+runs, sequence parallel on unless noted. dp x tp layouts put each tp pair on
+an nvlink pair. `sp_dim` is what sp shards between regions (`tp.sp_dim`):
+"seq" (default) or "batch", which keeps each rank's chunk contiguous so the
+collectives need no layout copies (needs micro batch % tp == 0).
+
+**qwen3 0.6B**, global batch 32, no grad accumulation
+
+| layout | mb | result |
+|--------|----|--------|
+| ddp, 4 gpus | 8 | 198k / 37.1% / 56.2 GiB |
+| fsdp, 4 gpus | 8 | **198k / 37.1%** / 47.1 GiB |
+| tp 4 | 32 | 83k / 15.5% / 59.6 GiB |
+| fsdp 2 x tp 2, no sp | 16 | 172k / 32.2% / 53.3 GiB |
+
+| dp 2 x tp 2, mb 16 | fsdp | ddp |
+|--------------------|------|-----|
+| sp_dim seq | 162k / 30.4% / 49.8 GiB | 152k / 28.6% / 56.3 GiB |
+| sp_dim seq, overlap backward | 157k / 29.5% / 54.7 GiB | 147k / 27.6% / 61.1 GiB |
+| sp_dim seq, overlap collective_matmul | 155k / 29.0% / 54.7 GiB | 144k / 26.9% / 61.1 GiB |
+| sp_dim batch | **174k / 32.6%** / 49.7 GiB | **162k / 30.5%** / 56.3 GiB |
+| sp_dim batch, overlap backward | 171k / 32.2% / 54.5 GiB | 160k / 30.0% / 61.1 GiB |
+| sp_dim batch, overlap collective_matmul | 168k / 31.5% / 54.5 GiB | 156k / 29.3% / 61.1 GiB |
+
+**qwen3 4B**, global batch 16
+
+| layout | mb | result |
+|--------|----|--------|
+| ddp, 4 gpus | 4 | oom |
+| fsdp, 4 gpus | 4 | **44.4k / 41.7%** / 82.1 GiB |
+| ddp 2 x tp 2 | 8 | oom |
+| ddp 2 x tp 2 (2x accum) | 4 | 36.2k / 34.0% / 77.0 GiB |
+| fsdp 2 x tp 2, sp_dim seq | 8 | 39.3k / 36.9% / 86.4 GiB |
+| fsdp 2 x tp 2, sp_dim batch | 8 | 41.5k / 39.0% / 86.3 GiB |
+| fsdp 2 x tp 2, any overlap | 8 | oom (seq + collective_matmul hangs instead) |
+| tp 4 | 16 | oom |
+| tp 4 (2x accum) | 8 | 23.0k / 21.6% / 63.2 GiB |
+
+takeaways: on one node, fsdp over all gpus beats every tp layout at these
+sizes (tp shards model state no further than fsdp already does; it only
+helps once one sequence's activations at mb 1 don't fit). `sp_dim: "batch"`
+is a free +6-7% for tp. the overlap modes (`tp.overlap`) lose 1-5% and ~5 GiB
+here: nvlink leaves little comm to hide. tp 4 spans the pcie hop between the
+nvlink pairs.
