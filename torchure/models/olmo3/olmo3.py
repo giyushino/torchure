@@ -30,16 +30,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    cos = cos.to(x.dtype)
-    sin = sin.to(x.dtype)
-    return (x * cos) + (rotate_half(x) * sin)
+from torchure.models.layers import (
+    RotaryEmbedding,
+    SwiGLU,
+    apply_rotary,
+    positions,
+    swiglu_ffn_dim,
+)
 
 
 def _yarn_inv_freq(
@@ -74,7 +71,9 @@ def _yarn_inv_freq(
     return inv_freq, attention_factor
 
 
-class Olmo3RotaryEmbedding(nn.Module):
+class Olmo3RotaryEmbedding(RotaryEmbedding):
+    """yarn rope: interpolated frequencies and an attention factor on cos/sin."""
+
     def __init__(
         self,
         head_dim: int,
@@ -84,47 +83,21 @@ class Olmo3RotaryEmbedding(nn.Module):
         beta_fast: float = 32.0,
         beta_slow: float = 1.0,
     ):
-        super().__init__()
-        assert head_dim % 2 == 0, "RoPE requires even head_dim"
-        self.head_dim = head_dim
-        self.base = base
         self.factor = factor
         self.original_max = original_max
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
-        self.attention_factor = 1.0
-        self.register_buffer("inv_freq", torch.empty(head_dim // 2), False)
-        self._cache: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
-        self.init_buffers()
+        super().__init__(head_dim, base)
 
-    @torch.no_grad()
-    def init_buffers(self) -> None:
-        inv_freq, factor = _yarn_inv_freq(
+    @property
+    def attention_factor(self) -> float:
+        return self.scale
+
+    def frequencies(self, device: torch.device) -> tuple[torch.Tensor, float]:
+        return _yarn_inv_freq(
             self.head_dim, self.base, self.factor, self.original_max,
-            self.beta_fast, self.beta_slow, self.inv_freq.device,
+            self.beta_fast, self.beta_slow, device,
         )
-        self.inv_freq.copy_(inv_freq)
-        self.attention_factor = factor
-        self._cache.clear()
-
-    def _cos_sin(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        freqs = position_ids.float()[:, :, None] * self.inv_freq[None, None, :]
-        emb = torch.cat([freqs, freqs], dim=-1)
-        cos = emb.cos()[:, None, :, :] * self.attention_factor
-        sin = emb.sin()[:, None, :, :] * self.attention_factor
-        return cos, sin
-
-    def forward(
-        self, position_ids: torch.Tensor, cacheable: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not cacheable:
-            return self._cos_sin(position_ids)
-        key = (position_ids.shape[1], position_ids.device)
-        cached = self._cache.get(key)
-        if cached is None:
-            cached = self._cos_sin(position_ids[:1])
-            self._cache[key] = cached
-        return cached
 
 
 class Olmo3Attention(nn.Module):
@@ -195,17 +168,6 @@ class Olmo3Attention(nn.Module):
         return self.o_proj(self.combine_heads(out))
 
 
-class SwiGLU(nn.Module):
-    def __init__(self, hidden_dim: int, ffn_dim: int):
-        super().__init__()
-        self.gate_proj = nn.Linear(hidden_dim, ffn_dim, bias=False)
-        self.up_proj = nn.Linear(hidden_dim, ffn_dim, bias=False)
-        self.down_proj = nn.Linear(ffn_dim, hidden_dim, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
 class Olmo3TransformerBlock(nn.Module):
     """post-norm: sublayer -> rmsnorm -> + residual (twice)."""
 
@@ -264,7 +226,7 @@ class Olmo3(nn.Module):
     ):
         super().__init__()
         if ffn_dim is None:
-            ffn_dim = 256 * ((int(8 * emb_dim / 3) + 255) // 256)
+            ffn_dim = swiglu_ffn_dim(emb_dim)
         self.emb_dim = emb_dim
         self.sliding_window = sliding_window
         self.token_emb = nn.Embedding(vocab_size, emb_dim)
@@ -339,15 +301,7 @@ class Olmo3(nn.Module):
         return_hidden_states: bool = False,
         return_final_hidden: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        B, S = x.shape
-        if attention_mask is None:
-            position_ids = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
-            cacheable = True
-        else:
-            attention_mask = attention_mask.bool()
-            position_ids = attention_mask.long().cumsum(dim=1) - 1
-            position_ids = position_ids.masked_fill(~attention_mask, 0)
-            cacheable = False
+        position_ids, attention_mask, cacheable = positions(x, attention_mask)
 
         x = self.token_emb(x)
         cos, sin = self.rope(position_ids, cacheable=cacheable)

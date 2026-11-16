@@ -24,6 +24,8 @@ from torchure.models.kimi_k31.kimi_k31 import (
     LatentMoE,
     MultiHeadLatentAttention,
     SiTUMLP,
+    _kda_reference,
+    _kda_scan,
     situ_glu,
 )
 from torchure.models.olmo3.olmo3 import Olmo3
@@ -169,6 +171,90 @@ def test_kimi():
     print("kimi_k31: hybrid kda/mla, latent moe, situ bound, attn-res, dsa, kda causality ok")
 
 
+def test_kda_chunkwise():
+    """the chunkwise closed form is the step-by-step recurrence, values and grads."""
+    torch.manual_seed(0)
+    B, S, H, D = 2, 150, 3, 8
+    q = F.normalize(torch.randn(B, S, H, D), dim=-1)
+    k = F.normalize(torch.randn(B, S, H, D), dim=-1)
+    v = torch.randn(B, S, H, D)
+    beta = torch.rand(B, S, H)
+    # mild decay, and the worst case: half the channels pinned at the -5
+    # floor, where exp(g_t) / exp(g_i) would overflow within one chunk
+    mild = -2 * torch.rand(B, S, H, D)
+    harsh = torch.where(torch.rand(B, S, H, D) < 0.5, torch.full((B, S, H, D), -5.0), mild * 1e-3)
+    for name, log_alpha in (("mild", mild), ("floor", harsh)):
+        ref = _kda_reference(q.double(), k.double(), v.double(), log_alpha.double(), beta.double())
+        for chunk in (7, 64, 1000):  # ragged tail, the default, one chunk
+            out = _kda_scan(q, k, v, log_alpha, beta, chunk=chunk)
+            err = (out.double() - ref).abs().max().item()
+            assert err < 5e-5, f"kda {name} chunk={chunk}: max err {err:.2e}"
+
+    ins = [t.clone().requires_grad_() for t in (q, k, v, mild, beta)]
+
+    def grads(fn):
+        for t in ins:
+            t.grad = None
+        fn(*ins).pow(2).sum().backward()
+        return [t.grad.clone() for t in ins]
+
+    want = grads(_kda_reference)
+    for checkpoint_chunks in (True, False):
+        got = grads(lambda *a, c=checkpoint_chunks: _kda_scan(*a, chunk=16, checkpoint_chunks=c))
+        for g, w in zip(got, want, strict=True):
+            assert torch.allclose(g, w, rtol=1e-3, atol=1e-5), "kda chunkwise grads differ"
+    print("kimi_k31: chunkwise kda == step-by-step recurrence (values, grads, decay floor) ok")
+
+
+def test_moe_dispatch():
+    """the sorted, grouped expert bank is the obvious per-expert loop."""
+    torch.manual_seed(0)
+    moe = LatentMoE(
+        emb_dim=16, latent_dim=8, moe_dim=12, num_experts=6, experts_per_token=2,
+        num_shared_experts=1, shared_dim=8, beta=4.0, linear_beta=25.0,
+    )
+    # a bias that keeps experts 4 and 5 from ever being picked
+    moe.router_bias[4:] = -10.0
+    x = torch.randn(2, 9, 16, requires_grad=True)
+    out = moe(x)
+
+    z = moe.latent_norm(moe.down_proj(x)).reshape(18, -1)
+    probs = torch.sigmoid(moe.router(z))
+    _, indices = (probs + moe.router_bias).topk(2, dim=-1)
+    picked = probs.gather(-1, indices)
+    weights = picked / picked.sum(dim=-1, keepdim=True)
+    bank = moe.experts
+    naive = torch.zeros_like(z)
+    for n in range(18):
+        for slot in range(2):
+            e = indices[n, slot]
+            hidden = situ_glu(bank.gate.weight[e] @ z[n], bank.up.weight[e] @ z[n], 4.0, 25.0)
+            naive[n] += weights[n, slot] * (bank.down.weight[e] @ hidden)
+    want = moe.up_proj(naive.reshape(2, 9, -1)) + moe.shared_experts[0](x)
+    assert torch.allclose(out, want, atol=1e-5), "grouped dispatch != per-expert loop"
+
+    assert moe.load.sum() == 18 * 2 and (moe.load[4:] == 0).all()
+    out.sum().backward()
+    # an expert no token picked still leaves its params with a grad (zeros)
+    for linear in (bank.gate, bank.up, bank.down):
+        assert linear.weight.grad is not None and (linear.weight.grad[4:] == 0).all()
+        assert linear.weight.grad[:4].abs().sum() > 0
+    with torch.no_grad():
+        moe(x)
+    assert moe.load.sum() == 18 * 2, "a no-grad forward must not count toward the load"
+
+    # the balancing rule moves the bias toward the starved experts
+    model = build(KimiK31, KIMI_CFG, seed=3)
+    layer = model.moe_layers()[0]
+    layer.load.copy_(torch.tensor([9.0, 0, 3, 3, 3, 3, 3, 0]))
+    stats = model.balance_step()
+    rate = model.router_bias_rate
+    assert torch.allclose(layer.router_bias, rate * torch.tensor([-1.0, 1, 0, 0, 0, 0, 0, 1]))
+    assert layer.load.sum() == 0 and stats["moe/dead_experts"] >= 2
+    assert stats["moe/max_load"] == 3.0 and stats["moe/min_load"] == 0.0
+    print("kimi_k31: grouped expert dispatch, load counting, bias balancing ok")
+
+
 def test_registry_and_counts():
     for name, cfg in (("olmo3", OLMO_CFG), ("kimi_k31", KIMI_CFG)):
         model = build_model(name, cfg)
@@ -187,5 +273,7 @@ def test_registry_and_counts():
 if __name__ == "__main__":
     test_olmo()
     test_kimi()
+    test_kda_chunkwise()
+    test_moe_dispatch()
     test_registry_and_counts()
     print("all model tests passed")

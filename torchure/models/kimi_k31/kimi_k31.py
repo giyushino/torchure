@@ -22,9 +22,8 @@ scaled defaults; `__main__` prints the exact total / active counts):
   - latent moe: hidden -> latent (0.5x) -> routed situ experts -> latent
     norm happens on the way in -> up to hidden; shared experts run on the
     hidden stream in parallel. sigmoid router, top-k renormalised,
-    aux-free (a zero-init router bias buffer is kept for the noaux_tc
-    bias-update rule; nothing here updates it yet, so routing is purely
-    the learned sigmoid for now)
+    aux-free: a router bias buffer steers the top-k choice and is moved
+    by a balancing rule, not by gradient (see balance_step)
   - situ-glu: beta1*tanh(g/beta1) * sigmoid(g) * beta2*tanh(u/beta2),
     beta1=4, beta2=25, so outputs are bounded by 100
   - block attention residuals: sublayer outputs sum into a per-block
@@ -33,19 +32,23 @@ scaled defaults; `__main__` prints the exact total / active counts):
     the completed block sums, and the current partial
   - first layer is dense (first_k_dense_replace=1 in the real config)
 
-pure-pytorch references, deliberately: the kda recurrence is a sequential
-scan (compiler-disabled, like the tp collectives; checkpointed in segments
-so its autograd memory stays bounded, see _kda_scan) and the moe dispatch is
-a per-expert loop. fused chunkwise-kda / grouped-moe kernels are the
-follow-up, not something to fake here. expect kda layers to be slow at
-seq 4096 until then; the scaled config in configs/ turns compile off.
+pure pytorch throughout. the kda recurrence is solved chunkwise (64 steps in
+closed form at a time, see _kda_chunk; compiler-disabled, like the tp
+collectives) and the routed experts are one stacked bank driven by a sort and
+a grouped matmul (models/moe.py). the scaled config in configs/ turns compile
+off.
 
 trainer contract, same as qwen3: `blocks`, `norm`, `lm_head.weight`,
 `init_weights()`, `tp_plan()`, `activation_checkpointing`,
 forward(..., return_final_hidden=True). tp is vocab-only (see tp_plan):
 the current tp engine shards (b, s, d) regions, and neither the kda scan,
-mla's latent bottleneck, nor expert dispatch fit that vocabulary.
-fsdp/dp over `blocks` is the intended scaling path (ep is still a stub).
+mla's latent bottleneck, nor expert dispatch fit that vocabulary. the
+scaling paths are fsdp/dp over `blocks` and expert parallel over the routed
+experts (`ep_plan`, parallelism/expert_parallel.py).
+
+load balancing is aux-loss free: `balance_step` (called by the trainer after
+every optimizer step) nudges each layer's router bias toward the experts
+that got fewer tokens than their share, and reports the spread.
 """
 
 import math
@@ -55,52 +58,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    cos = cos.to(x.dtype)
-    sin = sin.to(x.dtype)
-    return (x * cos) + (rotate_half(x) * sin)
-
-
-class KimiRotaryEmbedding(nn.Module):
-    """plain rope for the mla rope dims only (kda is nope)."""
-
-    def __init__(self, head_dim: int, base: float = 10_000):
-        super().__init__()
-        assert head_dim % 2 == 0, "RoPE requires even head_dim"
-        self.head_dim = head_dim
-        self.base = base
-        self.register_buffer("inv_freq", torch.empty(head_dim // 2), False)
-        self._cache: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
-        self.init_buffers()
-
-    @torch.no_grad()
-    def init_buffers(self) -> None:
-        exponent = torch.arange(0, self.head_dim, 2, device=self.inv_freq.device).float()
-        self.inv_freq.copy_(1.0 / (self.base ** (exponent / self.head_dim)))
-        self._cache.clear()
-
-    def _cos_sin(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        freqs = position_ids.float()[:, :, None] * self.inv_freq[None, None, :]
-        emb = torch.cat([freqs, freqs], dim=-1)
-        return emb.cos()[:, None, :, :], emb.sin()[:, None, :, :]
-
-    def forward(
-        self, position_ids: torch.Tensor, cacheable: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not cacheable:
-            return self._cos_sin(position_ids)
-        key = (position_ids.shape[1], position_ids.device)
-        cached = self._cache.get(key)
-        if cached is None:
-            cached = self._cos_sin(position_ids[:1])
-            self._cache[key] = cached
-        return cached
+from torchure.models.layers import RotaryEmbedding, apply_rotary, positions
+from torchure.models.moe import ExpertBank, GroupedLinear, balance_stats, sort_by_expert
 
 
 def situ_glu(gate: torch.Tensor, up: torch.Tensor, beta: float, linear_beta: float) -> torch.Tensor:
@@ -124,59 +83,115 @@ class SiTUMLP(nn.Module):
         )
 
 
-# timesteps per checkpointed segment of the kda scan
-KDA_SCAN_CHUNK = 64
+# timesteps the kda scan solves in closed form at once
+KDA_CHUNK = 64
 
 
-def _kda_segment(
-    state: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    alpha: torch.Tensor, beta: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """the recurrence over one run of timesteps: (final state, outputs)."""
+def _kda_reference(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    log_alpha: torch.Tensor, beta: torch.Tensor,
+) -> torch.Tensor:
+    """
+    the gated delta rule one timestep at a time, exactly as written:
+
+        S <- (I - beta k k^T) diag(alpha) S + beta k v^T,   o = S^T q
+
+    q/k/v (B, S, H, D), log_alpha (B, S, H, D) <= 0, beta (B, S, H). slow and
+    memory hungry under autograd; `_kda_scan` is what the model runs, and is
+    tested against this.
+    """
+    B, S, H, D = q.shape
+    state = torch.zeros(B, H, D, D, device=q.device, dtype=q.dtype)
+    q = q * (D ** -0.5)
+    alpha = log_alpha.exp()
     outs = []
-    for t in range(q.shape[1]):
+    for t in range(S):
         k_t, v_t = k[:, t], v[:, t]                       # (B, H, D)
         state = state * alpha[:, t].unsqueeze(-1)         # per-channel decay
         pred = (state * k_t.unsqueeze(-1)).sum(dim=-2)    # S^T k_t
         delta = beta[:, t].unsqueeze(-1) * (v_t - pred)
         state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
         outs.append((state * q[:, t].unsqueeze(-1)).sum(dim=-2))
-    return state, torch.stack(outs, dim=1)
+    return torch.stack(outs, dim=1)
+
+
+def _kda_chunk(
+    state: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    log_alpha: torch.Tensor, beta: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    C timesteps of the recurrence in closed form: (state after, outputs).
+    q/k/v/log_alpha (B, H, C, D), beta (B, H, C), state (B, H, D, D).
+
+    every step adds a rank-1 write k_t u_t^T to the decayed state, with
+    u_t = beta_t (v_t - S_{t-1}'^T k_t). unrolling, with g_t the log decay
+    accumulated up to step t and w[t, i] = exp(g_t - g_i) the per-channel
+    decay a write at step i has suffered by step t:
+
+        S_t = exp(g_t) S_0 + sum_{i<=t} (w[t, i] k_i) u_i^T
+
+    substituting that into u_t gives a unit lower-triangular system for all
+    C of them at once,
+
+        (I + diag(beta) tril(A, -1)) U = diag(beta) (V - (exp(g) K) S_0),
+        A[t, i] = sum_d k_t[d] w[t, i, d] k_i[d]
+
+    and the outputs and the final state follow from U. w is formed pairwise,
+    exp of a difference that is always <= 0, rather than as exp(g_t) /
+    exp(g_i): a channel that decays hard would overflow the division.
+    """
+    g = log_alpha.cumsum(dim=2)                                   # (B, H, C, D)
+    # w[t, i, d] for i <= t; the i > t half is masked off below
+    w = (g.unsqueeze(3) - g.unsqueeze(2)).clamp(max=0).exp()      # (B, H, C, C, D)
+    decay = g.exp()
+
+    a = torch.einsum("bhtd,bhtid,bhid->bhti", k, w, k).tril(-1)
+    system = a * beta.unsqueeze(-1)                               # rows scaled by beta_t
+    rhs = beta.unsqueeze(-1) * (v - (k * decay) @ state)
+    u = torch.linalg.solve_triangular(system, rhs, upper=False, unitriangular=True)
+
+    aq = torch.einsum("bhtd,bhtid,bhid->bhti", q, w, k).tril()
+    out = (q * decay) @ state + aq @ u
+    carried = (w[:, :, -1] * k).transpose(-1, -2) @ u             # writes, decayed to the end
+    return decay[:, :, -1].unsqueeze(-1) * state + carried, out
 
 
 @torch.compiler.disable
 def _kda_scan(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    alpha: torch.Tensor, beta: torch.Tensor,
-    chunk: int = KDA_SCAN_CHUNK,
+    log_alpha: torch.Tensor, beta: torch.Tensor,
+    chunk: int = KDA_CHUNK,
+    checkpoint_chunks: bool = True,
 ) -> torch.Tensor:
     """
-    recurrent gated delta rule. q/k/v (B, S, H, D), alpha (B, S, H, D) in
-    (0, 1), beta (B, S, H). state S is (B, H, D, D), kept in fp32.
+    the gated delta rule over a sequence, `chunk` timesteps at a time (see
+    _kda_chunk). q/k/v (B, S, H, D), log_alpha (B, S, H, D) <= 0, beta
+    (B, S, H). the state is (B, H, D, D), kept in fp32.
 
-    autograd would keep several (B, H, D, D) tensors for EVERY timestep,
-    gigabytes per sequence per layer at seq 4096. so with grad on, the scan
-    runs in segments of `chunk` steps under activation checkpointing: only
-    the state at each segment boundary is kept, and a segment's steps are
-    recomputed when backward reaches it. memory goes from O(S) states to
-    O(S / chunk + chunk), for one extra forward of the scan.
+    S / chunk python steps instead of S. each chunk builds a (C, C, D)
+    pairwise-decay tensor per head, so memory grows with the chunk size;
+    with grad on, chunks run under activation checkpointing by default, so
+    only the state at each chunk boundary is kept for backward, at the price
+    of running each chunk a second time.
     """
     B, S, H, D = q.shape
     state = torch.zeros(B, H, D, D, device=q.device, dtype=torch.float32)
-    q = q.float() * (D ** -0.5)
-    k, v, alpha, beta = k.float(), v.float(), alpha.float(), beta.float()
-    use_checkpoint = torch.is_grad_enabled() and S > chunk and any(
-        t.requires_grad for t in (q, k, v, alpha, beta)
+    # (B, S, H, ...) -> (B, H, S, ...)
+    q = q.float().transpose(1, 2) * (D ** -0.5)
+    k, v, log_alpha = (t.float().transpose(1, 2) for t in (k, v, log_alpha))
+    beta = beta.float().transpose(1, 2)
+    use_checkpoint = checkpoint_chunks and torch.is_grad_enabled() and S > chunk and any(
+        t.requires_grad for t in (q, k, v, log_alpha, beta)
     )
     outs = []
     for s in range(0, S, chunk):
-        args = (state, *(t[:, s:s + chunk] for t in (q, k, v, alpha, beta)))
+        args = (state, *(t[:, :, s:s + chunk] for t in (q, k, v, log_alpha, beta)))
         if use_checkpoint:
-            state, out = checkpoint(_kda_segment, *args, use_reentrant=False)
+            state, out = checkpoint(_kda_chunk, *args, use_reentrant=False)
         else:
-            state, out = _kda_segment(*args)
+            state, out = _kda_chunk(*args)
         outs.append(out)
-    return torch.cat(outs, dim=1)
+    return torch.cat(outs, dim=2).transpose(1, 2)
 
 
 class KimiDeltaAttention(nn.Module):
@@ -245,10 +260,10 @@ class KimiDeltaAttention(nn.Module):
         log_alpha = -torch.exp(self.A_log)[None, None] * F.softplus(
             gate.float() + self.dt_bias.reshape(1, 1, H, D)
         )
-        alpha = torch.exp(log_alpha.clamp_min(self.gate_lower_bound))
+        log_alpha = log_alpha.clamp_min(self.gate_lower_bound)
         beta = torch.sigmoid(self.beta_proj(x))
 
-        out = _kda_scan(q, k, v, alpha, beta).to(x.dtype)  # (B, S, H, D)
+        out = _kda_scan(q, k, v, log_alpha, beta).to(x.dtype)  # (B, S, H, D)
         out = self.out_norm(out.reshape(B, S, H, D))
         out = out * torch.sigmoid(self.out_gate_proj(x).reshape(B, S, H, D))
         return self.o_proj(out.reshape(B, S, H * D))
@@ -372,20 +387,24 @@ class LatentMoE(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.experts_per_token = experts_per_token
+        self.beta = beta
+        self.linear_beta = linear_beta
         self.down_proj = nn.Linear(emb_dim, latent_dim, bias=False)
         self.latent_norm = nn.RMSNorm(latent_dim, eps=norm_eps)
         self.up_proj = nn.Linear(latent_dim, emb_dim, bias=False)
         self.router = nn.Linear(latent_dim, num_experts, bias=False)
-        # noaux_tc bias: updated by a balancing rule, not by gradient
+        # noaux_tc bias: moved by KimiK31.balance_step, not by gradient
         self.register_buffer("router_bias", torch.zeros(num_experts))
-        self.experts = nn.ModuleList(
-            SiTUMLP(latent_dim, moe_dim, latent_dim, beta, linear_beta)
-            for _ in range(num_experts)
-        )
+        # tokens each expert got since the last balance_step
+        self.register_buffer("load", torch.zeros(num_experts), persistent=False)
+        self.experts = ExpertBank(num_experts, latent_dim, moe_dim, latent_dim, self._situ)
         self.shared_experts = nn.ModuleList(
             SiTUMLP(emb_dim, shared_dim, emb_dim, beta, linear_beta)
             for _ in range(num_shared_experts)
         )
+
+    def _situ(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        return situ_glu(gate, up, self.beta, self.linear_beta)
 
     @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -398,13 +417,15 @@ class LatentMoE(nn.Module):
         picked = probs.gather(-1, indices)
         weights = picked / picked.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        out = torch.zeros_like(z)
-        for e, expert in enumerate(self.experts):
-            rows, slot = (indices == e).nonzero(as_tuple=True)
-            if rows.numel() == 0:
-                continue
-            contrib = expert(z[rows]) * weights[rows, slot].unsqueeze(-1).to(z.dtype)
-            out.index_add_(0, rows, contrib)
+        # the (token, expert) pairs, grouped by expert
+        token, slot, counts = sort_by_expert(indices, self.num_experts)
+        if torch.is_grad_enabled():
+            # only passes that train: not eval, and not the no-grad first
+            # pass of an activation-checkpointed block (its re-run counts)
+            self.load += counts
+        routed = self.experts(z[token], counts)                    # (N * k, latent)
+        routed = routed * weights[token, slot].unsqueeze(-1).to(routed.dtype)
+        out = torch.zeros_like(z).index_add_(0, token, routed.to(z.dtype))
 
         result = self.up_proj(out.reshape(B, S, -1))
         for shared in self.shared_experts:
@@ -496,13 +517,17 @@ class KimiK31(nn.Module):
         attn_res: bool = True,
         attn_res_block_size: int = 6,
         dsa_topk: int | None = None,
+        router_bias_rate: float = 1e-3,
     ):
         super().__init__()
         self.emb_dim = emb_dim
+        # how far balance_step moves a router bias per optimizer step
+        self.router_bias_rate = router_bias_rate
         self.use_attn_res = attn_res
         self.attn_res_block_size = attn_res_block_size
         self.token_emb = nn.Embedding(vocab_size, emb_dim)
-        self.rope = KimiRotaryEmbedding(qk_rope_dim, base=rope_base)
+        # plain rope, on the mla rope dims only (kda is nope)
+        self.rope = RotaryEmbedding(qk_rope_dim, base=rope_base)
 
         blocks = []
         for i in range(num_layers):
@@ -543,6 +568,8 @@ class KimiK31(nn.Module):
                 nn.init.normal_(module.weight, mean=0.0, std=std)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+            elif isinstance(module, GroupedLinear):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=std)
             elif isinstance(module, nn.RMSNorm) and module.weight is not None:
@@ -555,7 +582,7 @@ class KimiK31(nn.Module):
             elif name.endswith("dt_bias"):
                 nn.init.zeros_(param)
         for name, buf in self.named_buffers():
-            if name.endswith("router_bias"):
+            if name.endswith(("router_bias", "load")):
                 buf.zero_()
 
         residual_scale = (2 * len(self.blocks)) ** -0.5
@@ -564,7 +591,8 @@ class KimiK31(nn.Module):
             ffn = block.ffn
             if isinstance(ffn, LatentMoE):
                 ffn.up_proj.weight.data.mul_(residual_scale)
-                for expert in (*ffn.experts, *ffn.shared_experts):
+                ffn.experts.down.weight.data.mul_(residual_scale)
+                for expert in ffn.shared_experts:
                     expert.down_proj.weight.data.mul_(residual_scale)
             else:
                 ffn.down_proj.weight.data.mul_(residual_scale)
@@ -586,6 +614,40 @@ class KimiK31(nn.Module):
             "seq_local": [],
         }
 
+    def moe_layers(self) -> list[LatentMoE]:
+        return [block.ffn for block in self.blocks if isinstance(block.ffn, LatentMoE)]
+
+    def ep_plan(self) -> list[ExpertBank]:
+        """
+        the expert banks expert parallel shards across the mesh's ep axis.
+        everything else (routers, shared experts, attention) stays dense.
+        """
+        return [moe.experts for moe in self.moe_layers()]
+
+    @torch.no_grad()
+    def balance_step(self, reduce=None) -> dict[str, torch.Tensor]:
+        """
+        aux-loss-free load balancing, once per optimizer step: every
+        layer's router bias moves `router_bias_rate` toward the experts that
+        got fewer tokens than the mean since the last call, away from the
+        ones that got more. returns the spread (see moe.balance_stats).
+
+        `reduce(tensor)` sums a tensor in place over every rank that saw
+        different data, so all ranks apply the same update and the bias
+        stays replicated.
+        """
+        layers = self.moe_layers()
+        if not layers:
+            return {}
+        load = torch.stack([moe.load for moe in layers])
+        if reduce is not None:
+            load = reduce(load)
+        step = self.router_bias_rate * torch.sign(load.mean(dim=-1, keepdim=True) - load)
+        for moe, delta in zip(layers, step, strict=True):
+            moe.router_bias += delta.to(moe.router_bias.dtype)
+            moe.load.zero_()
+        return balance_stats(load)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -593,15 +655,7 @@ class KimiK31(nn.Module):
         return_hidden_states: bool = False,
         return_final_hidden: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        B, S = x.shape
-        if attention_mask is None:
-            position_ids = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
-            cacheable = True
-        else:
-            attention_mask = attention_mask.bool()
-            position_ids = attention_mask.long().cumsum(dim=1) - 1
-            position_ids = position_ids.masked_fill(~attention_mask, 0)
-            cacheable = False
+        position_ids, attention_mask, cacheable = positions(x, attention_mask)
 
         emb = self.token_emb(x)
         cos, sin = self.rope(position_ids, cacheable=cacheable)
@@ -653,8 +707,8 @@ if __name__ == "__main__":
     for block in model.blocks:
         ffn = block.ffn
         if isinstance(ffn, LatentMoE):
-            per_expert = sum(p.numel() for p in ffn.experts[0].parameters())
-            inactive += per_expert * (len(ffn.experts) - ffn.experts_per_token)
+            per_expert = sum(p.numel() for p in ffn.experts.parameters()) // ffn.num_experts
+            inactive += per_expert * (ffn.num_experts - ffn.experts_per_token)
     mla = sum(isinstance(b.attn, MultiHeadLatentAttention) for b in model.blocks)
     print(f"kimi-k3.1 scaled: {total / 1e9:.2f}B total, "
           f"{(total - inactive) / 1e9:.2f}B active (excl. token embedding)")

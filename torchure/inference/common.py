@@ -7,9 +7,8 @@ from tokenizers import Tokenizer
 
 from torchure.checkpoint.checkpointer import Checkpointer
 from torchure.models.builder import build_model
-from torchure.utils import checkpoint_dir, load_json
-
-load_config = load_json
+from torchure.config import load_config  # noqa: F401 -- re-exported for the scripts
+from torchure.utils import checkpoint_dir
 
 
 def load_model_and_tokenizer(config: dict, step: int, device: str):

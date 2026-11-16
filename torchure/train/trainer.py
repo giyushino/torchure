@@ -18,7 +18,8 @@ from tokenizers import Tokenizer
 from torchure.checkpoint.checkpointer import Checkpointer, ShardLayout
 from torchure.core.collective import all_reduce
 from torchure.core.grad_helper import clip_grad_norm
-from torchure.core.mesh import Mesh
+from torchure.config import load_config, validate
+from torchure.core.mesh import Mesh, build_mesh
 from torchure.core.meta import materialize
 from torchure.dataloader.builder import build_dataloader, shutdown_workers
 from torchure.dataloader.prefetcher import CUDAPrefetcher
@@ -26,9 +27,10 @@ from torchure.models.builder import build_model
 from torchure.objectives.builder import build_objective
 from torchure.optimizer.builder import build_optimizer, build_scheduler
 from torchure.parallelism.data_parallel import DDP
+from torchure.parallelism.expert_parallel import EP
 from torchure.parallelism.fsdp2 import FSDP
 from torchure.parallelism.tensor_parallel import TP
-from torchure.utils import checkpoint_dir, debug_time, load_json
+from torchure.utils import checkpoint_dir, debug_time
 
 try:
     import wandb
@@ -52,11 +54,6 @@ _DTYPES = {
     "none": None,
 }
 
-# fixed, because order matters: the last axis gets stride 1 (tp peers on
-# adjacent ranks), and mesh.flatten needs its axes in spec order
-MESH_AXIS_ORDER = ("pp", "dp_replicate", "dp_shard", "cp", "tp", "ep")
-
-
 class Trainer:
     def __init__(
         self,
@@ -67,10 +64,11 @@ class Trainer:
         benchmark: bool = False,
     ):
         # TODO: assert model and tokenizer vocab sizes match
-        self.config = load_json(train_config_path)
+        self.config = load_config(train_config_path)
+        validate(self.config, world_size)
         self.rank = rank
         self.world_size = world_size
-        self.seed = self.config.get("seed", 67)
+        self.seed = self.config["seed"]
         torch.manual_seed(self.seed)
         # benchmark mode (train.py --steps): fixed-step tps run, no checkpoints or wandb
         self.benchmark = benchmark
@@ -80,19 +78,21 @@ class Trainer:
         self.dp_size = self.mesh.size("dp")
         # the mesh drops size-1 axes, so no tp axis means no tensor parallel
         self.tp_size = self.mesh.sizes.get("tp", 1)
+        self.ep_size = self.mesh.sizes.get("ep", 1)
 
         # "ddp" | "fsdp"
-        self.parallelism = self.config.get("parallelism", "ddp")
+        self.parallelism = self.config["parallelism"]
         # set by _build_model: the data-parallel strategy (DDP | FSDP) and the
-        # tensor-parallel one, if any
+        # tensor-parallel / expert-parallel ones, if any
         self.parallel: DDP | FSDP
         self.tp: TP | None = None
+        self.ep: EP | None = None
 
         self.ignore_index = self.config["objective"]["config"]["ignore_index"]
         self.tokenizer = Tokenizer.from_pretrained(self.config["data"]["tokenizer"])
 
         self.model = self._build_model()
-        self.model.activation_checkpointing = self.config.get("activation_checkpointing", False)
+        self.model.activation_checkpointing = self.config["activation_checkpointing"]
         # init ran on the shared seed so every rank built the same model; from
         # here each dp rank draws its own stream (dropout, diffusion masks).
         # tp/cp peers share a dp coordinate, so they stay in lockstep.
@@ -134,23 +134,24 @@ class Trainer:
             rank=rank,
             world_size=world_size,
             # snapshot to cpu, write in a background thread while training runs
-            async_save=self.config["checkpointing"].get("async_save", True),
+            async_save=self.config["checkpointing"]["async_save"],
         )
         self.resume = self.config["checkpointing"]["resume"]
         self.save_steps = self.config["checkpointing"]["save_steps"]
         # complete checkpoints to keep besides the one being written; null keeps all
-        self.keep_last_n = self.config["checkpointing"].get("keep_last_n")
-        assert self.keep_last_n is None or self.keep_last_n >= 1, (
-            f"checkpointing.keep_last_n={self.keep_last_n}: expected null or >= 1"
+        self.keep_last_n = self.config["checkpointing"]["keep_last_n"]
+        # logging is the only host sync in the step loop, besides the check
+        # for a SIGTERM (see _run_steps), which defaults to the same steps
+        self.log_every = self.config["log_every"]
+        self.stop_check_every = (
+            self.config["checkpointing"]["stop_check_every"] or self.log_every
         )
-        # logging is the only host sync in the step loop
-        self.log_every = self.config.get("log_every", 10)
         # false for "continue" runs that change the schedule: loading the old
         # scheduler state would overwrite total_steps/warmup/decay with the old values
-        self.resume_scheduler = self.config["checkpointing"].get("resume_scheduler", True)
+        self.resume_scheduler = self.config["checkpointing"]["resume_scheduler"]
         # restoring stream position replays everything consumed in each worker's
         # current shard, which can be slow. false skips that and reshuffles instead.
-        self.resume_dataloader = self.config["checkpointing"].get("resume_dataloader", True)
+        self.resume_dataloader = self.config["checkpointing"]["resume_dataloader"]
         # set by _resume so wandb reattaches to the existing run
         self.resume_wandb_id: str | None = None
         # the batch the prefetcher held at the checkpoint, set by _resume
@@ -175,8 +176,8 @@ class Trainer:
     def _setup_wandb(self) -> None:
         """rank 0 only. runs after _resume so it can reattach to the checkpointed run id."""
         self.wandb_run = None
-        wandb_cfg = self.config.get("wandb", {})
-        if not wandb_cfg.get("enabled", False) or self.rank != 0 or self.benchmark:
+        wandb_cfg = self.config["wandb"]
+        if not wandb_cfg["enabled"] or self.rank != 0 or self.benchmark:
             return
         assert wandb is not None, (
             "wandb.enabled is true in the config but wandb isn't installed: "
@@ -184,8 +185,8 @@ class Trainer:
         )
 
         self.wandb_run = wandb.init(
-            project=wandb_cfg.get("project", "torchure"),
-            entity=wandb_cfg.get("entity"),
+            project=wandb_cfg["project"],
+            entity=wandb_cfg["entity"],
             name=self.run_name,
             id=self.resume_wandb_id,
             resume="must" if self.resume_wandb_id else None,
@@ -193,7 +194,8 @@ class Trainer:
         )
 
     def _log_metrics(
-        self, loss: float, grad_norm: float, step: int, tokens_per_step: int, step_time: float
+        self, loss: float, grad_norm: float, step: int, tokens_per_step: int, step_time: float,
+        extra: dict[str, float],
     ) -> None:
         # `step` is the count of completed steps, same as checkpoint(). wandb
         # silently drops logs at step <= the last one, so these must agree.
@@ -208,6 +210,7 @@ class Trainer:
                 "perf/tps": tokens_per_step / step_time,
                 "perf/step_time": step_time,
                 "perf/peak_mem_gib": torch.cuda.max_memory_allocated() / 2**30,
+                **extra,
             },
             step=step,
         )
@@ -217,13 +220,13 @@ class Trainer:
         build, initialize and parallelize the model; sets self.parallel and
         self.tp.
 
-        plain ddp: build -> init -> replicate. anything sharded (fsdp, tp or
-        both): build on the meta device (shapes only) -> shard -> init the
-        shards, so no rank ever holds the full weights. tp cuts first; fsdp
-        then shards what tp left on the rank, and ddp replicates it.
+        plain ddp: build -> init -> replicate. anything sharded (fsdp, tp,
+        ep): build on the meta device (shapes only) -> shard -> init the
+        shards, so no rank ever holds the full weights. tp and ep cut first;
+        fsdp then shards what they left on the rank, and ddp replicates it.
         """
         model_cfg = self.config["model"]
-        if self.parallelism != "fsdp" and self.tp_size == 1:
+        if self.parallelism != "fsdp" and self.tp_size == 1 and self.ep_size == 1:
             model = build_model(model_cfg["name"], model_cfg["config"])
             model.to(self.device)
             model.init_weights()
@@ -233,6 +236,7 @@ class Trainer:
         with torch.device("meta"):
             model = build_model(model_cfg["name"], model_cfg["config"])
         self.tp = self._tensor_parallelize(model)
+        self.ep = self._expert_parallelize(model)
         if self.parallelism == "fsdp":
             self._parallelize(model)  # allocates this rank's shards
             self._init_shards(model)
@@ -251,12 +255,14 @@ class Trainer:
         runs before _compile so the grad hooks stay outside the compiled regions.
         """
         if self.parallelism == "ddp":
-            ddp_cfg = self.config.get("ddp", {})
             self.parallel = DDP(
                 model,
                 self.mesh,
                 dim="dp",
-                bucket_mb=ddp_cfg.get("bucket_mb", 25),
+                bucket_mb=self.config["ddp"]["bucket_mb"],
+                # under ep, `dp` includes the ep axis, and an expert has
+                # replicas only along the dp axes proper
+                dim_of=self._expert_axis("dp", "dp_expert"),
             )
         elif self.parallelism == "fsdp":
             # FSDP at dp_shard=1 is a full no-op, so it would silently skip
@@ -265,7 +271,10 @@ class Trainer:
                 f"parallelism 'fsdp' needs dp_shard > 1 (mesh {self.config['mesh']}); "
                 "use parallelism 'ddp' for pure replication"
             )
-            fsdp_cfg = self.config.get("fsdp", {})
+            fsdp_cfg = self.config["fsdp"]
+            # whole replicas of a shard: along dp_replicate, and for dense
+            # params along ep as well (ep ranks are data-parallel for them)
+            replicate_dim = "dp_replicate_ep" if self.ep is not None else "dp_replicate"
             self.parallel = FSDP(
                 model,
                 self.mesh,
@@ -273,16 +282,41 @@ class Trainer:
                 units=model.blocks,
                 shard_dim="dp_shard",
                 # hsdp: reduce-scatter on dp_shard, then all_reduce on dp_replicate
-                replicate_dim="dp_replicate" if self.mesh.size("dp_replicate") > 1 else None,
-                param_dtype=_DTYPES[fsdp_cfg.get("param_dtype", "bfloat16")],
-                reduce_dtype=_DTYPES[fsdp_cfg.get("reduce_dtype", "float32")],
-                prefetch=fsdp_cfg.get("prefetch", 1),
+                replicate_dim=replicate_dim if self.mesh.size(replicate_dim) > 1 else None,
+                replicate_dim_of=self._expert_axis(replicate_dim, "dp_replicate"),
+                param_dtype=_DTYPES[fsdp_cfg["param_dtype"]],
+                reduce_dtype=_DTYPES[fsdp_cfg["reduce_dtype"]],
+                prefetch=fsdp_cfg["prefetch"],
                 device=self.device,
             )
         else:
             raise ValueError(
                 f"unknown parallelism {self.parallelism!r}; expected 'ddp' or 'fsdp'"
             )
+
+    def _expert_axis(self, dense: str, expert: str):
+        """
+        param -> the mesh axis its replicas lie along, for ddp / fsdp: `expert`
+        for an expert-parallel weight, `dense` for everything else. None
+        without ep (one axis for every param).
+        """
+        if self.ep is None:
+            return None
+        ep = self.ep
+        return lambda param: expert if ep.owns(param) else dense
+
+    def _expert_parallelize(self, model: nn.Module) -> EP | None:
+        """
+        split the model's expert banks along the mesh's ep axis. the model is
+        still on meta here, so this only rewrites shapes.
+        """
+        if self.ep_size == 1:
+            return None
+        assert hasattr(model, "ep_plan"), (
+            f"mesh.ep={self.ep_size} but {type(model).__name__} has no ep_plan(): "
+            "expert parallel needs a moe model"
+        )
+        return EP(self.mesh, model.ep_plan(), dim="ep")
 
     def _tensor_parallelize(self, model: nn.Module) -> TP | None:
         """
@@ -299,27 +333,20 @@ class Trainer:
         """
         if self.tp_size == 1:
             return None
-        tp_cfg = self.config.get("tp", {})
-        sequence_parallel = tp_cfg.get("sequence_parallel", True)
-        seq_len = self.config["data"]["seq_len"]
-        assert not sequence_parallel or seq_len % self.tp_size == 0, (
-            f"sequence parallel needs seq_len {seq_len} divisible by tp {self.tp_size}"
-        )
-        plan = model.tp_plan(self.tp_size, vocab_parallel=tp_cfg.get("vocab_parallel", True))
+        tp_cfg = self.config["tp"]
+        sequence_parallel = tp_cfg["sequence_parallel"]
+        plan = model.tp_plan(self.tp_size, vocab_parallel=tp_cfg["vocab_parallel"])
+        # a model with no tp regions (kimi: vocab only) has nothing for
+        # sequence parallel to shard between
+        sequence_parallel = sequence_parallel and bool(plan["regions"])
         # the dim sp shards activations along between regions: "seq" (1) or
         # "batch" (0). batch keeps each rank's chunk contiguous, so gathers and
         # scatters need no layout copies; it needs micro_batch % tp == 0
-        sp_dim = tp_cfg.get("sp_dim", "seq")
-        assert sp_dim in ("seq", "batch"), f"tp.sp_dim {sp_dim!r}: expected 'seq' or 'batch'"
-        if sp_dim == "batch":
-            micro = self.config["data"]["micro_batch_size"]
-            assert micro % self.tp_size == 0, (
-                f"tp.sp_dim 'batch' needs micro_batch_size {micro} divisible by tp {self.tp_size}"
-            )
+        sp_dim = tp_cfg["sp_dim"]
         return TP(
             self.mesh, **plan, dim="tp", sequence_parallel=sequence_parallel,
             seq_dim=0 if sp_dim == "batch" else 1,
-            overlap=tp_cfg.get("overlap", "none"),
+            overlap=tp_cfg["overlap"] if sequence_parallel else "none",
         )
 
     def _compile(self, model: nn.Module) -> None:
@@ -327,9 +354,9 @@ class Trainer:
         compile per transformer block: one graph reused across identical blocks,
         matching fsdp's per-block granularity.
         """
-        if not self.config.get("compile", True):
+        if not self.config["compile"]:
             return
-        mode = self.config.get("compile_mode", "default")
+        mode = self.config["compile_mode"]
         # compile `forward`, not the module: module.compile() would also trace
         # the module hooks (fsdp's gathers), which must stay eager
         for block in model.blocks:
@@ -340,20 +367,21 @@ class Trainer:
     def _init_shards(self, model: nn.Module) -> None:
         """
         init a model materialized from meta: each rank fills only its own
-        shards. seeded per (dp_shard, tp) cell, so shards differ from each
-        other; the finish_init calls then make everything that is replicated
-        (hsdp replicas, params tp doesn't cut, buffers) agree.
+        shards. seeded per (dp_shard, tp, ep) cell, so shards differ from
+        each other; the finish_init calls then make everything that is
+        replicated (hsdp replicas, params tp / ep don't cut, buffers) agree.
         """
-        shard = self.mesh.coordinate("dp_shard") if self.parallelism == "fsdp" else 0
-        cell = shard * self.tp_size
-        if self.tp is not None:
-            cell += self.mesh.coordinate("tp")
+        cell = self.mesh.coordinate("dp_shard") if self.parallelism == "fsdp" else 0
+        cell = cell * self.tp_size + (self.mesh.coordinate("tp") if self.tp else 0)
+        cell = cell * self.ep_size + (self.mesh.coordinate("ep") if self.ep else 0)
         torch.manual_seed(self.seed + cell)
         model.init_weights()
         if self.parallelism == "fsdp":
             self.parallel.finish_init()
         if self.tp is not None:
             self.tp.finish_init(model)
+        if self.ep is not None:
+            self.ep.finish_init(model)
 
     @debug_time
     def _build_dataloader(self) -> torchdata.stateful_dataloader.StatefulDataLoader:
@@ -384,35 +412,12 @@ class Trainer:
         return loader_iter
 
     def _build_mesh(self) -> Mesh:
-        """
-        canonicalize the config's mesh spec (into MESH_AXIS_ORDER) and add the
-        flattened `dp` axis. `dp: N` is shorthand for `dp_shard: N`.
-        """
-        # copy: self.config["mesh"] is saved in checkpoints and checked on resume
-        mesh_cfg = dict(self.config["mesh"])
-        assert not ("dp" in mesh_cfg and ("dp_replicate" in mesh_cfg or "dp_shard" in mesh_cfg)), (
-            f"mesh spec {self.config['mesh']}: `dp` is shorthand for `dp_shard`; "
-            "don't mix it with the explicit axes"
-        )
-
-        if "dp" in mesh_cfg:
-            mesh_cfg["dp_shard"] = mesh_cfg.pop("dp")
-
-        spec = {}
-        for axis in MESH_AXIS_ORDER:
-            size = mesh_cfg.pop(axis, 1)
-            # size-1 axes cost world_size new_group calls, so drop them, except
-            # the dp axes, which flatten() needs
-            if size > 1 or axis in ("dp_replicate", "dp_shard"):
-                spec[axis] = size
-
-        mesh = Mesh(spec)
-        mesh.flatten(("dp_replicate", "dp_shard"), "dp")
-        return mesh
+        """the config's mesh plus the derived data axis `dp` (core/mesh.py)."""
+        return build_mesh(self.config["mesh"])
 
     def _shard_layout(self) -> ShardLayout:
         """how this run shards model/optimizer state, for the checkpointer."""
-        return ShardLayout.of(self.model, self.parallel, self.mesh, tp=self.tp)
+        return ShardLayout.of(self.model, self.parallel, self.mesh, tp=self.tp, ep=self.ep)
 
     def _writes_model_state(self) -> bool:
         """
@@ -421,10 +426,14 @@ class Trainer:
         rank 0 alone under ddp, the dp_replicate=0 row under fsdp/hsdp, and
         with tp on, one rank per tp coordinate of those.
         """
-        shard_dims = self.parallel.shard_dims + (self.tp.shard_dims if self.tp else ())
+        shard_dims = (
+            self.parallel.shard_dims
+            + (self.tp.shard_dims if self.tp else ())
+            + (self.ep.shard_dims if self.ep else ())
+        )
         return all(
             self.mesh.coordinate(axis) == 0
-            for axis in ("dp_replicate", "dp_shard", "tp")
+            for axis in ("dp_replicate", "dp_shard", "tp", "ep")
             if axis in self.mesh.sizes and axis not in shard_dims
         )
 
@@ -501,8 +510,9 @@ class Trainer:
         """
         collective: has any rank been sent SIGTERM? ranks get the signal at
         different moments, so they agree on it here, at a point every rank
-        reaches on the same step. only called at log points, which already
-        sync with the host.
+        reaches on the same step. it syncs with the host, so it is asked
+        every `checkpointing.stop_check_every` steps (default: the log points,
+        which sync anyway), not every step.
         """
         flag = torch.tensor(float(self._sigterm), device=self.device)
         if self.dp_size > 1:
@@ -604,7 +614,11 @@ class Trainer:
     def _grad_shard_dims(self, param: nn.Parameter) -> tuple[str, ...]:
         """the mesh axes `param`'s grad is sharded over (for the global grad norm)."""
         dims = self.parallel.shard_dims
-        return dims if self.tp is None else dims + self.tp.shard_dims_of(param)
+        if self.tp is not None:
+            dims = dims + self.tp.shard_dims_of(param)
+        if self.ep is not None:
+            dims = dims + self.ep.shard_dims_of(param)
+        return dims
 
     def micro_train_step(self) -> torch.Tensor:
         batch = next(self.prefetcher)
@@ -627,6 +641,8 @@ class Trainer:
         if self.tp is not None:
             # after the dp sync: it reduces these same grad tensors in the background
             self.tp.sync()
+        if self.ep is not None:
+            self.ep.sync()
         grad_norm = clip_grad_norm(
             self.model.parameters(), self.mesh, self.max_norm,
             shard_dims_of=self._grad_shard_dims,
@@ -636,7 +652,24 @@ class Trainer:
         self.scheduler.step()
 
         # rank-local loss; _run_steps averages over dp once per log window
-        return {"loss": loss, "grad_norm": grad_norm}
+        return {"loss": loss, "grad_norm": grad_norm, **self._balance_experts()}
+
+    def _balance_experts(self) -> dict[str, torch.Tensor]:
+        """
+        a moe model's aux-free load balancing, once per optimizer step: the
+        expert loads are summed over every data rank, so all ranks apply the
+        same router-bias update. returns the model's balance metrics (on
+        device), or {} for a model without it.
+        """
+        if not hasattr(self.model, "balance_step"):
+            return {}
+
+        def reduce(load: torch.Tensor) -> torch.Tensor:
+            if self.dp_size > 1:
+                all_reduce(load, self.mesh, "dp", "sum")
+            return load
+
+        return self.model.balance_step(reduce)
 
     def _run_steps(self, start: int, end: int, checkpoint: bool) -> None:
         """
@@ -648,34 +681,46 @@ class Trainer:
         tokens_per_step = self.config["data"]["seq_len"] * self.global_batch_size
         loss_sum = torch.zeros((), device=self.device)
         gnorm_sum = torch.zeros((), device=self.device)
+        # anything else train_step reports (moe balance): summed like the rest
+        extra_sums: dict[str, torch.Tensor] = {}
         window = 0
         t0 = time.perf_counter()
 
         for step in range(start, end):
             metrics = self.train_step()
-            loss_sum += metrics["loss"]
-            gnorm_sum += metrics["grad_norm"]
+            loss_sum += metrics.pop("loss")
+            gnorm_sum += metrics.pop("grad_norm")
+            for name, value in metrics.items():
+                extra_sums[name] = extra_sums.get(name, 0) + value
             window += 1
 
             done = step + 1
             save = checkpoint and (done % self.save_steps == 0 or done == end)
-            if save or done % self.log_every == 0 or done == end:
-                stop = checkpoint and self._stop_requested()
+            log = done % self.log_every == 0 or done == end
+            # has any rank been sent SIGTERM? asked on the same steps by
+            # every rank; a yes turns this step into a log + save point
+            stop = False
+            if checkpoint and (save or log or done % self.stop_check_every == 0):
+                stop = self._stop_requested()
+            if save or log or stop:
                 save = save or stop
                 if self.dp_size > 1:
                     all_reduce(loss_sum, self.mesh, "dp", "avg")
                 loss = loss_sum.item() / window
                 gnorm = gnorm_sum.item() / window
+                extra = {name: total.item() / window for name, total in extra_sums.items()}
                 step_time = (time.perf_counter() - t0) / window
                 if self.rank == 0:
-                    self._log_metrics(loss, gnorm, done, tokens_per_step, step_time)
+                    self._log_metrics(loss, gnorm, done, tokens_per_step, step_time, extra)
                     print(
                         f"step={done} || loss={loss:.4f} || gnorm={gnorm:.3f} "
                         f"|| lr={self.scheduler.get_last_lr()[0]:.2e} "
                         f"|| tps={tokens_per_step / step_time:.0f}"
+                        + "".join(f" || {name}={value:.3g}" for name, value in extra.items())
                     )
                 loss_sum.zero_()
                 gnorm_sum.zero_()
+                extra_sums.clear()
                 window = 0
                 if save:
                     self.checkpoint(done)

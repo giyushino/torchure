@@ -209,6 +209,8 @@ def all_to_all(
     split_dim: int = 0,
     concat_dim: int = 0,
     *,
+    input_splits: list[int] | None = None,
+    output_splits: list[int] | None = None,
     async_op: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dist.Work]:
     """
@@ -216,12 +218,34 @@ def all_to_all(
     to coordinate j; the size received chunks (ordered by sender coordinate)
     are concatenated along `concat_dim`. returns a new tensor.
 
-    even splits only. ep will eventually need uneven splits.
+    uneven (expert parallel's token dispatch): pass `input_splits`, the rows
+    of dim 0 this rank sends to each coordinate, and `output_splits`, the
+    rows it receives from each. both are needed, and every pair of ranks
+    must agree (my input_splits[j] == j's output_splits[me]), so the ranks
+    exchange their counts first. rows only: split_dim == concat_dim == 0.
     """
     group = mesh.get_group(dim)
     group_size = mesh.size(dim)
-    assert tensor.shape[split_dim] % group_size == 0
     assert not async_op, "all_to_all is sync-only (v0)"
+    if input_splits is not None or output_splits is not None:
+        assert input_splits is not None and output_splits is not None, (
+            "uneven all_to_all needs both input_splits and output_splits"
+        )
+        assert split_dim == 0 and concat_dim == 0, "uneven all_to_all moves rows of dim 0"
+        assert len(input_splits) == len(output_splits) == group_size
+        assert sum(input_splits) == tensor.shape[0], (
+            f"input_splits {input_splits} don't add up to {tensor.shape[0]} rows"
+        )
+        input_tensor = tensor.contiguous()
+        output_tensor = torch.empty(
+            (sum(output_splits), *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device
+        )
+        dist.all_to_all_single(
+            output=output_tensor, input=input_tensor,
+            output_split_sizes=output_splits, input_split_sizes=input_splits, group=group,
+        )
+        return output_tensor
+    assert tensor.shape[split_dim] % group_size == 0
     input_tensor = tensor.movedim(split_dim, 0).contiguous()
     output_tensor = torch.empty_like(input_tensor)
     dist.all_to_all_single(output=output_tensor, input=input_tensor, group=group)

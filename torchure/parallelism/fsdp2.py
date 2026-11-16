@@ -49,7 +49,7 @@ collectives in the same order.
 not done yet: dedicated comm stream, flat per-unit buffers.
 """
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 import torch
@@ -98,6 +98,7 @@ class _ParamState:
     full_shape: tuple[int, ...]     # the param's true unsharded shape
     valid: int                      # rows of `sharded` this rank owns; the rest is padding
     placements: Placements          # layout over (dp_replicate, dp_shard)
+    replicate_dim: str | None = None  # mesh axis its replicas (hsdp) are averaged over
     sharded_grad: torch.Tensor | None = None
 
 
@@ -128,7 +129,9 @@ class FSDP:
     (execution order is recorded on the first forward); params outside them
     form the root unit. units must not nest or share a param.
     `replicate_dim` adds hsdp: reduce-scatter on shard_dim, then all-reduce on
-    replicate_dim. `param_dtype` is the gathered/compute dtype (None = no
+    replicate_dim. `replicate_dim_of(param)` overrides that axis for
+    individual params (expert parallel: expert weights have replicas along
+    fewer ranks than the dense ones; None = no replicas). `param_dtype` is the gathered/compute dtype (None = no
     cast); `reduce_dtype` is the grad reduction dtype (None = grad's dtype).
 
     a `model` built on the meta device is materialized sharded on `device`,
@@ -148,8 +151,10 @@ class FSDP:
         reduce_dtype: torch.dtype | None = torch.float32,
         prefetch: int = 1,
         device: torch.device | None = None,
+        replicate_dim_of: Callable[[nn.Parameter], str | None] | None = None,
     ):
         self.model = model
+        self._replicate_dim_of_param = replicate_dim_of
         self.mesh = mesh
         self.shard_dim = shard_dim
         self.replicate_dim = replicate_dim
@@ -205,10 +210,21 @@ class FSDP:
         keeps its own slice, which is only one model if they all started from
         the same one.
         """
-        for tensor in [*model.parameters(), *model.buffers()]:
-            broadcast(tensor.detach(), self.mesh, self.shard_dim, src=0)
+        for param in model.parameters():
+            broadcast(param.detach(), self.mesh, self.shard_dim, src=0)
+            if self._replicate_dim(param) is not None:
+                broadcast(param.detach(), self.mesh, self._replicate_dim(param), src=0)
+        for buf in model.buffers():
+            broadcast(buf, self.mesh, self.shard_dim, src=0)
             if self.replicate_size > 1:
-                broadcast(tensor.detach(), self.mesh, self.replicate_dim, src=0)
+                broadcast(buf, self.mesh, self.replicate_dim, src=0)
+
+    def _replicate_dim(self, param: nn.Parameter) -> str | None:
+        """the mesh axis `param` has whole replicas along, if any."""
+        dim = self.replicate_dim
+        if self._replicate_dim_of_param is not None:
+            dim = self._replicate_dim_of_param(param)
+        return dim if dim is not None and self.mesh.size(dim) > 1 else None
 
     def _materialize(self, model: nn.Module, device: torch.device) -> None:
         """
@@ -240,8 +256,8 @@ class FSDP:
             return
         for st in self._states:
             st.sharded[st.valid:].zero_()
-            if self.replicate_size > 1:
-                broadcast(st.sharded, self.mesh, self.replicate_dim, src=0)
+            if st.replicate_dim is not None:
+                broadcast(st.sharded, self.mesh, st.replicate_dim, src=0)
         for buf in self.model.buffers():
             broadcast(buf, self.mesh, self.shard_dim, src=0)
             if self.replicate_size > 1:
@@ -322,11 +338,13 @@ class FSDP:
         full = unsharded.narrow(0, 0, full_shape[0])
         _free_storage(unsharded)
 
+        replicate_dim = self._replicate_dim(param)
         placements: Placements = (
-            (Replicate(), placement) if self.replicate_size > 1 else (placement,)
+            (Replicate(), placement) if replicate_dim is not None else (placement,)
         )
         return _ParamState(
-            name, param, sharded, unsharded, full, full_shape, valid, placements
+            name, param, sharded, unsharded, full, full_shape, valid, placements,
+            replicate_dim,
         )
 
     def _register_hooks(self) -> None:
@@ -545,8 +563,10 @@ class FSDP:
         while self._pending:
             p = self._pending.pop(0)
             p.work.wait()
-            if self.replicate_size > 1:
-                _, work = all_reduce(p.out, self.mesh, self.replicate_dim, "avg", async_op=True)
+            if p.state.replicate_dim is not None:
+                _, work = all_reduce(
+                    p.out, self.mesh, p.state.replicate_dim, "avg", async_op=True
+                )
                 self._all_reducing.append(_PendingReduce(p.state, p.out, work, p.out))
             else:
                 self._accumulate(p.state, p.out)
@@ -602,6 +622,19 @@ class FSDP:
         """`param`'s true unsharded shape (its local shard may be padded)."""
         entry = self._by_param.get(id(param))
         return tuple(param.shape) if entry is None else entry[1].full_shape
+
+    def reshard(self) -> None:
+        """
+        point every param back at its shard and free the gathered buffers.
+        only needed after a forward with NO backward (eval, generation): the
+        root unit stays gathered until a backward, and a checkpoint needs
+        every param sharded. a training step never has to call this.
+        """
+        assert not self._open and not self._fired, "reshard() in the middle of a backward"
+        for unit in self._units:
+            if unit.status == _GATHERING:
+                self._wait_gather(unit)
+            self._reshard(unit)
 
     def sync(self) -> None:
         """

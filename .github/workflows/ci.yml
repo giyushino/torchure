@@ -63,5 +63,7 @@ jobs:
         run: uv run --no-sync tests/tensor_parallel.py
       - name: grad sync with missing grads, ddp + fsdp (gloo, 4 ranks)
         run: uv run --no-sync tests/missing_grads.py --world-size 4
+      - name: expert parallel: dispatch, grads, meta build, checkpoint (gloo, up to 8 ranks)
+        run: uv run --no-sync tests/expert_parallel.py
       - name: model contracts (olmo3, kimi k3.1)
         run: uv run --no-sync tests/models.py

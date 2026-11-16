@@ -17,11 +17,17 @@ lockstep by averaging grads across the axis after every backward.
   launches what is left with zeros for the missing grads. ranks may differ in
   which grads are missing: the fixed order keeps their collectives paired.
 
+- `dim_of(param)` overrides the axis for individual params: expert parallel's
+  expert weights are replicated over fewer ranks than the rest of the model.
+  None (or an axis of size 1) means the param has no replicas to sync with.
+
 one DDP instance per model: hooks are registered once and never removed.
 """
 
 import torch
 import torch.nn as nn
+
+from collections.abc import Callable
 
 from torchure.core.collective import MeshLike, all_reduce, broadcast
 
@@ -33,8 +39,9 @@ class _Bucket:
     lone param is reduced through its own `.grad`.
     """
 
-    def __init__(self, params: list[nn.Parameter]):
+    def __init__(self, params: list[nn.Parameter], dim: str):
         self.params = params
+        self.dim = dim              # the mesh axis these grads are averaged over
         self.pending = len(params)  # params still owing a grad this backward
         self.launched = False       # all-reduced already this step
         self.flat = None
@@ -50,24 +57,42 @@ class _Bucket:
 
 
 class DDP:
-    def __init__(self, model: nn.Module, mesh: MeshLike, dim="dp", bucket_mb=25):
+    def __init__(
+        self,
+        model: nn.Module,
+        mesh: MeshLike,
+        dim="dp",
+        bucket_mb=25,
+        dim_of: Callable[[nn.Parameter], str | None] | None = None,
+    ):
         self.mesh = mesh
         self.dim = dim
         self.group_size = mesh.size(dim)
+        self._dim_of_param = dim_of
         self._works = []
         self._next = 0  # index of the next bucket to launch this step
+        self._buckets: list[_Bucket] = []
         self.requires_sync = True
 
-        if self.group_size == 1:
-            return
-
         self._replicate(model)
-        params = [param for param in model.parameters() if param.requires_grad]
+        params = [
+            param for param in model.parameters()
+            if param.requires_grad and self._axis(param) is not None
+        ]
+        if not params:
+            return
         params.reverse()
         self._buckets = self._build_buckets(params, int(bucket_mb * 1024 * 1024))
         self._bucket_of = {p: b for b in self._buckets for p in b.params}
         for param in params:
             param.register_post_accumulate_grad_hook(self._on_grad_ready)
+
+    def _axis(self, param: nn.Parameter | None = None) -> str | None:
+        """the mesh axis `param` (default: any param) has replicas along, if any."""
+        dim = self.dim
+        if param is not None and self._dim_of_param is not None:
+            dim = self._dim_of_param(param)
+        return dim if dim is not None and self.mesh.size(dim) > 1 else None
 
     def _build_buckets(self, params: list[nn.Parameter], max_bucket_bytes: int) -> list[_Bucket]:
         """params should already be reversed."""
@@ -77,15 +102,19 @@ class DDP:
 
         for param in params:
             n_bytes = param.numel() * param.element_size()
-            if run and (run_bytes + n_bytes > max_bucket_bytes or param.dtype != run[0].dtype):
-                buckets.append(_Bucket(run))
+            if run and (
+                run_bytes + n_bytes > max_bucket_bytes
+                or param.dtype != run[0].dtype
+                or self._axis(param) != self._axis(run[0])
+            ):
+                buckets.append(_Bucket(run, self._axis(run[0])))
                 run = []
                 run_bytes = 0
             run.append(param)
             run_bytes += n_bytes
 
         if run:
-            buckets.append(_Bucket(run))
+            buckets.append(_Bucket(run, self._axis(run[0])))
         return buckets
 
     def _on_grad_ready(self, param: nn.Parameter) -> None:
@@ -120,7 +149,7 @@ class DDP:
             for param, view in zip(bucket.params, bucket.views, strict=True):
                 param.grad = view
             grad = bucket.flat
-        _, work = all_reduce(grad, self.mesh, self.dim, "avg", async_op=True)
+        _, work = all_reduce(grad, self.mesh, bucket.dim, "avg", async_op=True)
         self._works.append(work)
 
     @property
@@ -136,11 +165,15 @@ class DDP:
         return tuple(param.shape)
 
     def _replicate(self, model: nn.Module):
-        for tensor in [*model.parameters(), *model.buffers()]:
-            broadcast(tensor.detach(), self.mesh, self.dim, src=0)
+        for param in model.parameters():
+            if self._axis(param) is not None:
+                broadcast(param.detach(), self.mesh, self._axis(param), src=0)
+        if self._axis() is not None:
+            for buf in model.buffers():
+                broadcast(buf, self.mesh, self.dim, src=0)
 
     def sync(self) -> None:
-        if self.group_size == 1:
+        if not self._buckets:
             return
         assert self.requires_sync, (
             "sync() with requires_sync False: it must be True for the last "

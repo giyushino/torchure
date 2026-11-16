@@ -9,64 +9,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """[a, b, c, d, e, f, g, h] -> [-e, -f, -g, -h, a, b, c, d]"""
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    cos = cos.to(x.dtype)
-    sin = sin.to(x.dtype)
-    return (x * cos) + (rotate_half(x) * sin)
+from torchure.models.layers import (
+    RotaryEmbedding,
+    SwiGLU,
+    apply_rotary,
+    positions,
+    swiglu_ffn_dim,
+)
 
 
-class Qwen3RotaryEmbedding(nn.Module):
+class Qwen3RotaryEmbedding(RotaryEmbedding):
+    """plain rope at qwen3's base."""
+
     def __init__(self, head_dim: int, base: int = 1_000_000):
-        super().__init__()
-        assert head_dim % 2 == 0, "RoPE requires even head_dim"
-
-        self.head_dim = head_dim
-        self.base = base
-        self.register_buffer("inv_freq", torch.empty(head_dim // 2), False)
-
-        # cos/sin per (seq_len, device) for the packed, no-mask training path
-        self._cache: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
-        self.init_buffers()
-
-    @torch.no_grad()
-    def init_buffers(self) -> None:
-        """(re)compute inv_freq in place, e.g. after a meta-device build."""
-        exponent = torch.arange(0, self.head_dim, 2, device=self.inv_freq.device).float()
-        self.inv_freq.copy_(1.0 / (self.base ** (exponent / self.head_dim)))
-        self._cache.clear()
-
-    def _cos_sin(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # (B, S, 1) * (1, 1, D/2) -> (B, S, D/2)
-        freqs = position_ids.float()[:, :, None] * self.inv_freq[None, None, :]
-        emb = torch.cat([freqs, freqs], dim=-1)
-
-        # (B, 1, S, D), fp32; apply_rotary casts to the Q/K dtype
-        cos = emb.cos()[:, None, :, :]
-        sin = emb.sin()[:, None, :, :]
-
-        return cos, sin
-
-    def forward(
-        self, position_ids: torch.Tensor, cacheable: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # cacheable: position_ids is arange(seq_len) broadcast over the batch
-        if not cacheable:
-            return self._cos_sin(position_ids)
-
-        # cache a single row (1, 1, S, D) so it broadcasts over any batch size
-        key = (position_ids.shape[1], position_ids.device)
-        cached = self._cache.get(key)
-        if cached is None:
-            cached = self._cos_sin(position_ids[:1])
-            self._cache[key] = cached
-        return cached
+        super().__init__(head_dim, base)
 
 
 class Qwen3GroupQueryAttention(nn.Module):
@@ -143,17 +99,6 @@ class Qwen3GroupQueryAttention(nn.Module):
         return self.o_proj(self.combine_heads(attn_output))
 
 
-class SwiGLU(nn.Module):
-    def __init__(self, hidden_dim: int, ffn_dim: int):
-        super().__init__()
-        self.gate_proj = nn.Linear(hidden_dim, ffn_dim, bias=False)
-        self.up_proj = nn.Linear(hidden_dim, ffn_dim, bias=False)
-        self.down_proj = nn.Linear(ffn_dim, hidden_dim, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
 class Qwen3TransformerBlock(nn.Module):
     def __init__(
         self,
@@ -170,8 +115,7 @@ class Qwen3TransformerBlock(nn.Module):
         self.norm2 = nn.RMSNorm(emb_dim, eps=norm_eps)
 
         if ffn_dim is None:
-            # 8/3 * emb_dim rounded up to a multiple of 256
-            ffn_dim = 256 * ((int(8 * emb_dim / 3) + 255) // 256)
+            ffn_dim = swiglu_ffn_dim(emb_dim)
         self.ffn = SwiGLU(emb_dim, ffn_dim)
 
     def forward(
@@ -283,17 +227,7 @@ class Qwen3(nn.Module):
         return_hidden_states: bool = False,
         return_final_hidden: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        B, S = x.shape
-
-        # number only non-pad tokens so left padding works with rope
-        if attention_mask is None:
-            position_ids = torch.arange(S, device=x.device).unsqueeze(0).expand(B, -1)
-            cacheable = True
-        else:
-            attention_mask = attention_mask.bool()
-            position_ids = attention_mask.long().cumsum(dim=1) - 1
-            position_ids = position_ids.masked_fill(~attention_mask, 0)
-            cacheable = False
+        position_ids, attention_mask, cacheable = positions(x, attention_mask)
 
         x = self.token_emb(x)
         cos, sin = self.rope(position_ids, cacheable=cacheable)

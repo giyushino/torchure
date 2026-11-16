@@ -83,14 +83,14 @@ class ShardLayout:
         return _flat(self.coords, self.counts)
 
     @classmethod
-    def of(cls, model: nn.Module, parallel, mesh, tp=None) -> "ShardLayout":
+    def of(cls, model: nn.Module, parallel, mesh, tp=None, ep=None) -> "ShardLayout":
         """
         the layout `model` has on this rank under a data-parallel strategy
-        (DDP / FSDP) and, optionally, tensor parallel on top. both expose
-        `shard_dims`, `shard_dim_of` and `full_shape_of`. tp cuts first: fsdp
-        shards whatever tp left on the rank.
+        (DDP / FSDP) and, optionally, tensor and/or expert parallel on top.
+        all expose `shard_dims`, `shard_dim_of` and `full_shape_of`. tp and
+        ep cut first: fsdp shards whatever they left on the rank.
         """
-        sources = [s for s in (tp, parallel) if s is not None and s.shard_dims]
+        sources = [s for s in (tp, ep, parallel) if s is not None and s.shard_dims]
         if not sources:
             return cls()
         for source in sources:

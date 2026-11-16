@@ -16,6 +16,10 @@ import math
 
 import torch.distributed as dist
 
+# fixed, because order matters: the last axis gets stride 1 (its peers are
+# adjacent ranks), and flatten() needs its axes in spec order
+AXIS_ORDER = ("pp", "dp_replicate", "dp_shard", "cp", "tp", "ep")
+
 
 class Mesh:
     def __init__(self, spec: dict[str, int]):
@@ -107,3 +111,48 @@ class Mesh:
         if dim in self._flat_coords:
             return self._flat_coords[dim]
         return (dist.get_rank() // self.strides[dim]) % self.sizes[dim]
+
+
+def build_mesh(spec: dict[str, int]) -> Mesh:
+    """
+    the mesh a training run uses, from a config's mesh spec: axes put in
+    AXIS_ORDER, `dp: N` read as shorthand for `dp_shard: N`, and the derived
+    axes added:
+
+        dp      every rank that reads its own data: dp_replicate x dp_shard,
+                and x ep under expert parallel (ep ranks are data-parallel
+                for everything but the experts). the dataloader split, loss
+                averaging and dense grad sync all run over it.
+
+    and, only with ep > 1:
+
+        dp_expert         dp_replicate x dp_shard: the ranks holding a
+                          replica of the same experts
+        dp_replicate_ep   dp_replicate x ep: the ranks holding a whole
+                          replica of a dense fsdp shard
+    """
+    spec = dict(spec)
+    assert not ("dp" in spec and ("dp_replicate" in spec or "dp_shard" in spec)), (
+        f"mesh spec {spec}: `dp` is shorthand for `dp_shard`; don't mix it with the explicit axes"
+    )
+    if "dp" in spec:
+        spec["dp_shard"] = spec.pop("dp")
+    unknown = set(spec) - set(AXIS_ORDER)
+    assert not unknown, f"mesh spec has unknown axes {sorted(unknown)}; known: {AXIS_ORDER}"
+
+    ordered = {}
+    for axis in AXIS_ORDER:
+        size = spec.get(axis, 1)
+        # size-1 axes cost world_size new_group calls, so drop them, except
+        # the dp axes, which flatten() needs
+        if size > 1 or axis in ("dp_replicate", "dp_shard"):
+            ordered[axis] = size
+
+    mesh = Mesh(ordered)
+    if "ep" in ordered:
+        mesh.flatten(("dp_replicate", "dp_shard", "ep"), "dp")
+        mesh.flatten(("dp_replicate", "dp_shard"), "dp_expert")
+        mesh.flatten(("dp_replicate", "ep"), "dp_replicate_ep")
+    else:
+        mesh.flatten(("dp_replicate", "dp_shard"), "dp")
+    return mesh

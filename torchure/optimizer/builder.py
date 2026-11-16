@@ -1,6 +1,6 @@
 """
 registry + build helpers for optimizers and schedulers. weight decay applies
-only to the weights of linear, embedding and conv layers. biases, norm
+only to the weights of linear, embedding, conv and expert-bank layers. biases, norm
 weights and bare nn.Parameters (gates, learned queries, log-rates) are exempt,
 whatever their shape.
 """
@@ -8,10 +8,12 @@ whatever their shape.
 import torch.nn as nn
 import torch.optim as optim
 
+from torchure.models.moe import GroupedLinear
+
 from torchure.optimizer.scheduler import WarmupStableDecayScheduler, CosineAnnealingScheduler
 
 
-_DECAYED_MODULES = (nn.Linear, nn.Embedding, nn.Conv1d, nn.Conv2d, nn.Conv3d)
+_DECAYED_MODULES = (nn.Linear, nn.Embedding, nn.Conv1d, nn.Conv2d, nn.Conv3d, GroupedLinear)
 
 OPTIMIZER_REGISTRY = {
     "adamw": optim.AdamW,

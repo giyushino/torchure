@@ -128,7 +128,7 @@ def build_dataloader(
     packer = ListPacker(tokenizer, data_cfg["seq_len"], eos_id, pad_id)
     dataset = dataset.map(
         packer, batched=True,
-        batch_size=data_cfg.get("pack_batch", 1000),
+        batch_size=data_cfg["pack_batch"],
         remove_columns=dataset.column_names,
     )
 

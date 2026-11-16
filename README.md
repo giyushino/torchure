@@ -25,6 +25,21 @@ uv run torchrun --nproc-per-node 8 -m torchure.train.train \
     --config configs/qwen3_dense_climbmix_ddp.json --steps 20
 ```
 
+## configs
+
+a config is checked against a schema (`torchure/config.py`) before anything
+is built: an unknown key is an error, optional keys get their defaults there.
+`"base": "other.json"` starts from another config and overrides it, so most
+files in `configs/` only state what differs from `qwen3_dense_climbmix.json`.
+
+`mesh` picks the layout: `dp_replicate`, `dp_shard` (`dp` for short), `tp`,
+`ep`. `ep` is expert parallel for moe models (`kimi_k31`): each ep rank
+holds a slice of every layer's experts and reads its own data, and tokens
+travel to the experts. see `configs/kimi_k31_4b_climbmix_fsdp_ep.json`.
+
+`torchure.inference.export` turns any checkpoint, however it was sharded,
+into one plain state_dict file.
+
 ## performance
 
 all numbers are bf16, seq_len 4096, global tokens/sec.

@@ -1,0 +1,12 @@
+{
+  "base": "kimi_k31_4b_climbmix.json",
+  "mesh": {
+    "dp_shard": 2,
+    "ep": 2
+  },
+  "parallelism": "fsdp",
+  "data": {
+    "global_batch_size": 8
+  },
+  "run_name": "kimi_k31_4b_climbmix_fsdp_ep_test"
+}
