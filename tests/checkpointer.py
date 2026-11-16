@@ -267,6 +267,54 @@ def check_async(tmp: str) -> None:
     assert ckpt.latest() == 3
 
 
+def check_prune(tmp: str) -> None:
+    """prune keeps the newest N complete steps, incomplete dirs and `keep`."""
+    path = os.path.join(tmp, "prune_run")
+    model, _, _, _ = build_state(seed=0)
+    r0 = Checkpointer(path, rank=0, world_size=2)
+    r1 = Checkpointer(path, rank=1, world_size=2)
+    for step in (10, 20, 30, 40):
+        r0.save_model(model, step)
+        r0.commit(step)
+        if step != 20:  # rank 1 never finishes step 20
+            r1.commit(step)
+    assert sorted(r0._steps()) == [10, 30, 40]
+
+    # the step about to be written is never deleted, complete or not
+    assert r0.prune(2, keep=(10,)) == []
+    assert r0.prune(2) == [10]
+    left = sorted(os.listdir(path))
+    assert left == ["20", "30", "40"], f"incomplete step 20 must survive, got {left}"
+    assert r0.prune(2) == [] and r0.latest() == 40
+    assert r0.prune(1) == [30] and r0.latest() == 40
+
+
+def check_inference_load(tmp: str) -> None:
+    """the inference loader finds a run under checkpointing.dir and loads it."""
+    from torchure.inference import common
+
+    config = {"run_name": "infer_run", "checkpointing": {"dir": tmp}}
+    model = build_model(seed=0)
+    ckpt = Checkpointer(os.path.join(tmp, "infer_run"))
+    ckpt.save_model(model, 7)
+    ckpt.commit(7)
+
+    fresh = build_model(seed=1)
+    # stand in for the tokenizer download and the model registry
+    real = common.Tokenizer.from_pretrained, common.build_model
+    common.Tokenizer.from_pretrained = lambda name: None
+    common.build_model = lambda name, cfg: fresh
+    try:
+        config |= {"data": {"tokenizer": "x"}, "model": {"name": "x", "config": {}}}
+        loaded, _ = common.load_model_and_tokenizer(config, 7, "cpu")
+    finally:
+        common.Tokenizer.from_pretrained, common.build_model = real
+    for (name, p), (_, q) in zip(
+        model.named_parameters(), loaded.named_parameters(), strict=True
+    ):
+        assert torch.equal(p, q), f"{name} differs after the inference load"
+
+
 def main() -> None:
     tmp = tempfile.mkdtemp(prefix="torchure_ckpt_test_")
     try:
@@ -274,6 +322,8 @@ def main() -> None:
         check_completion_marker(tmp)
         check_per_rank_markers(tmp)
         check_async(tmp)
+        check_prune(tmp)
+        check_inference_load(tmp)
         print("all checkpointer checks passed")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

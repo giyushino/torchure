@@ -19,6 +19,18 @@ def get_project_dir() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def checkpoint_dir(config: dict) -> str:
+    """
+    where a run's checkpoints live: <checkpointing.dir>/<run_name>, with
+    `checkpointing.dir` defaulting to <repo>/checkpoints. multi-node runs
+    need it on a filesystem every node shares.
+    """
+    root = config.get("checkpointing", {}).get("dir") or os.path.join(
+        get_project_dir(), "checkpoints"
+    )
+    return os.path.join(os.path.expanduser(root), config["run_name"])
+
+
 def load_json(path: str) -> dict:
     with open(path) as f:
         return json.load(f)

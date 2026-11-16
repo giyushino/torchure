@@ -37,6 +37,15 @@ backward. the forward hooks stand down for that re-run (the backward-pre hook
 has already gathered the unit, and resharding there would free weights the
 backward is about to read).
 
+missing grads: a unit's grads are reduced once every one of its params has
+its grad. a param that gets none in a backward (an moe expert no token picked,
+a param the forward never used) would leave the unit waiting forever, so a
+unit left short is closed with zeros for the missing grads: a block unit
+when the backward moves on to another unit, the rest at the next forward or
+at sync(). ranks may differ in which grads are missing, so a late close
+lands exactly where an on-time one would have: every rank issues the same
+collectives in the same order.
+
 not done yet: dedicated comm stream, flat per-unit buffers.
 """
 
@@ -156,6 +165,7 @@ class FSDP:
         self._pending: list[_PendingReduce] = []        # reduce-scatters in flight
         self._all_reducing: list[_PendingReduce] = []   # hsdp all-reduces in flight
         self._fired: set[int] = set()                   # units done with the current backward
+        self._open: list[_Unit] = []                    # block units that began this backward
         self._backwards = 0                             # completed backwards since the last sync
         self._units: list[_Unit] = []
         self._states: list[_ParamState] = []
@@ -402,6 +412,9 @@ class FSDP:
                 # activation checkpointing re-running this forward inside its
                 # backward: already gathered, and nothing to prefetch
                 return
+            if unit.index == 0:
+                # a new forward: the previous backward (if any) is over
+                self._close_backward()
             if not self._order_checked:
                 self._exec_order.append(unit.index)
             self._wait_gather(unit)
@@ -424,7 +437,11 @@ class FSDP:
     def _make_backward_pre(self, unit: _Unit):
         @torch.compiler.disable
         def hook(module, grad_output):
+            # backward runs one unit at a time, so any other unit still open
+            # has seen all the grads it will get
+            self._close_open_units()
             unit.in_backward = True
+            self._open.append(unit)
             self._wait_gather(unit)
             for prv in self._neighbours(unit.index, forward=False):
                 self._start_gather(prv)
@@ -436,7 +453,9 @@ class FSDP:
         def hook(param):
             unit.pending -= 1
             if unit.pending == 0:
-                unit.pending = len(unit.params)
+                if unit.index == 0:
+                    # the root goes last; close blocks still open before it
+                    self._close_open_units()
                 self._post_backward(unit)
 
         return hook
@@ -460,7 +479,29 @@ class FSDP:
 
     # ---- grad reduction --------------------------------------------------
 
+    def _close_open_units(self) -> None:
+        """
+        reduce the block units whose backward has ended short of a grad for
+        every param, in the order they began it.
+        """
+        for unit in self._open:
+            if unit.in_backward:
+                self._post_backward(unit)
+        self._open.clear()
+
+    def _close_backward(self) -> None:
+        """
+        the backward (if one ran) is over: close every unit it left short,
+        blocks first and the root last, where a full backward puts them.
+        """
+        self._close_open_units()
+        root = self._units[0]
+        started = bool(self._fired) or root.pending != len(root.params)
+        if started and root.index not in self._fired:
+            self._post_backward(root)
+
     def _post_backward(self, unit: _Unit) -> None:
+        unit.pending = len(unit.params)
         # drain the PREVIOUS unit's reduce-scatters first: they had this
         # unit's whole backward to complete, so the wait is usually free, and
         # it bounds in-flight unsharded grads to one unit's worth
@@ -468,9 +509,12 @@ class FSDP:
 
         for st in unit.params:
             grad = st.param.grad
-            assert grad is not None, (
-                f"param {st.name!r} fired its post-accumulate hook with no grad"
-            )
+            if grad is None:
+                # no grad this backward: this rank contributes zeros
+                grad = torch.zeros(
+                    st.full_shape, dtype=self.reduce_dtype or st.full.dtype,
+                    device=st.sharded.device,
+                )
             st.param.grad = None
             if self.reduce_dtype is not None and grad.dtype != self.reduce_dtype:
                 grad = grad.to(self.reduce_dtype)
@@ -569,11 +613,11 @@ class FSDP:
         """
         if self.group_size == 1:
             return
+        self._close_backward()
         self._drain(final=True)
         assert not self._fired, (
-            f"units {sorted(self._fired)} of {len(self._units)} finished their "
-            "backward -- some unit never completed. a frozen or unused param "
-            "leaves its unit's counter permanently short"
+            f"only units {sorted(self._fired)} of {len(self._units)} took part "
+            "in the backward: some unit's output got no grad at all"
         )
         assert self._backwards > 0, (
             "sync() with no completed backward since the last sync()"

@@ -28,7 +28,7 @@ from torchure.optimizer.builder import build_optimizer, build_scheduler
 from torchure.parallelism.data_parallel import DDP
 from torchure.parallelism.fsdp2 import FSDP
 from torchure.parallelism.tensor_parallel import TP
-from torchure.utils import debug_time, get_project_dir, load_json
+from torchure.utils import checkpoint_dir, debug_time, load_json
 
 try:
     import wandb
@@ -41,8 +41,6 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
-
-PROJECT_DIR = get_project_dir()
 
 # config strings -> dtypes for fsdp's mixed precision. None means "no cast":
 # gathered params keep the fp32 master dtype (what an fp32 debug run wants)
@@ -130,7 +128,7 @@ class Trainer:
         # datetime.now()). only the wandb display name gets the timestamp.
         time_launched = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.run_name = f"{self.config['run_name']}_{time_launched}"
-        self.checkpointer_path = f"{PROJECT_DIR}/checkpoints/{self.config['run_name']}"
+        self.checkpointer_path = checkpoint_dir(self.config)
         self.checkpointer = Checkpointer(
             self.checkpointer_path,
             rank=rank,
@@ -140,6 +138,11 @@ class Trainer:
         )
         self.resume = self.config["checkpointing"]["resume"]
         self.save_steps = self.config["checkpointing"]["save_steps"]
+        # complete checkpoints to keep besides the one being written; null keeps all
+        self.keep_last_n = self.config["checkpointing"].get("keep_last_n")
+        assert self.keep_last_n is None or self.keep_last_n >= 1, (
+            f"checkpointing.keep_last_n={self.keep_last_n}: expected null or >= 1"
+        )
         # logging is the only host sync in the step loop
         self.log_every = self.config.get("log_every", 10)
         # false for "continue" runs that change the schedule: loading the old
@@ -161,7 +164,8 @@ class Trainer:
         # torn down explicitly on every exit path or the process hangs at exit
         atexit.register(shutdown_workers, dataloader_iter)
         self.prefetcher = CUDAPrefetcher(
-            dataloader_iter, self.device, first_batch=self._resumed_batch
+            dataloader_iter, self.device, first_batch=self._resumed_batch,
+            restart=self._next_data_pass,
         )
 
         # set by the SIGTERM handler train() installs; see _stop_requested
@@ -361,6 +365,24 @@ class Trainer:
             shield_sigterm=True,
         )
 
+    def _next_data_pass(self):
+        """
+        this rank's shards ran out: start the next pass over them. the hf
+        dataset reshuffles per epoch (shard order and shuffle buffer), and
+        its epoch counter is part of the dataloader state, so a resume lands
+        in the same pass.
+        """
+        dataset = self.dataloader.dataset
+        epoch = dataset.epoch + 1
+        dataset.set_epoch(epoch)
+        print(f"[dp {self.mesh.coordinate('dp')}] data exhausted, starting pass {epoch}")
+        loader_iter = iter(self.dataloader)
+        # persistent workers hand back the same iterator, already registered;
+        # a new one needs its own teardown
+        if loader_iter is not self.prefetcher.loader_iter:
+            atexit.register(shutdown_workers, loader_iter)
+        return loader_iter
+
     def _build_mesh(self) -> Mesh:
         """
         canonicalize the config's mesh spec (into MESH_AXIS_ORDER) and add the
@@ -419,6 +441,10 @@ class Trainer:
         # one rank per shard writes model/optimizer state, rank 0 the rest;
         # every rank writes its own dataloader and rng state. no barrier: each
         # rank commits its own marker and the step is complete when all have
+        if self.rank == 0 and self.keep_last_n is not None:
+            # before the save, and never the newest complete ones: a save
+            # that dies halfway still leaves keep_last_n to resume from
+            self.checkpointer.prune(self.keep_last_n, keep=(step,))
         if self._writes_model_state():
             layout = self._shard_layout()
             self.checkpointer.save_model(self.model, step, layout)
@@ -444,8 +470,11 @@ class Trainer:
                 dp_rank,
             )
             self.checkpointer.save_dataloader(self.dataloader, step, dp_rank)
-            # the loader is one batch ahead of training; that batch is saved here
-            self.checkpointer.save_prefetcher(self.prefetcher.state_dict(), step, dp_rank)
+            # the loader is one batch ahead of training; that batch is saved
+            # here, with the data pass the loader is on (see _next_data_pass)
+            held = self.prefetcher.state_dict()
+            held["epoch"] = self.dataloader.dataset.epoch
+            self.checkpointer.save_prefetcher(held, step, dp_rank)
         self.checkpointer.commit(step)
 
     def _on_sigterm(self, signum, frame) -> None:
@@ -523,11 +552,14 @@ class Trainer:
 
         dp_rank = self.mesh.coordinate("dp")
         if self.resume_dataloader:
-            self.checkpointer.load_dataloader(self.dataloader, step, dp_rank)
             # older checkpoints have none: they resume one batch ahead
             held = self.checkpointer.load_prefetcher(step, dp_rank)
             if held is not None:
                 self._resumed_batch = held["next_batch"]
+                # the dataset only applies saved state to the pass it was
+                # saved in, and doesn't restore the pass number itself
+                self.dataloader.dataset.set_epoch(held.get("epoch", 0))
+            self.checkpointer.load_dataloader(self.dataloader, step, dp_rank)
         # each dp rank resumes its own stream. older checkpoints carry only
         # rank 0's, in trainer.pt. a rank with neither (resume onto a larger
         # mesh) keeps the seed-derived stream it already has.

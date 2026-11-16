@@ -64,6 +64,27 @@ def shutdown_workers(loader_iter) -> None:
             worker.kill()
 
 
+def _check_shards(num_shards: int, dp_size: int, num_workers: int) -> None:
+    """
+    warn about shard counts that quietly cost throughput. split_dataset_by_node
+    hands each rank whole shards only when the rank count divides the shard
+    count; otherwise EVERY rank streams the whole dataset and keeps one
+    example in dp_size. and a rank with fewer shards than workers leaves the
+    extra workers idle.
+    """
+    if num_shards % dp_size != 0:
+        print(
+            f"WARNING: {num_shards} dataset shards don't divide over dp={dp_size} ranks. "
+            f"every rank will read and tokenize the whole stream and drop "
+            f"{dp_size - 1}/{dp_size} of it. use a shard count that is a multiple of {dp_size}"
+        )
+    elif num_workers > num_shards // dp_size:
+        print(
+            f"WARNING: each rank gets {num_shards // dp_size} shard(s) but has "
+            f"{num_workers} dataloader workers; the extra workers will sit idle"
+        )
+
+
 def build_dataloader(
     data_cfg, tokenizer: Tokenizer, ignore_id: int, dp_rank: int, dp_size: int,
     shield_sigterm: bool = False,
@@ -87,6 +108,7 @@ def build_dataloader(
     )
     if dp_rank == 0:
         print(f"num shards: {dataset.num_shards}")
+        _check_shards(dataset.num_shards, dp_size, data_cfg["num_workers"])
 
     # rename_column rather than a lambda .map, since lambdas don't pickle to workers
     text_field = data_cfg["text_field"]

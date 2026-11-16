@@ -1,9 +1,13 @@
 import torch.nn as nn
 
+from torchure.models.kimi_k31.kimi_k31 import KimiK31
+from torchure.models.olmo3.olmo3 import Olmo3
 from torchure.models.qwen3.qwen3 import Qwen3
 
 MODEL_REGISTRY = {
     "qwen3_dense": Qwen3,
+    "olmo3": Olmo3,
+    "kimi_k31": KimiK31,
     "llama3_2": None,
 }
 

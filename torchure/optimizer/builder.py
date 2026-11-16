@@ -1,6 +1,8 @@
 """
 registry + build helpers for optimizers and schedulers. weight decay applies
-only to >=2D params; biases and norm weights are exempt.
+only to the weights of linear, embedding and conv layers. biases, norm
+weights and bare nn.Parameters (gates, learned queries, log-rates) are exempt,
+whatever their shape.
 """
 
 import torch.nn as nn
@@ -8,6 +10,8 @@ import torch.optim as optim
 
 from torchure.optimizer.scheduler import WarmupStableDecayScheduler, CosineAnnealingScheduler
 
+
+_DECAYED_MODULES = (nn.Linear, nn.Embedding, nn.Conv1d, nn.Conv2d, nn.Conv3d)
 
 OPTIMIZER_REGISTRY = {
     "adamw": optim.AdamW,
@@ -24,9 +28,16 @@ def build_optimizer(model: nn.Module, optim_name: str, optim_config: dict) -> op
     cfg = dict(optim_config)
     weight_decay = cfg.pop("weight_decay", 0.0)
 
+    # by module type, not p.dim(): a 2-D bare parameter (a per-head gate
+    # rate, say) is not a matrix to regularize
+    decayed = {
+        id(module.weight)
+        for module in model.modules()
+        if isinstance(module, _DECAYED_MODULES) and module.weight is not None
+    }
     params = [p for p in model.parameters() if p.requires_grad]
-    decay_params = [p for p in params if p.dim() >= 2]
-    nodecay_params = [p for p in params if p.dim() < 2]
+    decay_params = [p for p in params if id(p) in decayed]
+    nodecay_params = [p for p in params if id(p) not in decayed]
     param_groups = [
         {"params": decay_params, "weight_decay": weight_decay},
         {"params": nodecay_params, "weight_decay": 0.0},

@@ -218,6 +218,8 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Custom project ignores
+wandb/
+checkpoints/
 *.pyc
 *.pt
 # profiler chrome traces -- ~11MB each, regenerate with

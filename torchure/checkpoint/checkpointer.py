@@ -31,6 +31,8 @@ completion: `commit(step)` writes this rank's `.done{rank}of{world}` marker
 after its last file. a step is complete once every rank's marker is there, so
 no collective fences the save (a legacy `.complete` file still counts).
 
+retention: `prune(keep_last_n)` deletes older complete checkpoints.
+
 async (`async_save=True`): save_* snapshot state to cpu and return; commit()
 hands the snapshot to a background thread that writes the files and then the
 marker, while training continues. at most one save is in flight: commit() and
@@ -43,6 +45,7 @@ import json
 import math
 import os
 import re
+import shutil
 import threading
 from dataclasses import dataclass, field
 
@@ -265,6 +268,20 @@ class Checkpointer:
             int(d) for d in os.listdir(self.checkpoint_save_path)
             if d.isdigit() and self.is_complete(int(d))
         ]
+
+    def prune(self, keep_last_n: int, keep: tuple[int, ...] = ()) -> list[int]:
+        """
+        delete all but the newest `keep_last_n` COMPLETE checkpoints, and
+        return the steps deleted. incomplete step dirs are left alone (one
+        may be another rank's save in flight), and so are the steps in
+        `keep`. call from one rank only.
+        """
+        assert keep_last_n >= 1, "prune would delete every checkpoint"
+        steps = sorted(self._steps())
+        doomed = [s for s in steps[:-keep_last_n] if s not in keep]
+        for step in doomed:
+            shutil.rmtree(self._step_dir(step))
+        return doomed
 
     def _step_dir(self, step: int, create: bool = False) -> str:
         step_dir = os.path.join(self.checkpoint_save_path, str(step))

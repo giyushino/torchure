@@ -11,6 +11,11 @@ lockstep by averaging grads across the axis after every backward.
 - `sync()` waits on all handles; call it between backward and optimizer.step.
 - `requires_sync` is the no_sync switch for grad accumulation: False for the
   first K-1 microbatches, True for the last.
+- buckets are all-reduced in bucket order, on every rank, whenever each
+  becomes ready. a param that got no grad this step (an moe expert no token
+  picked, a param the forward never used) leaves its bucket unready; `sync()`
+  launches what is left with zeros for the missing grads. ranks may differ in
+  which grads are missing: the fixed order keeps their collectives paired.
 
 one DDP instance per model: hooks are registered once and never removed.
 """
@@ -31,6 +36,7 @@ class _Bucket:
     def __init__(self, params: list[nn.Parameter]):
         self.params = params
         self.pending = len(params)  # params still owing a grad this backward
+        self.launched = False       # all-reduced already this step
         self.flat = None
         self.views = None
         if len(params) > 1:
@@ -49,6 +55,7 @@ class DDP:
         self.dim = dim
         self.group_size = mesh.size(dim)
         self._works = []
+        self._next = 0  # index of the next bucket to launch this step
         self.requires_sync = True
 
         if self.group_size == 1:
@@ -85,13 +92,27 @@ class DDP:
         if not self.requires_sync:
             return
 
-        bucket = self._bucket_of[param]
-        bucket.pending -= 1
-        if bucket.pending == 0:
+        self._bucket_of[param].pending -= 1
+        self._launch_ready()
+
+    def _launch_ready(self, force: bool = False) -> None:
+        """
+        launch buckets strictly in bucket order, stopping at the first one
+        still owed a grad. `force` (from sync) launches the rest regardless.
+        """
+        while self._next < len(self._buckets):
+            bucket = self._buckets[self._next]
+            if bucket.pending > 0 and not force:
+                return
             self._launch(bucket)
+            self._next += 1
 
     def _launch(self, bucket: _Bucket) -> None:
         bucket.pending = len(bucket.params)
+        # no grad this step: this rank contributes zeros to the average
+        for param in bucket.params:
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
         if bucket.flat is None:
             grad = bucket.params[0].grad
         else:
@@ -121,12 +142,13 @@ class DDP:
     def sync(self) -> None:
         if self.group_size == 1:
             return
-        assert len(self._works) == len(self._buckets), (
-            f"only {len(self._works)}/{len(self._buckets)} grad buckets launched -- "
-            "either a param got no grad this backward (frozen param), or "
-            "requires_sync was still False on the last microbatch of an "
-            "accumulation step (it must be True for exactly the last one)"
+        assert self.requires_sync, (
+            "sync() with requires_sync False: it must be True for the last "
+            "microbatch of an accumulation step, so its backward launches the reduces"
         )
+        # buckets still owed a grad (see the module docstring)
+        self._launch_ready(force=True)
         for work in self._works:
             work.wait()
         self._works.clear()
+        self._next = 0
