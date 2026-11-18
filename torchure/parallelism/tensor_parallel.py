@@ -334,8 +334,6 @@ class TP:
             elif self.sequence_parallel:
                 head.register_forward_pre_hook(self._head_pre)
 
-    # ---- construction ----------------------------------------------------
-
     def _shard(self, module: nn.Module, name: str, tensor_dim: int) -> None:
         """
         make `module.<name>` this rank's slice along `tensor_dim`: sliced out
@@ -402,8 +400,6 @@ class TP:
                 broadcast(param.data, self.mesh, self.dim, src=0)
         for buf in model.buffers():
             broadcast(buf, self.mesh, self.dim, src=0)
-
-    # ---- hooks -----------------------------------------------------------
 
     def _region_pre(self, module: nn.Module, args: tuple) -> tuple:
         return (_enter_region(args[0], self.mesh, self.dim, self._seq_dim), *args[1:])
@@ -483,8 +479,6 @@ class TP:
     def vocab_axis(self) -> tuple[MeshLike, str] | None:
         """(mesh, axis) the vocab is sharded over, or None if it isn't."""
         return (self.mesh, self.dim) if self.vocab_parallel else None
-
-    # ---- trainer surface -------------------------------------------------
 
     @property
     def shard_dims(self) -> tuple[str, ...]:

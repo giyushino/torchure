@@ -95,7 +95,11 @@ class DDP:
         return dim if dim is not None and self.mesh.size(dim) > 1 else None
 
     def _build_buckets(self, params: list[nn.Parameter], max_bucket_bytes: int) -> list[_Bucket]:
-        """params should already be reversed."""
+        """
+        greedy buckets of up to max_bucket_bytes, in the given order (reverse
+        parameter order, so roughly the order backward produces grads). a new
+        bucket also starts where dtype or reduce axis changes.
+        """
         buckets = []
         run = []
         run_bytes = 0
@@ -173,13 +177,13 @@ class DDP:
                 broadcast(buf, self.mesh, self.dim, src=0)
 
     def sync(self) -> None:
+        """launch any buckets still owed a grad, then wait for every reduce."""
         if not self._buckets:
             return
         assert self.requires_sync, (
             "sync() with requires_sync False: it must be True for the last "
             "microbatch of an accumulation step, so its backward launches the reduces"
         )
-        # buckets still owed a grad (see the module docstring)
         self._launch_ready(force=True)
         for work in self._works:
             work.wait()

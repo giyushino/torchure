@@ -242,8 +242,8 @@ class KimiDeltaAttention(nn.Module):
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # kda is nope and has no padding mask in the recurrent form; the
-        # trainer's packed path (attention_mask=None) is the supported one.
+        # kda uses no rope (cos / sin are ignored) and can't apply a padding
+        # mask, so only the packed path (attention_mask=None) is supported
         B, S, _ = x.shape
         H, D = self.num_heads, self.head_dim
 
@@ -393,7 +393,8 @@ class LatentMoE(nn.Module):
         self.latent_norm = nn.RMSNorm(latent_dim, eps=norm_eps)
         self.up_proj = nn.Linear(latent_dim, emb_dim, bias=False)
         self.router = nn.Linear(latent_dim, num_experts, bias=False)
-        # noaux_tc bias: moved by KimiK31.balance_step, not by gradient
+        # aux-loss-free balancing: added to the scores only to pick experts,
+        # and moved by KimiK31.balance_step, not by gradient
         self.register_buffer("router_bias", torch.zeros(num_experts))
         # tokens each expert got since the last balance_step
         self.register_buffer("load", torch.zeros(num_experts), persistent=False)
@@ -412,16 +413,15 @@ class LatentMoE(nn.Module):
         z = self.latent_norm(self.down_proj(x)).reshape(B * S, -1)
         probs = torch.sigmoid(self.router(z).float())
         _, indices = (probs + self.router_bias.float()).topk(self.experts_per_token, dim=-1)
-        # renormalise the *sigmoid* weights of the picked experts (the bias
-        # only steers the choice, as in noaux_tc)
+        # mixing weights come from the unbiased scores of the picked experts
         picked = probs.gather(-1, indices)
         weights = picked / picked.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
         # the (token, expert) pairs, grouped by expert
         token, slot, counts = sort_by_expert(indices, self.num_experts)
         if torch.is_grad_enabled():
-            # only passes that train: not eval, and not the no-grad first
-            # pass of an activation-checkpointed block (its re-run counts)
+            # count only training passes: not eval, and not the no-grad first
+            # forward of a checkpointed block (its re-run in backward counts)
             self.load += counts
         routed = self.experts(z[token], counts)                    # (N * k, latent)
         routed = routed * weights[token, slot].unsqueeze(-1).to(routed.dtype)
@@ -526,7 +526,7 @@ class KimiK31(nn.Module):
         self.use_attn_res = attn_res
         self.attn_res_block_size = attn_res_block_size
         self.token_emb = nn.Embedding(vocab_size, emb_dim)
-        # plain rope, on the mla rope dims only (kda is nope)
+        # plain rope, for the mla rope dims only (kda has no positions)
         self.rope = RotaryEmbedding(qk_rope_dim, base=rope_base)
 
         blocks = []

@@ -72,8 +72,6 @@ def build_bestfit_packers(seq_len: int = SEQ_LEN, eos_id: int = EOS_ID, pad_id: 
     return {name: cls(None, seq_len, eos_id, pad_id) for name, cls in BESTFIT_PACKERS.items()}
 
 
-# ---------------------------------------------------------------- correctness
-
 def _check_correctness(n_docs: int = 500) -> None:
     docs = make_corpus(n_docs=n_docs)
     packers = build_packers()
@@ -144,8 +142,6 @@ def test_empty_input():
     for name, p in build_packers().items():
         assert p.pack([]) == [], f"{name} mishandles empty input"
 
-
-# ------------------------------------------------------------------ benchmark
 
 @dataclass
 class BenchResult:

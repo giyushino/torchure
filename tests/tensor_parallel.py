@@ -342,7 +342,7 @@ def check_training_and_checkpoint(mesh: Mesh, sc: Scenario, checks: Checks, tmp:
             f"trained {name}", p.data, local(p_ref.data, tp, par, p, mesh), rtol=1e-3, atol=1e-3
         )
 
-    # ---- checkpoint: one file per shard cell, written by one rank each
+    # checkpoint: one file per shard cell, written by one rank each
     rank = dist.get_rank()
     ckpt = Checkpointer(os.path.join(tmp, "run"))
     layout = ShardLayout.of(model, par, mesh, tp=tp)

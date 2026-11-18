@@ -44,8 +44,8 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
-# config strings -> dtypes for fsdp's mixed precision. None means "no cast":
-# gathered params keep the fp32 master dtype (what an fp32 debug run wants)
+# fsdp mixed-precision dtypes by config name. None: no cast, gathered params
+# stay fp32 (for debugging numerics)
 _DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
@@ -82,8 +82,7 @@ class Trainer:
 
         # "ddp" | "fsdp"
         self.parallelism = self.config["parallelism"]
-        # set by _build_model: the data-parallel strategy (DDP | FSDP) and the
-        # tensor-parallel / expert-parallel ones, if any
+        # set by _build_model; tp / ep stay None when their axis is absent
         self.parallel: DDP | FSDP
         self.tp: TP | None = None
         self.ep: EP | None = None
@@ -93,9 +92,9 @@ class Trainer:
 
         self.model = self._build_model()
         self.model.activation_checkpointing = self.config["activation_checkpointing"]
-        # init ran on the shared seed so every rank built the same model; from
-        # here each dp rank draws its own stream (dropout, diffusion masks).
-        # tp/cp peers share a dp coordinate, so they stay in lockstep.
+        # from here on each data rank has its own random stream (dropout,
+        # masking). tp peers share a dp coordinate, hence a stream: they must
+        # compute identical activations.
         torch.manual_seed(self.seed + 1 + self.mesh.coordinate("dp"))
         self._compile(self.model)
 
@@ -113,8 +112,7 @@ class Trainer:
         self.global_batch_size = self.config["data"]["global_batch_size"]
         self.micro_batch_size = self.config["data"]["micro_batch_size"]
 
-        # depends only on config + mesh, so every rank runs the same number of
-        # microbatches and the collectives stay in lockstep
+        # same on every rank, so every rank issues the same collectives
         seqs_per_backward = self.micro_batch_size * self.dp_size
         assert self.global_batch_size % seqs_per_backward == 0, (
             f"global_batch_size {self.global_batch_size} must be divisible by "
@@ -123,9 +121,8 @@ class Trainer:
         )
         self.microbatches_per_step = self.global_batch_size // seqs_per_backward
 
-        # checkpoint dir is deliberately NOT timestamped: a relaunch must land in
-        # the same dir for resume="auto" to find it (and ranks would disagree on
-        # datetime.now()). only the wandb display name gets the timestamp.
+        # only the wandb name is timestamped: the checkpoint dir must be the
+        # same on every rank and every relaunch, or resume="auto" can't find it
         time_launched = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.run_name = f"{self.config['run_name']}_{time_launched}"
         self.checkpointer_path = checkpoint_dir(self.config)
@@ -138,19 +135,19 @@ class Trainer:
         )
         self.resume = self.config["checkpointing"]["resume"]
         self.save_steps = self.config["checkpointing"]["save_steps"]
-        # complete checkpoints to keep besides the one being written; null keeps all
+        # complete checkpoints to keep besides the one being written; None = all
         self.keep_last_n = self.config["checkpointing"]["keep_last_n"]
-        # logging is the only host sync in the step loop, besides the check
-        # for a SIGTERM (see _run_steps), which defaults to the same steps
+        # the step loop syncs with the host only at log points and SIGTERM
+        # checks; the checks default to the log points
         self.log_every = self.config["log_every"]
         self.stop_check_every = (
             self.config["checkpointing"]["stop_check_every"] or self.log_every
         )
-        # false for "continue" runs that change the schedule: loading the old
-        # scheduler state would overwrite total_steps/warmup/decay with the old values
+        # false to resume under a new schedule: the saved scheduler state would
+        # bring back the old total_steps / warmup / decay
         self.resume_scheduler = self.config["checkpointing"]["resume_scheduler"]
-        # restoring stream position replays everything consumed in each worker's
-        # current shard, which can be slow. false skips that and reshuffles instead.
+        # restoring the stream position replays each worker's current shard up
+        # to where it was, which can be slow; false reshuffles instead
         self.resume_dataloader = self.config["checkpointing"]["resume_dataloader"]
         # set by _resume so wandb reattaches to the existing run
         self.resume_wandb_id: str | None = None
@@ -217,8 +214,8 @@ class Trainer:
 
     def _build_model(self) -> nn.Module:
         """
-        build, initialize and parallelize the model; sets self.parallel and
-        self.tp.
+        build, initialize and parallelize the model; sets self.parallel,
+        self.tp and self.ep.
 
         plain ddp: build -> init -> replicate. anything sharded (fsdp, tp,
         ep): build on the meta device (shapes only) -> shard -> init the
@@ -248,11 +245,10 @@ class Trainer:
 
     def _parallelize(self, model: nn.Module) -> None:
         """
-        attach the data-parallel strategy as `self.parallel`. the trainer only
-        uses `requires_sync`, `sync()`, and `shard_dims`, so train_step never
-        branches on the strategy.
+        attach DDP or FSDP as `self.parallel`. both expose `requires_sync`,
+        `sync()` and `shard_dims`, so train_step doesn't branch on which.
 
-        runs before _compile so the grad hooks stay outside the compiled regions.
+        runs before _compile, so the grad hooks stay outside compiled code.
         """
         if self.parallelism == "ddp":
             self.parallel = DDP(
@@ -260,20 +256,20 @@ class Trainer:
                 self.mesh,
                 dim="dp",
                 bucket_mb=self.config["ddp"]["bucket_mb"],
-                # under ep, `dp` includes the ep axis, and an expert has
-                # replicas only along the dp axes proper
+                # under ep, `dp` includes ep; expert weights average over
+                # dp_expert instead (see _expert_axis)
                 dim_of=self._expert_axis("dp", "dp_expert"),
             )
         elif self.parallelism == "fsdp":
-            # FSDP at dp_shard=1 is a full no-op, so it would silently skip
-            # the dp_replicate grad sync too. pure replication is ddp's job.
+            # at dp_shard=1 fsdp does nothing, including the dp_replicate
+            # sync; pure replication is ddp's job
             assert self.mesh.size("dp_shard") > 1, (
                 f"parallelism 'fsdp' needs dp_shard > 1 (mesh {self.config['mesh']}); "
                 "use parallelism 'ddp' for pure replication"
             )
             fsdp_cfg = self.config["fsdp"]
-            # whole replicas of a shard: along dp_replicate, and for dense
-            # params along ep as well (ep ranks are data-parallel for them)
+            # the axis holding copies of the same shard: dp_replicate, plus ep
+            # for dense params (ep ranks each hold a full copy of those)
             replicate_dim = "dp_replicate_ep" if self.ep is not None else "dp_replicate"
             self.parallel = FSDP(
                 model,
@@ -296,9 +292,10 @@ class Trainer:
 
     def _expert_axis(self, dense: str, expert: str):
         """
-        param -> the mesh axis its replicas lie along, for ddp / fsdp: `expert`
-        for an expert-parallel weight, `dense` for everything else. None
-        without ep (one axis for every param).
+        a `param -> axis` function telling ddp / fsdp which axis to average
+        each grad over. an expert weight lives on one ep rank, so it averages
+        over `expert` (the dp axes without ep); everything else over `dense`.
+        None without ep: every param uses the same axis.
         """
         if self.ep is None:
             return None
@@ -324,24 +321,20 @@ class Trainer:
         which modules split which way. the model is still on meta here, so
         this only rewrites shapes.
 
-        config `tp`: `vocab_parallel` (default true) shards the embedding /
-        lm_head weight by vocab rows; `sequence_parallel` (default true)
-        shards the activations between tp regions along the sequence (or the
-        batch, `sp_dim: "batch"`); `overlap` ("none" | "backward" |
-        "collective_matmul", see parallelism/tp_overlap.py) hides the sp
-        collectives behind the region's matmuls.
+        config `tp`: `vocab_parallel` shards the embedding / lm_head by vocab
+        rows; `sequence_parallel` shards activations between tp regions along
+        `sp_dim`; `overlap` hides the sp collectives behind matmuls
+        (parallelism/tp_overlap.py).
         """
         if self.tp_size == 1:
             return None
         tp_cfg = self.config["tp"]
         sequence_parallel = tp_cfg["sequence_parallel"]
         plan = model.tp_plan(self.tp_size, vocab_parallel=tp_cfg["vocab_parallel"])
-        # a model with no tp regions (kimi: vocab only) has nothing for
-        # sequence parallel to shard between
+        # no regions (kimi shards only the vocab): nothing for sp to shard between
         sequence_parallel = sequence_parallel and bool(plan["regions"])
-        # the dim sp shards activations along between regions: "seq" (1) or
-        # "batch" (0). batch keeps each rank's chunk contiguous, so gathers and
-        # scatters need no layout copies; it needs micro_batch % tp == 0
+        # "batch" keeps each rank's chunk contiguous (no copies around the
+        # collectives) but needs micro_batch_size % tp == 0
         sp_dim = tp_cfg["sp_dim"]
         return TP(
             self.mesh, **plan, dim="tp", sequence_parallel=sequence_parallel,
@@ -351,25 +344,25 @@ class Trainer:
 
     def _compile(self, model: nn.Module) -> None:
         """
-        compile per transformer block: one graph reused across identical blocks,
-        matching fsdp's per-block granularity.
+        compile each block's forward: identical blocks share one graph, and
+        the boundaries match fsdp's units.
         """
         if not self.config["compile"]:
             return
         mode = self.config["compile_mode"]
-        # compile `forward`, not the module: module.compile() would also trace
-        # the module hooks (fsdp's gathers), which must stay eager
+        # `forward`, not the module: module.compile() would also trace fsdp's
+        # hooks, which must stay eager
         for block in model.blocks:
             block.forward = torch.compile(block.forward, mode=mode)
-        # gives the final norm a fused kernel for bf16 input x fp32 weight
+        # a fused kernel for the norm's bf16 input x fp32 weight
         model.norm.compile(mode=mode)
 
     def _init_shards(self, model: nn.Module) -> None:
         """
-        init a model materialized from meta: each rank fills only its own
-        shards. seeded per (dp_shard, tp, ep) cell, so shards differ from
-        each other; the finish_init calls then make everything that is
-        replicated (hsdp replicas, params tp / ep don't cut, buffers) agree.
+        init a model materialized from meta. each rank fills its own shards
+        on a seed per (dp_shard, tp, ep) cell, so different shards get
+        different values; the finish_init calls then copy everything meant
+        to be replicated (hsdp replicas, uncut params, buffers) from one rank.
         """
         cell = self.mesh.coordinate("dp_shard") if self.parallelism == "fsdp" else 0
         cell = cell * self.tp_size + (self.mesh.coordinate("tp") if self.tp else 0)
@@ -388,25 +381,24 @@ class Trainer:
         return build_dataloader(
             self.config["data"], self.tokenizer, self.ignore_index,
             self.mesh.coordinate("dp"), self.dp_size,
-            # so a job-wide SIGTERM can't kill the workers before the
-            # checkpoint; __init__ registers the matching teardown
+            # workers survive a job-wide SIGTERM until the final checkpoint;
+            # __init__ registers their teardown
             shield_sigterm=True,
         )
 
     def _next_data_pass(self):
         """
-        this rank's shards ran out: start the next pass over them. the hf
-        dataset reshuffles per epoch (shard order and shuffle buffer), and
-        its epoch counter is part of the dataloader state, so a resume lands
-        in the same pass.
+        this rank's shards ran out: start the next pass, reshuffled (the hf
+        dataset reshuffles per epoch). the epoch is saved with the prefetcher
+        state, so a resume lands in the same pass.
         """
         dataset = self.dataloader.dataset
         epoch = dataset.epoch + 1
         dataset.set_epoch(epoch)
         print(f"[dp {self.mesh.coordinate('dp')}] data exhausted, starting pass {epoch}")
         loader_iter = iter(self.dataloader)
-        # persistent workers hand back the same iterator, already registered;
-        # a new one needs its own teardown
+        # persistent workers return the same iterator; only a new one needs
+        # its teardown registered
         if loader_iter is not self.prefetcher.loader_iter:
             atexit.register(shutdown_workers, loader_iter)
         return loader_iter
@@ -421,10 +413,9 @@ class Trainer:
 
     def _writes_model_state(self) -> bool:
         """
-        one rank per shard writes model/optimizer state: the one at coordinate
-        0 on every axis the state is replicated (not sharded) over. that is
-        rank 0 alone under ddp, the dp_replicate=0 row under fsdp/hsdp, and
-        with tp on, one rank per tp coordinate of those.
+        one rank per distinct shard writes model/optimizer state: the one at
+        coordinate 0 on every axis the state is replicated over. under ddp
+        that is rank 0 alone; fsdp, tp and ep each add their shard axis.
         """
         shard_dims = (
             self.parallel.shard_dims
@@ -439,20 +430,18 @@ class Trainer:
 
     def _writes_dp_state(self) -> bool:
         """
-        rng, dataloader and prefetcher state is one file per dp coordinate.
-        tp peers share that coordinate and hold identical state, so only the
-        first of them writes it.
+        rng, dataloader and prefetcher state is one file per dp coordinate;
+        tp peers hold identical copies, so only tp coordinate 0 writes.
         """
         return self.tp_size == 1 or self.mesh.coordinate("tp") == 0
 
     @debug_time
     def checkpoint(self, step: int) -> None:
-        # one rank per shard writes model/optimizer state, rank 0 the rest;
-        # every rank writes its own dataloader and rng state. no barrier: each
-        # rank commits its own marker and the step is complete when all have
+        # no barrier: each rank writes a done-marker after its files, and the
+        # step is complete once every rank's marker exists
         if self.rank == 0 and self.keep_last_n is not None:
-            # before the save, and never the newest complete ones: a save
-            # that dies halfway still leaves keep_last_n to resume from
+            # prune before saving: if this save dies, keep_last_n complete
+            # checkpoints are still there
             self.checkpointer.prune(self.keep_last_n, keep=(step,))
         if self._writes_model_state():
             layout = self._shard_layout()
@@ -479,8 +468,8 @@ class Trainer:
                 dp_rank,
             )
             self.checkpointer.save_dataloader(self.dataloader, step, dp_rank)
-            # the loader is one batch ahead of training; that batch is saved
-            # here, with the data pass the loader is on (see _next_data_pass)
+            # the prefetcher holds one batch training hasn't seen yet; save it
+            # with the current data pass
             held = self.prefetcher.state_dict()
             held["epoch"] = self.dataloader.dataset.epoch
             self.checkpointer.save_prefetcher(held, step, dp_rank)
@@ -488,15 +477,11 @@ class Trainer:
 
     def _on_sigterm(self, signum, frame) -> None:
         """
-        first SIGTERM: checkpoint and exit at the next log point. a later one
-        means "now": put the default handler back and die.
+        first SIGTERM: checkpoint and exit at the next stop check. a second
+        one more than 5s later: die now.
 
-        one request often arrives twice within moments: a signal to the whole
-        process group reaches this rank directly and again when torchrun
-        forwards its own copy. repeats inside a short window count as one.
-
-        dataloader workers ignore SIGTERM, so a signal sent to the whole
-        process group still leaves the run able to reach that log point.
+        the window exists because one kill often arrives twice (directly, and
+        forwarded by torchrun).
         """
         now = time.monotonic()
         if self._sigterm and now - self._sigterm_at > 5.0:
@@ -508,11 +493,9 @@ class Trainer:
 
     def _stop_requested(self) -> bool:
         """
-        collective: has any rank been sent SIGTERM? ranks get the signal at
-        different moments, so they agree on it here, at a point every rank
-        reaches on the same step. it syncs with the host, so it is asked
-        every `checkpointing.stop_check_every` steps (default: the log points,
-        which sync anyway), not every step.
+        collective: has any rank been sent SIGTERM? ranks receive it at
+        different times, so they vote here and all stop on the same step.
+        costs a host sync, so it runs every `stop_check_every` steps.
         """
         flag = torch.tensor(float(self._sigterm), device=self.device)
         if self.dp_size > 1:
@@ -523,9 +506,8 @@ class Trainer:
 
     def _resume_step(self) -> int | None:
         """
-        the checkpoint step to resume from, per `checkpointing.resume`: null
-        (start fresh), "auto" (the latest complete step, if any) or an
-        explicit step. None means start fresh.
+        the step to resume from per `checkpointing.resume` (null, "auto" or a
+        step), or None to start fresh.
         """
         if self.resume is None:
             return None
@@ -549,8 +531,8 @@ class Trainer:
             return 0
 
         state = self.checkpointer.load_trainer(step)
-        # model/optimizer state reshards onto any mesh, but the per-rank
-        # dataloader files would be misread under a different dp layout
+        # model/optimizer state reshards onto any mesh; the per-dp-rank
+        # dataloader files don't
         assert state["config"]["mesh"] == self.config["mesh"] or not self.resume_dataloader, (
             f"resume across a mesh change (checkpoint {state['config']['mesh']}, "
             f"config {self.config['mesh']}) can't restore the per-rank dataloader "
@@ -562,17 +544,16 @@ class Trainer:
 
         dp_rank = self.mesh.coordinate("dp")
         if self.resume_dataloader:
-            # older checkpoints have none: they resume one batch ahead
+            # None in older checkpoints: they resume one batch ahead
             held = self.checkpointer.load_prefetcher(step, dp_rank)
             if held is not None:
                 self._resumed_batch = held["next_batch"]
-                # the dataset only applies saved state to the pass it was
-                # saved in, and doesn't restore the pass number itself
+                # the dataset doesn't restore its epoch itself, and ignores
+                # state saved in another epoch
                 self.dataloader.dataset.set_epoch(held.get("epoch", 0))
             self.checkpointer.load_dataloader(self.dataloader, step, dp_rank)
-        # each dp rank resumes its own stream. older checkpoints carry only
-        # rank 0's, in trainer.pt. a rank with neither (resume onto a larger
-        # mesh) keeps the seed-derived stream it already has.
+        # each dp rank's own stream (older checkpoints: rank 0's, in
+        # trainer.pt). a rank with none, after growing the mesh, keeps its seed
         rng = self.checkpointer.load_rng(step, dp_rank)
         if rng is None and "cpu_rng" in state:
             rng = state
@@ -585,12 +566,11 @@ class Trainer:
 
     def _resume_optimizer(self, step: int, layout: ShardLayout) -> None:
         """
-        optimizer and scheduler state. per-param state (adam moments) always
-        comes from the checkpoint and hparams from this config, except lr,
-        which belongs to the scheduler when that is resumed too.
+        per-param state (adam moments) comes from the checkpoint, hparams
+        from this config. lr comes from the checkpoint when the scheduler is
+        resumed, else from this config's schedule at `step`.
         """
-        # load_state_dict overwrites param_groups wholesale, so save this
-        # config's hparams and put them back
+        # load_state_dict replaces param_groups, hparams included; keep ours
         config_hparams = [
             {k: v for k, v in group.items() if k != "params"}
             for group in self.optimizer.param_groups
@@ -603,8 +583,8 @@ class Trainer:
         if self.resume_scheduler:
             self.checkpointer.load_scheduler(self.scheduler, step)
         else:
-            # fresh scheduler from this config, fast-forwarded to `step`, with
-            # its lr applied now so the first resumed step doesn't use the step-0 lr
+            # fast-forward this config's schedule to `step` and apply its lr
+            # now, or the first resumed step would use the step-0 lr
             self.scheduler.last_epoch = step
             lrs = self.scheduler.get_lr()
             for group, lr in zip(self.optimizer.param_groups, lrs, strict=True):
@@ -639,7 +619,7 @@ class Trainer:
         loss += self.micro_train_step()
         self.parallel.sync()
         if self.tp is not None:
-            # after the dp sync: it reduces these same grad tensors in the background
+            # after parallel.sync(): ddp may still be all-reducing these grads
             self.tp.sync()
         if self.ep is not None:
             self.ep.sync()
@@ -651,15 +631,14 @@ class Trainer:
         self.optimizer.zero_grad()
         self.scheduler.step()
 
-        # rank-local loss; _run_steps averages over dp once per log window
+        # loss is this rank's; _run_steps averages it over dp at log points
         return {"loss": loss, "grad_norm": grad_norm, **self._balance_experts()}
 
     def _balance_experts(self) -> dict[str, torch.Tensor]:
         """
-        a moe model's aux-free load balancing, once per optimizer step: the
-        expert loads are summed over every data rank, so all ranks apply the
-        same router-bias update. returns the model's balance metrics (on
-        device), or {} for a model without it.
+        moe router-bias balancing, once per optimizer step. expert loads are
+        summed over all data ranks so every rank applies the same update.
+        returns balance metrics on device ({} for a dense model).
         """
         if not hasattr(self.model, "balance_step"):
             return {}
@@ -673,15 +652,14 @@ class Trainer:
 
     def _run_steps(self, start: int, end: int, checkpoint: bool) -> None:
         """
-        step loop shared by train() and the --steps benchmark. metrics stay on
-        device and only sync with the host at log points, so the cpu can run
-        ahead of the gpu. step time is averaged over the log window and
-        excludes checkpoint saves.
+        step loop for train() and the --steps benchmark. metrics stay on the
+        gpu until a log point so the cpu can run ahead. step time is averaged
+        over the log window and excludes checkpoint saves.
         """
         tokens_per_step = self.config["data"]["seq_len"] * self.global_batch_size
         loss_sum = torch.zeros((), device=self.device)
         gnorm_sum = torch.zeros((), device=self.device)
-        # anything else train_step reports (moe balance): summed like the rest
+        # any other train_step metrics (moe balance)
         extra_sums: dict[str, torch.Tensor] = {}
         window = 0
         t0 = time.perf_counter()
@@ -697,8 +675,7 @@ class Trainer:
             done = step + 1
             save = checkpoint and (done % self.save_steps == 0 or done == end)
             log = done % self.log_every == 0 or done == end
-            # has any rank been sent SIGTERM? asked on the same steps by
-            # every rank; a yes turns this step into a log + save point
+            # a stop turns this step into a log + save point
             stop = False
             if checkpoint and (save or log or done % self.stop_check_every == 0):
                 stop = self._stop_requested()
@@ -742,12 +719,12 @@ class Trainer:
         try:
             self._run_steps(self.start_step, self.num_train_steps, checkpoint=True)
         finally:
-            # past the loop nothing answers the flag, so SIGTERM kills again
+            # nothing checks the flag after the loop, so SIGTERM kills again
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             try:
-                # the last async save must be on disk before the process exits
+                # the last async save must finish before exit
                 self.checkpointer.wait()
             finally:
-                # so a crash marks the wandb run crashed instead of leaving it "running"
+                # so a crash shows as crashed in wandb, not "running"
                 if self.wandb_run is not None:
                     self.wandb_run.finish()

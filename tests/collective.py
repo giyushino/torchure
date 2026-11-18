@@ -60,11 +60,9 @@ def rank_pattern(shape, coord: int, device, dtype=torch.float32) -> torch.Tensor
     return (torch.arange(numel, dtype=dtype, device=device) * (coord + 1)).reshape(shape)
 
 
-# --------------------------------------------------------------------------
 # tests. each takes (mesh, dim, device); AssertionError = failure,
 # Skip = skipped. values are small-int fp32, so sums are exact and
 # assert_close's default fp32 tolerances are more than enough.
-# --------------------------------------------------------------------------
 
 
 def test_all_reduce_sum(mesh, dim, device):
@@ -377,11 +375,6 @@ TESTS = [
     test_subgroup_isolation,
     test_mesh_flatten,
 ]
-
-
-# --------------------------------------------------------------------------
-# harness
-# --------------------------------------------------------------------------
 
 
 def _worker(rank: int, world_size: int, backend: str, only: str | None = None):

@@ -113,7 +113,7 @@ class _FusedLinearCE(torch.autograd.Function):
         return (*_scaled_grads(ctx, grad_out), None, None, None)
 
 
-# ---- vocab-parallel variant ------------------------------------------------
+# vocab-parallel variant.
 #
 # the weight is this rank's slice of the vocab rows (tensor parallel), so the
 # logits are a slice too and the softmax needs every rank's. per chunk:

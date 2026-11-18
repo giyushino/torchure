@@ -43,11 +43,6 @@ def rank_pattern(shape, coord: int) -> torch.Tensor:
     return (torch.arange(numel, dtype=torch.float32) * (coord + 1)).reshape(shape)
 
 
-# --------------------------------------------------------------------------
-# single-axis cells
-# --------------------------------------------------------------------------
-
-
 def test_shard_to_replicate(mesh, dim):
     g, c = mesh.size(dim), mesh.coordinate(dim)
     x = full((4 * g, 3))
@@ -169,9 +164,7 @@ def test_double_shard_same_dim_rejected(mesh, dim):
     raise AssertionError("two axes on one tensor dim should be rejected")
 
 
-# --------------------------------------------------------------------------
 # two-axis (hsdp-shaped) cells -- 4 ranks only
-# --------------------------------------------------------------------------
 
 
 def test_two_axis(mesh, dim):

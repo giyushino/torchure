@@ -21,13 +21,14 @@ this file knows nothing about any model: the model hands over its expert
 banks (`model.ep_plan()`, models/moe.py's ExpertBank) and the bank calls
 back through `bank.remote`.
 
-grads. the objective is the mean of every data rank's loss. a dense param
-is replicated on all of them, so its grad is the average over all of them
-(ddp / fsdp do that, over an axis that includes ep). an expert lives on ONE
-ep rank, which has already summed the grads of every ep peer's loss that
-flowed back through the dispatch. so its grad is that sum / ep (`sync()`),
-averaged only over the ranks holding a replica of the same expert: the dp
-axes without ep. the trainer tells ddp / fsdp which params those are.
+grads. the loss is the mean over all data ranks, ep ranks included.
+- dense params: each rank has a copy and a grad from its own batch, so
+  ddp / fsdp average over `dp` (which includes ep), as usual.
+- an expert lives on one ep rank, and the return trip of the dispatch already
+  delivered the grads from every ep peer's tokens there: a SUM over the ep
+  group. `sync()` divides by ep to make it a mean; ddp / fsdp then average
+  only over the other copies of that expert (`dp_expert`, the dp axes
+  without ep).
 
 two ways to build, as for tensor parallel: from full weights (every rank
 inits the full model on one seed, EP keeps its slice), or from a meta model
@@ -67,9 +68,8 @@ class EP:
         self.mesh = mesh
         self.dim = dim
         self.group_size = mesh.size(dim)
-        # (module, attribute, unsharded shape) of every sharded weight. looked
-        # up through the module: materializing a meta model replaces the
-        # Parameter objects
+        # (module, attribute, unsharded shape) of every sharded weight. kept
+        # by module, not Parameter: materializing from meta replaces Parameters
         self._entries: list[tuple[nn.Module, str, tuple[int, ...]]] = []
         self._by_id: dict[int, tuple[int, ...]] | None = None
         if self.group_size == 1:
@@ -82,8 +82,6 @@ class EP:
             for linear in (bank.gate, bank.up, bank.down):
                 self._shard(linear)
             bank.remote = self._remote
-
-    # ---- construction ----------------------------------------------------
 
     def _shard(self, module: nn.Module) -> None:
         """make `module.weight` this rank's slice of the experts (dim 0)."""
@@ -118,9 +116,9 @@ class EP:
 
     def finish_init(self, model: nn.Module) -> None:
         """
-        call once after initializing a model built from meta. each rank
-        initialized on its own seed so its experts are its own; this makes
-        everything else, buffers included, agree with ep coordinate 0.
+        call once after initializing a model built from meta. every ep rank
+        initialized on its own seed, which is right for its experts; this
+        copies everything else (dense params, buffers) from ep rank 0.
         """
         if self.group_size == 1:
             return
@@ -130,8 +128,6 @@ class EP:
                 broadcast(param.data, self.mesh, self.dim, src=0)
         for buf in model.buffers():
             broadcast(buf, self.mesh, self.dim, src=0)
-
-    # ---- dispatch --------------------------------------------------------
 
     @torch.compiler.disable
     def _remote(self, bank: ExpertBank, x: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
@@ -144,25 +140,23 @@ class EP:
         per_rank = bank.num_experts // size
         me = self.mesh.coordinate(self.dim)
 
-        # table[sender, expert]: every rank's counts, so each knows what arrives
+        # table[sender, expert]: how many rows each rank sends each expert
         table = all_gather(counts, self.mesh, self.dim).view(size, bank.num_experts)
-        # rows sorted by expert are already grouped by destination rank
+        # experts are assigned to ranks in contiguous blocks, so rows sorted
+        # by expert are already grouped by destination rank
         send = counts.view(size, per_rank).sum(dim=1).tolist()
         mine = table[:, me * per_rank: (me + 1) * per_rank]   # (sender, local expert)
         recv = mine.sum(dim=1).tolist()
 
         arrived = _Exchange.apply(x, self.mesh, self.dim, send, recv)
-        # arrivals are ordered by sender, then expert; the bank wants them
-        # ordered by expert alone
+        # arrivals are ordered (sender, expert); the bank wants them by expert
         expert_of = torch.arange(per_rank, device=x.device).repeat(size)
         expert_of = expert_of.repeat_interleave(mine.reshape(-1))
         order = expert_of.argsort(stable=True)
         out = bank.local(arrived[order], mine.sum(dim=0))
-        # undo the regrouping, then send every row back where it came from
+        # undo the reorder, then send each row back to its sender
         restored = torch.empty_like(out).index_copy(0, order, out)
         return _Exchange.apply(restored, self.mesh, self.dim, recv, send)
-
-    # ---- trainer surface -------------------------------------------------
 
     @property
     def shard_dims(self) -> tuple[str, ...]:

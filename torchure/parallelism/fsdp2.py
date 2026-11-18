@@ -125,14 +125,16 @@ class _PendingReduce:
 class FSDP:
     """
     shard `model` along `shard_dim`; a no-op when that axis has size 1.
-    `units` are the submodules gathered/resharded independently, in any order
-    (execution order is recorded on the first forward); params outside them
-    form the root unit. units must not nest or share a param.
-    `replicate_dim` adds hsdp: reduce-scatter on shard_dim, then all-reduce on
-    replicate_dim. `replicate_dim_of(param)` overrides that axis for
-    individual params (expert parallel: expert weights have replicas along
-    fewer ranks than the dense ones; None = no replicas). `param_dtype` is the gathered/compute dtype (None = no
-    cast); `reduce_dtype` is the grad reduction dtype (None = grad's dtype).
+
+    units           submodules gathered / resharded independently, in any
+                    order (the forward order is recorded on the first step).
+                    params outside them form the root unit. units must not
+                    nest or share a param.
+    replicate_dim   hsdp: reduce-scatter on shard_dim, then all-reduce on this.
+    replicate_dim_of  per-param override of replicate_dim (expert weights
+                    have fewer replicas than dense ones); None = no replicas.
+    param_dtype     dtype params are gathered and computed in; None = no cast.
+    reduce_dtype    dtype grads are reduced in; None = the grad's own.
 
     a `model` built on the meta device is materialized sharded on `device`,
     with uninitialized values: run the model's init next, then finish_init().
@@ -164,8 +166,8 @@ class FSDP:
         self.group_size = mesh.size(shard_dim)
         self.replicate_size = mesh.size(replicate_dim) if replicate_dim is not None else 1
 
-        # accepted and ignored (see the module docstring); it exists so the
-        # trainer's accumulation loop is the same for ddp and fsdp
+        # ignored (fsdp reduces every microbatch); here so the trainer's
+        # accumulation loop works unchanged
         self.requires_sync = True
         self._pending: list[_PendingReduce] = []        # reduce-scatters in flight
         self._all_reducing: list[_PendingReduce] = []   # hsdp all-reduces in flight
@@ -202,13 +204,10 @@ class FSDP:
             st.param.data = st.sharded
         self._register_hooks()
 
-    # ---- construction ----------------------------------------------------
-
     def _replicate(self, model: nn.Module) -> None:
         """
-        make every rank's full weights identical before slicing: each rank
-        keeps its own slice, which is only one model if they all started from
-        the same one.
+        make every rank's full weights identical before each keeps its slice;
+        otherwise the slices would come from different models.
         """
         for param in model.parameters():
             broadcast(param.detach(), self.mesh, self.shard_dim, src=0)
@@ -358,8 +357,6 @@ class FSDP:
             for st in unit.params:
                 st.param.register_post_accumulate_grad_hook(self._make_grad_hook(unit))
 
-    # ---- gather / free ---------------------------------------------------
-
     def _start_gather(self, unit: _Unit) -> None:
         """launch the unit's all_gathers; does not wait. idempotent."""
         if unit.status != _FREE:
@@ -416,12 +413,9 @@ class FSDP:
             _free_storage(st.unsharded)
         unit.status = _FREE
 
-    # ---- hooks ----------------------------------------------------------
-    #
-    # every hook is @torch.compiler.disable'd: they resize storages, which
-    # inductor can't lower if dynamo traces them into a block's graph (it does
-    # under Module.compile(), which compiles _call_impl, hooks included). the
-    # resulting graph break sits at the unit boundary, so it costs nothing.
+    # the hooks are @torch.compiler.disable'd: they resize storages, which
+    # inductor can't compile. the graph break lands on a unit boundary, so it
+    # costs nothing.
 
     def _make_forward_pre(self, unit: _Unit):
         @torch.compiler.disable
@@ -494,8 +488,6 @@ class FSDP:
             if 0 <= j < len(order):
                 out.append(self._units[order[j]])
         return out
-
-    # ---- grad reduction --------------------------------------------------
 
     def _close_open_units(self) -> None:
         """
@@ -596,8 +588,6 @@ class FSDP:
             f"{list(range(len(self._units)))} exactly once"
         )
 
-    # ---- trainer surface -------------------------------------------------
-
     @property
     def shard_dims(self) -> tuple[str, ...]:
         """
@@ -662,10 +652,10 @@ class FSDP:
                 st.sharded_grad = None
         self._backwards = 0
 
-    # ---- introspection (used by tests/fsdp2.py) --------------------------
+    # introspection (used by tests/fsdp2.py)
 
     def sharded_numel(self) -> int:
-        """total params this rank actually owns. the memory exit criterion."""
+        """number of param elements this rank stores."""
         return sum(st.sharded.numel() for st in self._states)
 
     def unsharded_bytes_live(self) -> int:

@@ -137,11 +137,6 @@ def check_grads(errors, model, reference, mesh, dim, tag="", rtol=1e-4, atol=1e-
         )
 
 
-# --------------------------------------------------------------------------
-# parity
-# --------------------------------------------------------------------------
-
-
 def test_shard_and_replicate(mesh, dim, device):
     """
     ctor must (a) make every rank agree on the full weights before slicing --
@@ -422,9 +417,7 @@ def test_hsdp(mesh, dim, device):
     assert fsdp.placements_of("norm.weight") == (Replicate(), Shard(0))
 
 
-# --------------------------------------------------------------------------
 # the invariants that are invisible from the outside
-# --------------------------------------------------------------------------
 
 
 def test_storage_actually_freed(mesh, dim, device):
