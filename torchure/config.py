@@ -33,7 +33,8 @@ SCHEMA = {
     "mesh": FREE,
     # "ddp" | "fsdp": how the dp axes hold the model
     "parallelism": "ddp",
-    "ddp": {"bucket_mb": 25},
+    # reduce_dtype: the dtype grads are all-reduced in ("float32" = as is)
+    "ddp": {"bucket_mb": 25, "reduce_dtype": "float32"},
     "fsdp": {"param_dtype": "bfloat16", "reduce_dtype": "float32", "prefetch": 1},
     "tp": {
         "vocab_parallel": True,
@@ -53,7 +54,11 @@ SCHEMA = {
     },
     "objective": {"name": REQUIRED, "config": FREE},
     "data": {
-        "name": REQUIRED,
+        # exactly one of: `name`, an hf dataset streamed and tokenized on the
+        # fly, or `mix`, a mix script over pre-tokenized sources
+        # (dataloader/mixture.py, notes/DATA_MIXING.md)
+        "name": None,
+        "mix": None,
         "config": None,
         "split": "train",
         "tokenizer": REQUIRED,
@@ -67,6 +72,11 @@ SCHEMA = {
         "micro_batch_size": REQUIRED,
         "seq_len": REQUIRED,
         "pack_batch": 1000,
+        # mix only: bytes per range request, blocks per shuffle window, and
+        # download threads
+        "block_mb": 16,
+        "window_blocks": 4,
+        "fetch_threads": 8,
     },
     "checkpointing": {
         "save_steps": REQUIRED,
@@ -174,7 +184,7 @@ def load_config(path: str) -> dict:
     from torchure.optimizer.builder import SCHEDULER_REGISTRY
 
     name = config["model"]["name"]
-    if MODEL_REGISTRY.get(name) is None:
+    if name not in MODEL_REGISTRY:
         raise ConfigError(f"model {name!r} is not implemented; registry: {list(MODEL_REGISTRY)}")
     _check_kwargs(MODEL_REGISTRY[name].__init__, config["model"]["config"], f"model {name!r}")
 
@@ -221,6 +231,10 @@ def _check_values(config: dict) -> None:
     expect(ckpt["stop_check_every"] is None or ckpt["stop_check_every"] >= 1,
            "checkpointing.stop_check_every: expected null or >= 1")
     data = config["data"]
+    expect((data["name"] is None) != (data["mix"] is None),
+           "data needs exactly one of `name` (an hf dataset) or `mix` (a mix script)")
+    expect(data["mix"] is None or os.path.isfile(data["mix"]),
+           f"data.mix {data['mix']!r}: no such file")
     expect(data["global_batch_size"] % data["micro_batch_size"] == 0,
            f"data.global_batch_size {data['global_batch_size']} must be a multiple of "
            f"data.micro_batch_size {data['micro_batch_size']}")
