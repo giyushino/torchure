@@ -14,6 +14,7 @@ from datasets.distributed import split_dataset_by_node
 from tokenizers import Tokenizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from torchure.dataloader.mixture import MixtureLoader
 from torchure.dataloader.packers import ListPacker
 
 
@@ -53,6 +54,9 @@ def shutdown_workers(loader_iter) -> None:
     shutdown first, then SIGKILL for any that are still alive. safe to call
     twice, and on a single-process iterator.
     """
+    close = getattr(loader_iter, "close", None)  # MixtureLoader's fetch threads
+    if close is not None:
+        close()
     shutdown = getattr(loader_iter, "_shutdown_workers", None)
     if shutdown is not None:
         try:
@@ -86,6 +90,20 @@ def _check_shards(num_shards: int, dp_size: int, num_workers: int) -> None:
 
 
 def build_dataloader(
+    data_cfg, tokenizer: Tokenizer, ignore_id: int, dp_rank: int, dp_size: int,
+    shield_sigterm: bool = False, total_steps: int | None = None,
+):
+    """
+    `data.mix` set: a MixtureLoader over pre-tokenized sources (mixture.py),
+    which needs total_steps for the schedule. otherwise the hf path below.
+    """
+    if data_cfg["mix"] is not None:
+        assert total_steps is not None, "a mix schedule needs total_steps"
+        return MixtureLoader(data_cfg, dp_rank, dp_size, total_steps, data_cfg["tokenizer"])
+    return build_hf_dataloader(data_cfg, tokenizer, ignore_id, dp_rank, dp_size, shield_sigterm)
+
+
+def build_hf_dataloader(
     data_cfg, tokenizer: Tokenizer, ignore_id: int, dp_rank: int, dp_size: int,
     shield_sigterm: bool = False,
 ):
