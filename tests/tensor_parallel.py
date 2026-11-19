@@ -27,6 +27,8 @@ checks, per scenario:
                   which never builds full logits
     checkpoint    save sharded (one file per tp x dp_shard cell), load back
                   sharded (bitwise) and unsharded into a full model
+    doc mask      scenarios with doc_mask run every check above with
+                  document masking on (flex attention, eos tokens in every row)
     meta init     build from the meta device, so no rank holds full weights:
                   replicas agree, shards differ, and the model the ranks hold
                   between them behaves like one full model
@@ -70,6 +72,8 @@ ACCUM = 2
 STEPS = 3
 MAX_NORM = 0.5     # small enough that clipping is active
 IGNORE = -100
+# eos id under a doc_mask scenario (set per worker process), else None
+DOC_EOS = None
 
 
 @dataclass(frozen=True)
@@ -81,12 +85,14 @@ class Scenario:
     sp: bool = False
     batch_sp: bool = False     # sp shards the batch dim instead of the sequence
     overlap: str = "none"
+    doc_mask: bool = False
 
     @property
     def name(self) -> str:
         opts = [o for o, on in (
             ("vocab", self.vocab), ("sp", self.sp), ("batch-sp", self.batch_sp),
             (f"overlap={self.overlap}", self.overlap != "none"),
+            ("doc-mask", self.doc_mask),
         ) if on]
         return (
             f"{'fsdp' if self.fsdp else 'ddp'} dp={self.dp} x tp={self.tp}"
@@ -112,12 +118,17 @@ SCENARIOS = [
     Scenario(1, 2, sp=True, batch_sp=True, overlap="collective_matmul"),
     Scenario(2, 2, fsdp=True, vocab=True, sp=True, batch_sp=True, overlap="backward"),
     Scenario(3, 2, fsdp=True, vocab=True, sp=True, overlap="collective_matmul"),
+    # document masking under every way tp lays out the sequence
+    Scenario(1, 2, doc_mask=True),
+    Scenario(2, 2, fsdp=True, vocab=True, sp=True, doc_mask=True),
+    Scenario(1, 2, sp=True, batch_sp=True, doc_mask=True),
 ]
 
 
 def build_full(seed: int = 0) -> Qwen3:
     torch.manual_seed(seed)
     model = Qwen3(**CFG)
+    model.doc_mask_eos = DOC_EOS
     model.init_weights()
     # init leaves norm weights at exactly 1; move them so their grads matter
     with torch.no_grad():
@@ -155,6 +166,7 @@ def build_tp_from_meta(mesh: Mesh, sc: Scenario):
     """the trainer's order: no rank ever holds the full weights."""
     with torch.device("meta"):
         model = Qwen3(**CFG)
+    model.doc_mask_eos = DOC_EOS
     tp = parallelize(model, mesh, sc, tp_only=True)
     cpu = torch.device("cpu")
     if sc.fsdp:
@@ -174,7 +186,14 @@ def build_tp_from_meta(mesh: Mesh, sc: Scenario):
 def batch(step: int, micro: int, dp: int) -> torch.Tensor:
     """the global batch of one microbatch: (dp * MICRO, SEQ)."""
     g = torch.Generator().manual_seed(1000 + 10 * step + micro)
-    return torch.randint(0, CFG["vocab_size"], (dp * MICRO, SEQ), generator=g)
+    ids = torch.randint(0, CFG["vocab_size"], (dp * MICRO, SEQ), generator=g)
+    if DOC_EOS is not None:
+        # every row holds 2-3 docs, cut in different places
+        ids[ids == DOC_EOS] = DOC_EOS + 1
+        ids[::2, 5] = DOC_EOS
+        ids[1::2, 3] = DOC_EOS
+        ids[1::2, 11] = DOC_EOS
+    return ids
 
 
 def my_rows(ids: torch.Tensor, mesh: Mesh) -> torch.Tensor:
@@ -401,6 +420,7 @@ def check_meta_init(mesh: Mesh, sc: Scenario, checks: Checks) -> None:
 
     # the full model the ranks hold between them
     ref = Qwen3(**CFG)
+    ref.doc_mask_eos = DOC_EOS
     for (name, p), (_, p_ref) in zip(
         model.named_parameters(), ref.named_parameters(), strict=True
     ):
@@ -428,6 +448,8 @@ def check_meta_init(mesh: Mesh, sc: Scenario, checks: Checks) -> None:
 
 
 def _worker(rank: int, world_size: int, sc: Scenario, tmp: str, port: int):
+    global DOC_EOS
+    DOC_EOS = 0 if sc.doc_mask else None
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     torch.set_num_threads(1)
