@@ -39,7 +39,10 @@ def main() -> None:
     data_cfg["seed"] = data_cfg["seed"] + 1
     data_cfg["num_workers"] = 1  # persistent_workers=True in build_dataloader needs > 0
     ignore_index = config["objective"]["config"]["ignore_index"]
-    loader = build_dataloader(data_cfg, tokenizer, ignore_index, dp_rank=0, dp_size=1)
+    loader = build_dataloader(
+        data_cfg, tokenizer, ignore_index, dp_rank=0, dp_size=1,
+        total_steps=config["optimizer"]["scheduler"]["total_steps"],
+    )
 
     losses = []
     it = iter(loader)

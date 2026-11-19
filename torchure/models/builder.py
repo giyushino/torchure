@@ -8,12 +8,11 @@ MODEL_REGISTRY = {
     "qwen3_dense": Qwen3,
     "olmo3": Olmo3,
     "kimi_k31": KimiK31,
-    "llama3_2": None,
 }
 
 
 def build_model(model_name: str, model_config: dict) -> nn.Module:
-    assert MODEL_REGISTRY.get(model_name) is not None, (
+    assert model_name in MODEL_REGISTRY, (
         f"model {model_name!r} is not implemented; registry: {list(MODEL_REGISTRY)}"
     )
     return MODEL_REGISTRY[model_name](**model_config)
