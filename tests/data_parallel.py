@@ -83,9 +83,13 @@ def test_replicate(mesh, dim):
         torch.testing.assert_close(p, p_ref, rtol=0, atol=0, msg=f"param {name} not replicated")
 
 
-def test_grad_parity(mesh, dim, bucket_mb: float):
+def test_grad_parity(mesh, dim, bucket_mb: float, reduce_dtype: torch.dtype | None = None):
     model = build_model(seed=dist.get_rank())
-    ddp = DDP(model, mesh, dim, bucket_mb=bucket_mb)
+    ddp = DDP(model, mesh, dim, bucket_mb=bucket_mb, reduce_dtype=reduce_dtype)
+    # bf16 on the wire rounds each rank's grad to ~3 significant digits, so
+    # the error is relative to the grads' scale: where ranks nearly cancel,
+    # the average is off by a few bf16 ulps of the inputs
+    bf16 = reduce_dtype is not None
 
     reference = build_model(seed=0)
     batch = global_batch(mesh.size(dim))
@@ -98,8 +102,11 @@ def test_grad_parity(mesh, dim, bucket_mb: float):
         for (name, p), (_, p_ref) in zip(
             model.named_parameters(), reference.named_parameters(), strict=True
         ):
+            assert p.grad.dtype == p.dtype, f"param {name}: grad came back as {p.grad.dtype}"
             try:
-                torch.testing.assert_close(p.grad, p_ref.grad, rtol=1e-4, atol=1e-6)
+                scale = p_ref.grad.abs().max().item()
+                rtol, atol = (2e-2, 2e-2 * scale) if bf16 else (1e-4, 1e-6)
+                torch.testing.assert_close(p.grad, p_ref.grad, rtol=rtol, atol=atol)
             except AssertionError as e:
                 raise AssertionError(f"param {name}: {e}") from None
         for p in model.parameters():
@@ -167,6 +174,11 @@ TESTS = [
     ("test_parity_many_buckets", partial(test_grad_parity, bucket_mb=0.008)),
     # 0 cap: every param is "oversized" -> all in-place, no flat buffers
     ("test_parity_inplace", partial(test_grad_parity, bucket_mb=0.0)),
+    # bf16 reduce_dtype: cast copies on the wire, averaged back into fp32 grads
+    ("test_parity_bf16_reduce", partial(test_grad_parity, bucket_mb=0.008,
+                                        reduce_dtype=torch.bfloat16)),
+    ("test_parity_bf16_reduce_inplace", partial(test_grad_parity, bucket_mb=0.0,
+                                                reduce_dtype=torch.bfloat16)),
     # phase 1.3: grad accumulation, across the same three bucket shapes
     ("test_accum_2mb_one_bucket", partial(test_grad_accumulation, bucket_mb=25, microbatches=2)),
     ("test_accum_4mb_many_buckets", partial(test_grad_accumulation, bucket_mb=0.008, microbatches=4)),

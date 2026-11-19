@@ -527,9 +527,6 @@ def test_noop_at_size_one(mesh, dim, device):
     """dp_shard=1 must register no hooks, allocate nothing, launch nothing."""
     model = build_model(seed=0, device=device)
     before = [p.data_ptr() for p in model.parameters()]
-    solo = Mesh({"dp_shard": dist.get_world_size()}) if False else None
-    del solo
-
     class OneMesh:
         def size(self, d):
             return 1

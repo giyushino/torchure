@@ -36,22 +36,6 @@ class Skip(Exception):
     """raised by a test to report SKIP (not a failure) with a reason."""
 
 
-class FlatMesh:
-    """
-    1-d MeshLike stand-in over the WORLD group so collectives are testable
-    before core/mesh.py exists. accepts any dim name.
-    """
-
-    def size(self, dim: str) -> int:
-        return dist.get_world_size()
-
-    def get_group(self, dim: str) -> dist.ProcessGroup:
-        return dist.group.WORLD
-
-    def coordinate(self, dim: str) -> int:
-        return dist.get_rank()
-
-
 def rank_pattern(shape, coord: int, device, dtype=torch.float32) -> torch.Tensor:
     """arange(numel).reshape(shape) * (coord + 1), on `device`."""
     numel = 1
