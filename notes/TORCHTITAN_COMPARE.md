@@ -9,8 +9,11 @@ x 4, cross-checked against log timestamps). same box, same night.
 **the cuda build, not the framework or torch version, was the gap.** pypi's
 default torch 2.10 wheel is cuda 12.8; the same torch 2.10 built for cuda
 13.0 is +22% on 0.6B (195k -> 239k), from newer cublas/cudnn kernels.
-torchure on cuda 13 beats torchtitan main (torch 2.16 nightly, cuda 13.2)
-on every shape tried.
+at equal attention work (plain causal), torchure on cuda 13 beats
+torchtitan main (torch 2.16 nightly, cuda 13.2) on every shape tried. with
+its default document masking torchtitan does less attention work and
+reaches 250k on 0.6B ddp, above torchure's best (245.5k): torchure is the
+faster stack, not yet the faster trainer.
 
 | shape | torchure, cu128 (old pin) | torchure, cu130 (new pin) | best torchure config | torchtitan |
 |---|---|---|---|---|
