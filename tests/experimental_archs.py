@@ -114,6 +114,21 @@ def test_diffusion_loss():
     assert not missing, missing
 
 
+def test_diffusion_generate():
+    """every mask gets filled, `gen_len / steps` per step, and the prompt is never touched."""
+    from torchure.inference.diffusion_generate import diffusion_generate
+
+    mask_id = VOCAB - 1
+    model = build(Qwen3, {**QWEN, "num_layers": 2, "causal": False})
+    revealed = []
+    model.register_forward_pre_hook(lambda m, args: revealed.append(int((args[0] == mask_id).sum())))
+    prompt = ids(batch=2)[:, :4]
+    out = diffusion_generate(model, prompt, gen_len=8, steps=4, mask_id=mask_id, temperature=1.0)
+    assert out.shape == (2, 8) and (out != mask_id).all()
+    # masks left at each of the 4 forwards, both rows: 8, 6, 4, 2
+    assert revealed == [16, 12, 8, 4], revealed
+
+
 # --- looped ----------------------------------------------------------------
 
 
