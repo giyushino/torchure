@@ -34,6 +34,8 @@ from torchure.models.layers import (
     RotaryEmbedding,
     SwiGLU,
     apply_rotary,
+    doc_mask,
+    masked_attention,
     positions,
     swiglu_ffn_dim,
 )
@@ -152,6 +154,10 @@ class Olmo3Attention(nn.Module):
 
         S = Q.size(-2)
         window = self.sliding_window
+        # document masking: one BlockMask per window size (layers.doc_mask)
+        if isinstance(attention_mask, dict):
+            out = masked_attention(Q, K, V, attention_mask[window if window and S > window else None])
+            return self.o_proj(self.combine_heads(out))
         if attention_mask is None and (window is None or S <= window):
             out = F.scaled_dot_product_attention(Q, K, V, is_causal=True, enable_gqa=True)
             return self.o_proj(self.combine_heads(out))
@@ -244,6 +250,8 @@ class Olmo3(nn.Module):
         # olmo 3 does not tie embeddings
         self.lm_head = nn.Linear(emb_dim, vocab_size, bias=False)
         self.activation_checkpointing = False
+        # eos id: attend within documents only (layers.doc_mask); None = plain causal
+        self.doc_mask_eos: int | None = None
 
     def init_weights(self, std: float = 0.02) -> None:
         """same contract as qwen3: every param/buffer set, elementwise."""
@@ -301,7 +309,14 @@ class Olmo3(nn.Module):
         return_hidden_states: bool = False,
         return_final_hidden: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        position_ids, attention_mask, cacheable = positions(x, attention_mask)
+        if self.doc_mask_eos is not None and attention_mask is None:
+            windows = {None} | {b.attn.sliding_window for b in self.blocks
+                                if b.attn.sliding_window and x.size(1) > b.attn.sliding_window}
+            # every block gets the whole dict and picks its own window
+            position_ids, attention_mask = doc_mask(x, self.doc_mask_eos, windows)
+            cacheable = False
+        else:
+            position_ids, attention_mask, cacheable = positions(x, attention_mask)
 
         x = self.token_emb(x)
         cos, sin = self.rope(position_ids, cacheable=cacheable)

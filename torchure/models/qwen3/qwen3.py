@@ -10,9 +10,12 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from torchure.models.layers import (
+    BlockMask,
     RotaryEmbedding,
     SwiGLU,
     apply_rotary,
+    doc_mask,
+    masked_attention,
     positions,
     swiglu_ffn_dim,
 )
@@ -69,6 +72,10 @@ class Qwen3GroupQueryAttention(nn.Module):
         return x.transpose(1, 2).reshape(B, S, heads * self.head_dim)
 
     def scaled_self_attention(self, Q, K, V, attention_mask):
+        # document masking (layers.doc_mask)
+        if isinstance(attention_mask, BlockMask):
+            return masked_attention(Q, K, V, attention_mask)
+
         # no mask (packed training): is_causal lets sdpa use the flash kernel
         if attention_mask is None:
             return F.scaled_dot_product_attention(Q, K, V, is_causal=True, enable_gqa=True)
@@ -156,6 +163,8 @@ class Qwen3(nn.Module):
         # recompute each block's activations in backward instead of storing
         # them: trades roughly one extra forward for most activation memory
         self.activation_checkpointing = False
+        # eos id: attend within documents only (layers.doc_mask); None = plain causal
+        self.doc_mask_eos: int | None = None
 
     def init_weights(self, std: float = 0.02) -> None:
         """
@@ -227,7 +236,11 @@ class Qwen3(nn.Module):
         return_hidden_states: bool = False,
         return_final_hidden: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        position_ids, attention_mask, cacheable = positions(x, attention_mask)
+        if self.doc_mask_eos is not None and attention_mask is None:
+            position_ids, masks = doc_mask(x, self.doc_mask_eos)
+            attention_mask, cacheable = masks[None], False
+        else:
+            position_ids, attention_mask, cacheable = positions(x, attention_mask)
 
         x = self.token_emb(x)
         cos, sin = self.rope(position_ids, cacheable=cacheable)
