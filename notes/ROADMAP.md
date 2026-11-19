@@ -43,7 +43,8 @@ shards landed 11/10. phase 3 (sharded checkpointing with resharding load,
 async save) landed 11/9, so fsdp runs are resumable, and SIGTERM now
 checkpoints and exits. tensor parallel (phase 4) landed 11/10: tp over ddp
 or fsdp, vocab-parallel embedding with a parallel fused loss, sequence
-parallel, meta-device init. see the phase 4 status block.
+parallel, meta-device init. see the phase 4 status block. tp throughput,
+the batch-dim sp layout and comm overlap were measured 11/12 (TP_H100.md).
 
 the 7/30 overlap trace (DDP.md) sharpens what phase 2 is *for* on this
 hardware: at 8 gpus the grad all-reduce (442 ms/step) no longer fits inside the
@@ -60,15 +61,22 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
 | `core/grad_helper.py` | **done (phase 1.3).** `clip_grad_norm(params, mesh, max_norm, shard_dims=())` — placement-aware global grad-norm clip, returns the pre-clip norm for logging. local path matches `torch.nn.utils.clip_grad_norm_` and runs at memory-bandwidth limit (~10 ms / 2.1 GiB of grads, ~1.8% of a step); sharded path is what fsdp passes its shard axis to. tests in `tests/grad_helper.py` |
 | `parallelism/fsdp2.py` | **done (phase 2.2, 2.5).** per-param `Shard(0)` along `dp_shard`, hsdp when `dp_replicate > 1`. model-agnostic: the caller passes the unit modules (`units=model.blocks`), everything else is the root unit; fsdp reads no model attribute names. async gather with prefetch, reduce-scatter per microbatch, fp32 sharded masters + bf16 gathered buffers. uneven dims are zero-padded to equal shards. built from a meta-device model it allocates only this rank's shards (`finish_init()` after the model's init). hooks stand down for activation checkpointing's forward re-run. not done: dedicated comm stream, flat per-unit buffers. `tests/fsdp2.py` (gloo, in ci) |
 | `parallelism/tensor_parallel.py` | **done (phase 4).** model-agnostic engine: column linears `Shard(0)`, row linears `Shard(1)`, one forward and one backward collective per region, vocab-parallel embedding / head, sequence parallel, grads of shared params all_reduced in `sync()`. the model supplies the plan (`Qwen3.tp_plan`). composes with ddp or fsdp on the dp axes. builds from a meta model, so no rank holds full weights. `tests/tensor_parallel.py` (gloo, in ci) |
-| `parallelism/{context_parallel,expert_parallel}.py` | empty stubs |
-| models | qwen3 dense (0.6B validated, per-block compile, ~13k tps on A40, 73.5k global on 8x A40); llama3 stubbed |
+| `parallelism/context_parallel.py` | not started (the empty stub was removed 11/19) |
+| models | qwen3 dense (0.6B validated, per-block compile, ~13k tps on A40, 73.5k global on 8x A40; 4x h100 nvl on cuda 13: 239k ddp, 245.5k fsdp micro 8 + bf16 reduce, 4B fsdp 50k — beats torchtitan, see TORCHTITAN_COMPARE.md); llama3 not started (M2; the empty stub was removed 11/19) |
 | trainer | single-gpu and dp through the same path (world_size=1 is not a special case). lifecycle build → parallelize → init → optimizer → data, so sharded init slots in without reordering. grad accumulation (`global_batch_size / (micro_batch_size × dp)` microbatches) and grad-norm clipping both land in `train_step`; `train_step` returns a metrics dict (loss, grad_norm). no eval loop, no metrics logger, `self.parallel` is DDP or FSDP behind one surface (`requires_sync`, `sync()`, `shard_dims`, `shard_dim_of`), so `train_step` and checkpointing never branch on the strategy. torch is seeded from `config.seed`: one shared seed through init, then a per-dp-rank stream (`seed + 1 + dp coord`) |
 | checkpointing | **done (phase 3; multi-axis layout 11/10).** shard layouts are a grid over one or more axes (dp_shard, tp), each piece a box of the full tensor, so any grid loads onto any other. per-step dirs, `resume: null \| "auto" \| <step>`, full state (model/optimizer/scheduler/dataloader/rng/config). sharded: one rank per shard writes `{model,optimizer}_shard{k}.pt`, load reshards any saved shard count onto the current layout (fsdp ↔ hsdp ↔ ddp) via mmap range reads. per-dp-rank dataloader and rng files. per-rank `.done{rank}of{world}` markers instead of a barrier. async by default (`checkpointing.async_save`): cpu snapshot, background-thread write. a mesh change needs `resume_dataloader: false`. the prefetcher's held batch is saved, so resume no longer skips one. SIGTERM → checkpoint at the next log point → exit (second SIGTERM kills). tests: `tests/checkpointer.py`, `tests/sharded_checkpoint.py` (both in ci) |
 | objectives | AR CE, with the chunked fused-linear-CE landed and wired into `ARObjective` (default on). backward scales the stashed grads in place — see DEV_LOG 7/27 |
-| dataloader | streaming HF + packing (stream + best-fit-decreasing) + stateful + CUDA prefetcher; splits by the mesh's dp coordinate. packing allows cross-document attention (no doc mask); prefetcher skips one batch on resume |
+| dataloader | two paths, chosen by `data.name` / `data.mix`. **hf:** streaming HF + packing (stream + best-fit-decreasing) + stateful; splits by the mesh's dp coordinate. **mix (11/19):** pre-tokenized token shards (`tokenize_shards.py`) read by byte range from disk / http / `hf://`, mixed per step by a python schedule (`mixes/*.py`); exact per-step counts, rank-disjoint blocks, O(1) resume — see DATA_MIXING.md, `tests/mixture_loader.py` (ci). both feed the CUDA prefetcher. packing allows cross-document attention unless `doc_mask` is on (flex attention, qwen3 + olmo3; TORCHTITAN_COMPARE.md) |
 
 ### known correctness debt
 
+- **torch now comes from the cuda 13.0 index (11/19)**, +22% tok/s on h100
+  (TORCHTITAN_COMPARE.md). needs nvidia driver >= 580: the a40 / a6000
+  boxes the older configs target may not have it; drop `[tool.uv.sources]`
+  in pyproject there. `uv sync` drops wandb; use `uv sync --extra wandb`.
+- verified 11/19: mixture loader under the trainer (4×h100 ddp, 0.6B): a
+  resume from step 30 matches the uninterrupted run's losses to 4 decimals
+  through a schedule switch; `mix/*` reaches wandb. see DATA_MIXING.md.
 - fixed 11/10: prefetcher one-batch skip on resume. the held batch is saved
   as `prefetcher_dp{c}.pt` and handed back first on resume.
 - **the trainer's dataloader workers ignore SIGTERM** (so a group-wide
@@ -92,6 +100,11 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
 - fixed 11/10: a repeated SIGTERM within 5 s of the first counts as the same
   request (a group-wide signal plus torchrun's forwarded copy used to read as
   "kill now" and skip the checkpoint).
+- **tp collective_matmul hangs at 4B under fsdp 2×tp2 (sp_dim seq).**
+  reproduced twice, no error. guess: tp ring p2p and fsdp prefetch
+  all_gathers enqueued in different orders across ranks. see TP_H100.md.
+- **tp overlap ops are only tested in fp32 on cpu/gloo.** bf16 and real
+  concurrency are only covered by the 11/12 gpu sweep (losses matched).
 - **tp replicas are never re-synced.** params replicated over tp (embedding,
   block norms) stay equal only because peers compute identical grads from
   identical inputs. a nondeterministic kernel would let them drift.
@@ -476,10 +489,18 @@ a pure activation-memory win at zero extra comm volume.
   fsdp=2 x tp=2 with activation checkpointing gives the identical loss to
   without; SIGTERM -> checkpoint -> resume ends on the same loss as an
   uninterrupted run.
-- NOT measured: throughput. the gpus were shared with another job at 100%
-  util for every run. plain tp=2 on the tiny model ranged from 26k to 187k
-  tokens/s across runs (one gpu: 177k); vocab + sequence parallel ran at
-  ~16k. nothing here is a number to tune against. measure on idle gpus.
+- measured 11/12 on idle 4×H100 NVL (TP_H100.md): fsdp4 beats every tp
+  layout at 0.6B and 4B; best tp layout (fsdp 2×tp2, sp_dim batch) is −12%
+  at 0.6B, −7% at 4B. tp 4 crosses the pcie hop between nvlink pairs (−58%).
+- **sp_dim** (config `tp.sp_dim`, "seq" default | "batch"): shard sp along
+  the batch dim so gathers/scatters need no layout copies. +6-7% across
+  layouts; needs micro_batch % tp == 0.
+- **comm overlap** (config `tp.overlap`, "none" default | "backward" |
+  "collective_matmul", `parallelism/tp_overlap.py`): fused column (gather +
+  matmuls) and row (matmul + scatter) autograd ops; backward overlaps dX's
+  reduce_scatter with dW, collective_matmul rings every collective against
+  chunked matmuls. measured −1-5% and +~5 GiB on nvlink; off by default.
+  collective_matmul hangs at 4B fsdp×tp (see correctness debt).
 - not built: hsdp x tp is untested (should follow from fsdp x tp);
   tp-replicated params are never re-synced (see correctness debt).
 

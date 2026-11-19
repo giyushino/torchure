@@ -9,11 +9,9 @@ x 4, cross-checked against log timestamps). same box, same night.
 **the cuda build, not the framework or torch version, was the gap.** pypi's
 default torch 2.10 wheel is cuda 12.8; the same torch 2.10 built for cuda
 13.0 is +22% on 0.6B (195k -> 239k), from newer cublas/cudnn kernels.
-at equal attention work (plain causal), torchure on cuda 13 beats
-torchtitan main (torch 2.16 nightly, cuda 13.2) on every shape tried. with
-its default document masking torchtitan does less attention work and
-reaches 250k on 0.6B ddp, above torchure's best (245.5k): torchure is the
-faster stack, not yet the faster trainer.
+at equal attention work, torchure on cuda 13 beats torchtitan main (torch
+2.16 nightly, cuda 13.2) on every shape tried: plain causal everywhere, and
+with document masking on c4 (270k vs 250k, 0.6B ddp micro 4).
 
 | shape | torchure, cu128 (old pin) | torchure, cu130 (new pin) | best torchure config | torchtitan |
 |---|---|---|---|---|
@@ -64,8 +62,8 @@ its default regional compile: loss / activation / rope).
   less work, not a faster stack, so the table above patches its collator to
   emit positions 0..4095 per row (one "document" per row = plain causal over
   4096 with rope across docs, exactly torchure's semantics).
-- doc masking is a real feature torchure doesn't have (ROADMAP: no doc
-  mask). it'd also change the loss (no cross-doc attention).
+- torchure has doc masking since 11/19 (`doc_mask`, below): on c4,
+  torchure ddp micro 4 with doc_mask does 270k vs torchtitan's 250k.
 
 ## hill climb (on cu130): what moved and what didn't
 
@@ -105,3 +103,69 @@ removed empty stubs (`parallelism/context_parallel.py`, `models/llama3/`,
 `utils.load_json`, ddp's never-read `launched` flag, an unused test mesh
 class and two dead test lines. full cpu suite + gpu fused-CE test pass on
 the cu130 build.
+
+## document masking (11/19, later)
+
+`"doc_mask": true` (qwen3_dense, olmo3): `layers.doc_mask` turns each row's
+eos tokens into doc ids and per-doc positions, builds a flex attention
+BlockMask once per forward (one per sliding window size for olmo3), and the
+attention calls a compiled `flex_attention` with it. `tests/doc_mask.py`
+(ci): a packed row under doc_mask gives the same logits as each doc run
+alone (cpu: max diff 1e-6; gpu bf16: ~1.5% of the logit scale), for qwen3
+and for olmo3 with windows shorter than the row. the mixture loader's
+sources must end docs with `data.eos_token` (checked at startup).
+
+0.6B, 4x h100 nvl, 60 steps, mean of 21-60, same session:
+
+| layout | mb | climbmix causal | climbmix doc_mask | c4 doc_mask |
+|---|---|---|---|---|
+| ddp | 4 | 238.6k | 264.8k (+11%) | 269.5k |
+| fsdp, bf16 reduce | 8 | 245.9k | 276.0k (+12%) | 280.8k |
+
+torchtitan doc-masked (flex, c4, ddp micro 4): 250k. peak memory is
+unchanged (37.0 / 47.5 GiB). kimi has no doc_mask support (the trainer
+refuses it).
+
+other shapes, climbmix, causal -> doc_mask, same session:
+
+| run | causal | doc_mask | mem (GiB) |
+|---|---|---|---|
+| 4B fsdp micro 4, global 16, bf16 reduce | 50.7k | 54.1k (+7%) | 82.1 / 82.3 |
+| 0.6B fsdp 2 x tp 2, sp_dim batch, micro 16, bf16 reduce | 208.4k | 229.3k (+10%) | 49.7 / 50.5 |
+| 0.6B fsdp micro 8 + activation checkpointing | 198.4k | 221.1k (+11%) | 8.0 / 8.0 |
+| olmo3 7B fsdp micro 2, global 8, act ckpt (window 4096 = full at seq 4096) | 24.5k | 24.8k (+1%) | 31.5 / 31.6 |
+| olmo3 7B, same, sliding_window 1024 | 22.0k | 25.2k (+15%) | 31.6 / 31.6 |
+
+(olmo3 runs are 30 steps, tps at step 30.) the 7B gains little: at
+d=4096 attention is a small share of the step. its windowed causal path
+builds a dense S x S bool mask for sdpa, so flex's block-sparse window is
+the bigger win there. activation checkpointing with doc_mask gives the
+same loss to 4 decimals as without it, every logged step through 60.
+
+tp is covered by `tests/tensor_parallel.py` (3 doc-mask scenarios: tp,
+fsdp x tp + vocab + sp, batch-sp; forward, grads, act ckpt, training,
+checkpoint, meta init all match the single-process model). those run on
+cpu, where `masked_attention` falls back to sdpa with the same mask made
+dense: compiled flex backward fails on cpu in torch 2.10 (inductor
+IndexError, even with no mask). the flex kernel itself is checked on gpu by
+`tests/doc_mask.py`.
+
+## nanochat (11/19)
+
+karpathy/nanochat @ 92d63d4, its own env (torch 2.9.1, FA3 via `kernels`),
+`base_train` on 4 gpus, 60 iterations, mean of 21-60. its model is not
+qwen3 (relu^2 mlp, value embeddings, 32k vocab, muon), so compare mfu, each
+from the model's own `6N + 12·L·H·head_dim·seq` flops/token:
+
+| run | flops/token | tok/s | mfu |
+|---|---|---|---|
+| nanochat d28 x 1024, seq 4096, full attn, batch 32x4096, cu128 | 3.72e9 | 376.1k | 41.9% |
+| same, torch 2.9.1 cu130 | 3.72e9 | 378.0k | 42.2% |
+| nanochat d24 defaults (seq 2048, SSSL windows, 1M batch) | 4.78e9 | 295.4k | 42.2% |
+| torchure qwen3 0.6B ddp micro 4 | 6.39e9 | 239.2k | 45.8% |
+| torchure qwen3 0.6B fsdp micro 8, bf16 reduce | 6.39e9 | 245.5k | 47.0% |
+
+nanochat gets nothing from cuda 13 (+0.5%): it runs attention in FA3, not
+cudnn sdpa, which supports cudnn's attention kernels being much of
+torchure's cu130 gain. its mfu also pays for muon's newton-schulz, which the
+flop count doesn't credit.
