@@ -43,6 +43,12 @@ files in `configs/` only state what differs from `qwen3_dense_climbmix.json`.
 holds a slice of every layer's experts and reads its own data, and tokens
 travel to the experts. see `configs/kimi_k31_4b_climbmix_fsdp_ep.json`.
 
+experimental architectures (see `notes/EXPERIMENTAL_ARCHS.md`): a masked
+diffusion lm (`qwen3_diffusion_climbmix.json`: `causal: false` plus the
+`masked_diffusion` objective; sample with `torchure.inference.diffusion_generate`),
+a looped transformer (`looped_qwen3_climbmix.json`), and a qwen3 + siglip vlm
+on COCO captions (`qwen3_vl_coco.json`, needs `uv sync --extra vision`).
+
 `torchure.inference.export` turns any checkpoint, however it was sharded,
 into one plain state_dict file.
 

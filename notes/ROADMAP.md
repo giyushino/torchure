@@ -123,6 +123,10 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
   isn't one, and sequential A/B runs inherit each other's thermal state. see
   CHANGES.md 7/30 for the methodology fix; this also means some of the 8-gpu
   scaling gap in DDP.md is thermal, not comm.
+- **experimental archs (EXPERIMENTAL_ARCHS.md)**: `eval_ppl.py` reports a
+  meaningless number on a masked-diffusion checkpoint; the vlm's vision
+  tower is in fsdp's root unit and uncompiled; vlm + tp is unsupported. new
+  models were only tested multi-rank on gloo/cpu.
 - fixed 7/27: norm weights were bf16 *parameters*, so AdamW's updates rounded
   to nothing and the gains never moved. see DEV_LOG — the CHANGES.md numbers
   were all measured with them frozen and want a re-run.
@@ -650,7 +654,10 @@ already exists), greedy/top-p sampler, a small eval loop (held-out val loss
 per N steps, rank-0 only at first, dp-sharded later). deliberately minimal —
 no serving ambitions.
 
-**M6 — masked-diffusion LM (DLLM).** the objective abstraction in
+**M6 — masked-diffusion LM (DLLM).** **landed on `claude/experimental-arch`
+(11/19)**: `causal` flag, `objectives/masked_diffusion.py`, weighted fused
+loss, llada sampler. see EXPERIMENTAL_ARCHS.md; diffusion eval (ELBO) still
+owed. original plan: the objective abstraction in
 `torchure/objectives/` was built for this moment:
 - model: needs bidirectional attention — `is_causal=False` path through sdpa
   (the mask plumbing exists; add a `causal: bool` to the model config);
@@ -663,6 +670,15 @@ no serving ambitions.
 - sampling: iterative unmasking loop (uses M5's machinery);
 - parallelism note: everything except cp works unchanged; cp's causal zigzag
   balancing becomes plain contiguous sharding for bidirectional attention.
+
+**M8 — looped transformer.** landed on `claude/experimental-arch` (11/19):
+prelude / shared core x num_loops / coda, core = one fsdp unit + one compile
+graph. passes the full tp suite. no random-depth training yet.
+
+**M9 — vlm (qwen3 + siglip).** landed on `claude/experimental-arch` (11/19):
+llava-style projector with pixel shuffle, image-caption dataloader
+(`data.image_field`). no tp, no pretrained weights, no packing. see
+EXPERIMENTAL_ARCHS.md open problems.
 
 **M7 — continuous-diffusion LM (stretch/research).** embedding-space
 diffusion. keep as an explicit maybe: it stresses the objective abstraction
