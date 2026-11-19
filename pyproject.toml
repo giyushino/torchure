@@ -31,6 +31,8 @@ torch = { index = "pytorch-cu130" }
 
 [project.optional-dependencies]
 wandb = ["wandb>=0.16"]
+# image decoding for vlm data (data.image_field)
+vision = ["pillow"]
 
 [build-system]
 requires = ["setuptools>=61"]

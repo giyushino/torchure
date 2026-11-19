@@ -92,6 +92,7 @@ def _check_shards(num_shards: int, dp_size: int, num_workers: int) -> None:
 def build_dataloader(
     data_cfg, tokenizer: Tokenizer, ignore_id: int, dp_rank: int, dp_size: int,
     shield_sigterm: bool = False, total_steps: int | None = None,
+    vision: tuple[int, int] | None = None,
 ):
     """
     `data.mix` set: a MixtureLoader over pre-tokenized sources (mixture.py),
@@ -99,13 +100,16 @@ def build_dataloader(
     """
     if data_cfg["mix"] is not None:
         assert total_steps is not None, "a mix schedule needs total_steps"
+        assert data_cfg["image_field"] is None, "data.mix doesn't support image-text rows"
         return MixtureLoader(data_cfg, dp_rank, dp_size, total_steps, data_cfg["tokenizer"])
-    return build_hf_dataloader(data_cfg, tokenizer, ignore_id, dp_rank, dp_size, shield_sigterm)
+    return build_hf_dataloader(
+        data_cfg, tokenizer, ignore_id, dp_rank, dp_size, shield_sigterm, vision
+    )
 
 
 def build_hf_dataloader(
     data_cfg, tokenizer: Tokenizer, ignore_id: int, dp_rank: int, dp_size: int,
-    shield_sigterm: bool = False,
+    shield_sigterm: bool = False, vision: tuple[int, int] | None = None,
 ):
     """
     a streaming hf dataset -> shuffle -> this dp rank's shards -> tokenize and
@@ -114,7 +118,40 @@ def build_hf_dataloader(
     shield_sigterm: workers ignore SIGTERM (see _ignore_sigterm). only for a
     caller that calls shutdown_workers() before exit; off by default so a
     plain script can't hang at exit.
+
+    vision: (image_size, num_image_tokens) of a vlm. needed when the config
+    sets data.image_field, which switches to image-caption rows (dataloader/vlm.py).
     """
+    dataset = stream_dataset(data_cfg, dp_rank, dp_size)
+
+    # eos and pad must be distinct ids (see packers.py)
+    eos_id = tokenizer.token_to_id(data_cfg["eos_token"])
+    pad_id = tokenizer.token_to_id(data_cfg["pad_token"])
+    assert eos_id is not None, f"eos_token {data_cfg['eos_token']!r} not in tokenizer vocab"
+    assert pad_id is not None, f"pad_token {data_cfg['pad_token']!r} not in tokenizer vocab"
+
+    if data_cfg["image_field"] is not None:
+        from torchure.dataloader.vlm import ImageTextCollator
+
+        assert vision is not None, "data.image_field is set, but the model has no vision tower"
+        image_size, num_image_tokens = vision
+        collate_fn = ImageTextCollator(
+            tokenizer, ignore_id, data_cfg["seq_len"], eos_id, pad_id,
+            image_size, num_image_tokens,
+        )
+        return make_loader(dataset, data_cfg, collate_fn, shield_sigterm)
+
+    packer = ListPacker(tokenizer, data_cfg["seq_len"], eos_id, pad_id)
+    dataset = dataset.map(
+        packer, batched=True,
+        batch_size=data_cfg["pack_batch"],
+        remove_columns=dataset.column_names,
+    )
+    return make_loader(dataset, data_cfg, Collator(tokenizer, ignore_id), shield_sigterm)
+
+
+def stream_dataset(data_cfg, dp_rank: int, dp_size: int):
+    """the configured hf dataset, streamed, shuffled, and cut to this dp rank's shards."""
     # an explicit split returns an IterableDataset (not a Dict), which
     # split_dataset_by_node needs. `config` is the hf subset name, or None.
     # TODO: doesn't handle hf datasets stored as json
@@ -129,34 +166,23 @@ def build_hf_dataloader(
         _check_shards(dataset.num_shards, dp_size, data_cfg["num_workers"])
 
     # rename_column rather than a lambda .map, since lambdas don't pickle to workers
-    text_field = data_cfg["text_field"]
-    if text_field != "text":
-        dataset = dataset.rename_column(text_field, "text")
+    for field, name in ((data_cfg["text_field"], "text"), (data_cfg["image_field"], "image")):
+        if field is not None and field != name:
+            dataset = dataset.rename_column(field, name)
 
     dataset = dataset.shuffle(buffer_size=data_cfg["shuffle_buffer"], seed=data_cfg["seed"])
     # tp/cp peers share a dp_rank, so they read the same shards
-    dataset = split_dataset_by_node(dataset, rank=dp_rank, world_size=dp_size)
+    return split_dataset_by_node(dataset, rank=dp_rank, world_size=dp_size)
 
-    # eos and pad must be distinct ids (see packers.py)
-    eos_id = tokenizer.token_to_id(data_cfg["eos_token"])
-    pad_id = tokenizer.token_to_id(data_cfg["pad_token"])
-    assert eos_id is not None, f"eos_token {data_cfg['eos_token']!r} not in tokenizer vocab"
-    assert pad_id is not None, f"pad_token {data_cfg['pad_token']!r} not in tokenizer vocab"
 
-    packer = ListPacker(tokenizer, data_cfg["seq_len"], eos_id, pad_id)
-    dataset = dataset.map(
-        packer, batched=True,
-        batch_size=data_cfg["pack_batch"],
-        remove_columns=dataset.column_names,
-    )
-
+def make_loader(dataset, data_cfg, collate_fn, shield_sigterm: bool) -> StatefulDataLoader:
     # micro batches only; grad accumulation is the trainer's job
     num_workers = data_cfg["num_workers"]
     return StatefulDataLoader(
         dataset,
         batch_size=data_cfg["micro_batch_size"],
         num_workers=num_workers,
-        collate_fn=Collator(tokenizer, ignore_id),
+        collate_fn=collate_fn,
         worker_init_fn=_ignore_sigterm if shield_sigterm else None,
         persistent_workers=num_workers > 0,
         # fork can deadlock on fsspec's background threads inherited from the parent

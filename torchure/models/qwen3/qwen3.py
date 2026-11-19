@@ -36,6 +36,7 @@ class Qwen3GroupQueryAttention(nn.Module):
         num_kv_heads: int = 8,
         head_dim: int | None = None,
         norm_eps: float = 1e-6,
+        causal: bool = True,
     ):
         super().__init__()
         assert num_heads % num_kv_heads == 0 and num_heads >= num_kv_heads, \
@@ -46,6 +47,8 @@ class Qwen3GroupQueryAttention(nn.Module):
         # Qwen3 decouples head_dim from emb_dim / num_heads
         self.head_dim = head_dim if head_dim is not None else emb_dim // num_heads
         self.num_kv_heads = num_kv_heads
+        # False for bidirectional attention (diffusion lms)
+        self.causal = causal
 
         q_out = num_heads * self.head_dim
         kv_out = num_kv_heads * self.head_dim
@@ -78,14 +81,17 @@ class Qwen3GroupQueryAttention(nn.Module):
 
         # no mask (packed training): is_causal lets sdpa use the flash kernel
         if attention_mask is None:
-            return F.scaled_dot_product_attention(Q, K, V, is_causal=True, enable_gqa=True)
+            return F.scaled_dot_product_attention(
+                Q, K, V, is_causal=self.causal, enable_gqa=True
+            )
 
         # padding: is_causal can't be combined with a mask, so build one bool
         # mask (True = attend)
-        S = Q.size(-2)
-        causal = torch.ones(S, S, dtype=torch.bool, device=Q.device).tril()
-        key_keep = attention_mask[:, None, None, :].bool()      # (B,1,1,S)
-        attn_mask = causal[None, None] & key_keep               # (B,1,S,S)
+        attn_mask = attention_mask[:, None, None, :].bool()    # (B,1,1,S)
+        if self.causal:
+            S = Q.size(-2)
+            causal = torch.ones(S, S, dtype=torch.bool, device=Q.device).tril()
+            attn_mask = causal[None, None] & attn_mask          # (B,1,S,S)
         return F.scaled_dot_product_attention(Q, K, V, attn_mask=attn_mask, enable_gqa=True)
 
     def forward(
@@ -115,9 +121,12 @@ class Qwen3TransformerBlock(nn.Module):
         head_dim: int | None = None,
         ffn_dim: int | None = None,
         norm_eps: float = 1e-6,
+        causal: bool = True,
     ):
         super().__init__()
-        self.gqa = Qwen3GroupQueryAttention(num_heads, emb_dim, num_kv_heads, head_dim, norm_eps)
+        self.gqa = Qwen3GroupQueryAttention(
+            num_heads, emb_dim, num_kv_heads, head_dim, norm_eps, causal
+        )
         self.norm1 = nn.RMSNorm(emb_dim, eps=norm_eps)
         self.norm2 = nn.RMSNorm(emb_dim, eps=norm_eps)
 
@@ -149,14 +158,23 @@ class Qwen3(nn.Module):
         ffn_dim: int | None = None,
         # explicit: nn.RMSNorm's default eps depends on input dtype
         norm_eps: float = 1e-6,
+        # False: bidirectional attention, for the masked diffusion objective
+        causal: bool = True,
     ):
         super().__init__()
+        self.emb_dim = emb_dim
+        self.causal = causal
         self.token_emb = nn.Embedding(vocab_size, emb_dim)
         self.rope = Qwen3RotaryEmbedding(head_dim)
         self.blocks = nn.ModuleList(
-            Qwen3TransformerBlock(num_heads, emb_dim, num_kv_heads, head_dim, ffn_dim, norm_eps)
+            Qwen3TransformerBlock(
+                num_heads, emb_dim, num_kv_heads, head_dim, ffn_dim, norm_eps, causal
+            )
             for _ in range(num_layers)
         )
+        # blocks applied per forward; more than len(self.blocks) when a
+        # subclass reuses blocks (looped). sets the residual init scale
+        self.depth = num_layers
         self.norm = nn.RMSNorm(emb_dim, eps=norm_eps)
         self.lm_head = nn.Linear(emb_dim, vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight
@@ -187,8 +205,8 @@ class Qwen3(nn.Module):
             elif isinstance(module, nn.RMSNorm) and module.weight is not None:
                 nn.init.ones_(module.weight)
 
-        residual_scale = (2 * len(self.blocks)) ** -0.5
-        for block in self.blocks:
+        residual_scale = (2 * self.depth) ** -0.5
+        for block in self.transformer_blocks():
             block.gqa.o_proj.weight.data.mul_(residual_scale)
             block.ffn.down_proj.weight.data.mul_(residual_scale)
 
@@ -208,7 +226,7 @@ class Qwen3(nn.Module):
         rows; otherwise it is replicated. the norms on the residual stream
         are always replicated.
         """
-        gqa = self.blocks[0].gqa
+        gqa = self.transformer_blocks()[0].gqa
         assert gqa.num_kv_heads % tp_size == 0, (
             f"tp={tp_size} must divide num_kv_heads={gqa.num_kv_heads}: shards "
             "hold whole kv heads together with their q heads"
@@ -220,7 +238,7 @@ class Qwen3(nn.Module):
             "vocab": [self.token_emb, self.lm_head] if vocab_parallel else [],
             "seq_local": [self.norm],
         }
-        for block in self.blocks:
+        for block in self.transformer_blocks():
             gqa, ffn = block.gqa, block.ffn
             plan["column"] += [gqa.q_proj, gqa.k_proj, gqa.v_proj, ffn.gate_proj, ffn.up_proj]
             plan["row"] += [gqa.o_proj, ffn.down_proj]
@@ -229,29 +247,39 @@ class Qwen3(nn.Module):
             plan["seq_local"] += [block.norm1, block.norm2]
         return plan
 
+    def transformer_blocks(self) -> list[Qwen3TransformerBlock]:
+        """every distinct transformer block (what init and tp touch)."""
+        return list(self.blocks)
+
+    def run_block(self, block: nn.Module, x: torch.Tensor, *args) -> torch.Tensor:
+        if self.activation_checkpointing and torch.is_grad_enabled():
+            return checkpoint(block, x, *args, use_reentrant=False)
+        return block(x, *args)
+
     def forward(
         self,
         x: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         return_hidden_states: bool = False,
         return_final_hidden: bool = False,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """
+        x: token ids (B, S). inputs_embeds, if given, replaces token_emb(x)
+        (the vlm splices image features in); x still sets the positions.
+        """
         if self.doc_mask_eos is not None and attention_mask is None:
             position_ids, masks = doc_mask(x, self.doc_mask_eos)
             attention_mask, cacheable = masks[None], False
         else:
             position_ids, attention_mask, cacheable = positions(x, attention_mask)
 
-        x = self.token_emb(x)
+        x = self.token_emb(x) if inputs_embeds is None else inputs_embeds
         cos, sin = self.rope(position_ids, cacheable=cacheable)
         hidden_states: list[torch.Tensor] = [x] if return_hidden_states else []
 
-        use_checkpoint = self.activation_checkpointing and torch.is_grad_enabled()
         for block in self.blocks:
-            if use_checkpoint:
-                x = checkpoint(block, x, cos, sin, attention_mask, use_reentrant=False)
-            else:
-                x = block(x, cos, sin, attention_mask)
+            x = self.run_block(block, x, cos, sin, attention_mask)
             if return_hidden_states:
                 hidden_states.append(x)
 

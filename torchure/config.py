@@ -68,6 +68,8 @@ SCHEMA = {
         "eos_token": REQUIRED,
         "pad_token": REQUIRED,
         "text_field": "text",
+        # set for image-caption data (a vlm): the column holding the image
+        "image_field": None,
         "shuffle_buffer": 1000,
         "seed": 42,
         "num_workers": 4,
