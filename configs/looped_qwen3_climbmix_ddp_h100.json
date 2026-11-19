@@ -1,0 +1,25 @@
+{
+  "base": "looped_qwen3_climbmix.json",
+  "mesh": {
+    "dp": 4
+  },
+  "optimizer": {
+    "scheduler": {
+      "warmup_ratio": 0.01,
+      "total_steps": 42000
+    }
+  },
+  "checkpointing": {
+    "save_steps": 6000
+  },
+  "wandb": {
+    "enabled": true,
+    "project": "torchure",
+    "entity": null
+  },
+  "data": {
+    "global_batch_size": 32,
+    "micro_batch_size": 4
+  },
+  "run_name": "looped_qwen3_climbmix_ddp_h100"
+}

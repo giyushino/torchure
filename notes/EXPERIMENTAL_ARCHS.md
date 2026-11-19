@@ -87,6 +87,33 @@ gpu smoke, 1x H100 NVL, `--steps N`, compile on, bf16, ClimbMix seq 4096 mb 2
 - loss going down is a wiring check, not a quality claim. none of these were
   trained long enough to compare against AR.
 
+## 4x H100 NVL, cu130 (11/19)
+
+ddp, dp 4, `configs/*_ddp_h100.json`, the same shape as the AR baseline
+(micro 4, global 32, seq 4096; vlm: micro 64, global 256, seq 128). protocol
+from TORCHTITAN_COMPARE.md: `--steps 60`, mean tps over steps 21–60, torch
+2.10.0+cu130; run-to-run spread is about ±1k.
+
+| run | params | tok/s | vs AR | peak GiB |
+|---|---|---|---|---|
+| qwen3 AR baseline | 574M | 238,184 | — | 36.9 |
+| diffusion | 574M | 199,416 | −16.3% | 36.9 |
+| looped (depth 28) | 275M | 248,884 | +4.5% | 31.4 |
+| vlm | 664M | 172,258* | — | 29.9 |
+
+\* includes padding and image tokens; ~5.3 steps/s x 256 = ~1,350 images/s.
+
+- AR reproduces the 239.2k baseline, so the shared qwen3 changes cost nothing.
+- diffusion's gap shrank from ~20% (1 gpu, cu128) to 16%: the extra
+  attention work is a smaller share once ddp comm is in the step.
+- looped is faster than AR at the same depth because it all-reduces 48% of
+  the gradients.
+- vlm scales ~77% from 1 gpu, but that compares a cu128 1-gpu run with a
+  cu130 4-gpu run. likely cause: a short step (32k tokens) with a full 664M
+  gradient all-reduce each step. not profiled. COCO's 182 shards don't divide
+  over 4 ranks, so each rank reads the whole stream; a rank's loader still
+  delivers ~1,000 images/s (measured), well above the ~340/s it needs.
+
 ## open problems / known gaps
 
 - **vlm + tensor parallel: not supported** (`tp_plan` raises). tp's embedding
@@ -107,5 +134,5 @@ gpu smoke, 1x H100 NVL, `--steps N`, compile on, bf16, ClimbMix seq 4096 mb 2
   zigzag balancing is unnecessary for bidirectional attention.
 - **looped**: no random-depth training or state injection (Geiping et al.),
   so extrapolating to more loops at inference is not expected to help.
-- multi-gpu runs of the new models were only tested on gloo/cpu: the gpus
-  were in use by benchmarking.
+- multi-gpu: only ddp was run on gpus. fsdp and tp for the new models were
+  only tested on gloo/cpu.
