@@ -1,7 +1,7 @@
 # torchure
 
-a pure pytorch training stack for autoregressive transformer LLMs. no
-megatron, deepspeed, accelerate, or liger: the device mesh, collectives, and
+A pure pytorch training stack for autoregressive transformer LLMs. No
+megatron, deepspeed, accelerate, or liger. the device mesh, collectives, and
 parallelism are implemented here and tested against pytorch's own.
 
 ## usage
@@ -10,8 +10,14 @@ one json config drives a run, from a single gpu up to multi-node data parallel
 (ddp, fsdp, hsdp), with no code changes to scale up or down. see `configs/`
 for examples and `notes/` for optimization history and the roadmap.
 
+torch is installed from pytorch's cuda 13.0 index (`[tool.uv.sources]` in
+`pyproject.toml`), which needs nvidia driver >= 580. on an older driver,
+delete that block and run `uv lock` to get pypi's default cuda 12.8 build
+(about 20% slower on h100, see below).
+
 ```bash
 uv pip install -e .            # add ".[wandb]" for wandb logging
+# or: uv sync --extra wandb    (plain `uv sync` drops wandb)
 
 # single gpu
 uv run -m torchure.train.train --config configs/qwen3_dense_climbmix.json
@@ -42,7 +48,29 @@ into one plain state_dict file.
 
 ## performance
 
-all numbers are bf16, seq_len 4096, global tokens/sec.
+all numbers are bf16, seq_len 4096, global tokens/sec, plain causal
+attention (no document masking).
+
+### current build (torch 2.10 cu130), 4x H100 NVL
+
+global batch 32 (0.6B) / 16 (4B), no grad accumulation. torchtitan is main
+@ 1ae2914 on torch 2.16 nightly (cu132), with its collator patched to plain
+causal so both do the same attention work. details:
+`notes/TORCHTITAN_COMPARE.md`.
+
+| model, layout | mb | torchure, cu128 | torchure, cu130 | + bf16 grad reduce | torchtitan |
+|---------------|----|-----------------|-----------------|--------------------|------------|
+| 0.6B, ddp | 4 | 196k | 239k | 243k | 213k |
+| 0.6B, fsdp | 4 | 186k | 227k | 232k | 199k |
+| 0.6B, fsdp | 8 | - | 243k | **246k** | 218k |
+| 4B, fsdp | 4 | 45.5k | 49.5k | **50.2k** | 46.6k |
+
+the cuda 12.8 -> 13.0 wheel (same torch 2.10) is the whole jump: the torch
+version itself makes no difference. torchtitan's default document masking
+skips attention between packed documents and reaches 250k on 0.6B ddp
+(c4's short docs); torchure has no document masking yet.
+
+the tables below were measured on the cuda 12.8 build.
 
 ### ddp vs fsdp vs hsdp, 2x8 H100 SXM (infiniband)
 
@@ -121,9 +149,3 @@ collectives need no layout copies (needs micro batch % tp == 0).
 | tp 4 | 16 | oom |
 | tp 4 (2x accum) | 8 | 23.0k / 21.6% / 63.2 GiB |
 
-takeaways: on one node, fsdp over all gpus beats every tp layout at these
-sizes (tp shards model state no further than fsdp already does; it only
-helps once one sequence's activations at mb 1 don't fit). `sp_dim: "batch"`
-is a free +6-7% for tp. the overlap modes (`tp.overlap`) lose 1-5% and ~5 GiB
-here: nvlink leaves little comm to hide. tp 4 spans the pcie hop between the
-nvlink pairs.
