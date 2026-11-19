@@ -225,3 +225,5 @@ checkpoints/
 # profiler chrome traces -- ~11MB each, regenerate with
 # torchure/train/profile_overlap.py rather than committing them
 traces/
+# pre-tokenized sources (tokenize_shards.py)
+data/
