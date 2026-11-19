@@ -51,6 +51,8 @@ jobs:
         run: uv run --no-sync tests/dataloader_packing.py --check
       - name: mixture loader (schedule, rank split, resume, http range reads)
         run: uv run --no-sync tests/mixture_loader.py
+      - name: doc mask (packed row == each doc alone, qwen3 + olmo3 windows)
+        run: uv run --no-sync tests/doc_mask.py
       - name: checkpointer roundtrip
         run: uv run --no-sync tests/checkpointer.py
       - name: sharded checkpoint resharding (gloo, up to 4 ranks)
