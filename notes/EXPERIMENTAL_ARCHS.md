@@ -114,6 +114,20 @@ from TORCHTITAN_COMPARE.md: `--steps 60`, mean tps over steps 21–60, torch
   over 4 ranks, so each rank reads the whole stream; a rank's loader still
   delivers ~1,000 images/s (measured), well above the ~340/s it needs.
 
+### vlm micro batch 64 -> 128
+
+| vlm micro (global) | tok/s | images/s | peak GiB |
+|---|---|---|---|
+| 64 (256) | 172,258 | ~1,350 | 29.9 |
+| **128 (512)** | **216,110** | **~1,690** | 45.1 |
+
++25%, kept in `qwen3_vl_coco_ddp_h100.json`. the vlm's 32k-token step was
+dominated by per-step costs (full 664M-param grad all-reduce, adamw);
+doubling the step amortizes them. this is a global batch change (256 -> 512
+captions), not only a throughput knob. the text-only archs don't have this
+headroom: ddp micro 4 -> 8 on the 0.6B AR model is noise
+(TORCHTITAN_COMPARE.md), with gemm + attention ~76% of the step.
+
 ## open problems / known gaps
 
 - **vlm + tensor parallel: not supported** (`tp_plan` raises). tp's embedding

@@ -18,8 +18,8 @@
     "entity": null
   },
   "data": {
-    "global_batch_size": 256,
-    "micro_batch_size": 64
+    "global_batch_size": 512,
+    "micro_batch_size": 128
   },
   "run_name": "qwen3_vl_coco_ddp_h100"
 }
