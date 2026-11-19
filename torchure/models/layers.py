@@ -1,5 +1,6 @@
 """
-building blocks the model files share: rope, swiglu, the position-id rule.
+building blocks the model files share: rope, swiglu, the position-id rule,
+document masking.
 
 attribute names inside these modules are part of every model's state_dict
 (`ffn.gate_proj.weight`, ...), so renaming one breaks existing checkpoints.
@@ -8,6 +9,12 @@ attribute names inside these modules are part of every model's state_dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    create_block_mask,
+    create_mask,
+    flex_attention,
+)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -96,6 +103,52 @@ def positions(
     attention_mask = attention_mask.bool()
     position_ids = attention_mask.long().cumsum(dim=1) - 1
     return position_ids.masked_fill(~attention_mask, 0), attention_mask, False
+
+
+def doc_mask(
+    ids: torch.Tensor, eos_id: int, windows=(None,)
+) -> tuple[torch.Tensor, dict[int | None, BlockMask]]:
+    """
+    document masking for packed rows: each token attends only to earlier
+    tokens of its own document, and positions restart at 0 per document.
+    a document ends at (and includes) an eos; a row starting mid-document
+    numbers that fragment from 0 too.
+
+    returns (position_ids, {window: BlockMask}) for each sliding window size
+    in `windows` (None = no window). built once per forward, outside the
+    compiled blocks, and shared by every layer.
+    """
+    B, S = ids.shape
+    starts = torch.ones_like(ids, dtype=torch.bool)
+    starts[:, 1:] = ids[:, :-1] == eos_id
+    doc = starts.cumsum(dim=1)
+    idx = torch.arange(S, device=ids.device).expand(B, S)
+    position_ids = idx - torch.where(starts, idx, 0).cummax(dim=1).values
+
+    def mask_for(window):
+        def mask_mod(b, h, q, kv):
+            keep = (doc[b, q] == doc[b, kv]) & (q >= kv)
+            return keep if window is None else keep & (q - kv < window)
+        return create_block_mask(mask_mod, B, None, S, S, device=ids.device, _compile=True)
+
+    return position_ids, {w: mask_for(w) for w in windows}
+
+
+# compiled once: eager flex_attention materializes the full score matrix
+_flex_attention = torch.compile(flex_attention, dynamic=False)
+
+
+def masked_attention(
+    Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, block_mask: BlockMask
+) -> torch.Tensor:
+    """flex attention under a doc_mask BlockMask; (B, H, S, D) in and out, gqa ok."""
+    gqa = Q.size(1) != K.size(1)
+    if Q.device.type == "cpu":
+        # compiled flex backward fails on cpu (torch 2.10): same mask, dense, through sdpa
+        B, _, S, _ = Q.shape
+        dense = create_mask(block_mask.mask_mod, B, 1, S, S, device=Q.device)
+        return F.scaled_dot_product_attention(Q, K, V, attn_mask=dense, enable_gqa=gqa)
+    return _flex_attention(Q, K, V, block_mask=block_mask, enable_gqa=gqa)
 
 
 def swiglu_ffn_dim(emb_dim: int) -> int:
