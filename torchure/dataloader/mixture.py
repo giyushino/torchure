@@ -224,6 +224,7 @@ class MixtureLoader:
             )
         eos = {src.eos_id for src in self.sources.values()}
         assert len(eos) == 1, f"sources disagree on eos_id: {eos}"
+        self.eos_id = eos.pop()
         self.streams = {
             name: SourceStream(src, name, self.seed, dp_rank, dp_size,
                                data_cfg["window_blocks"], self.pool)

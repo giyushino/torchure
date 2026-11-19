@@ -12,7 +12,7 @@
   },
   "data": {
     "global_batch_size": 32,
-    "micro_batch_size": 4
+    "micro_batch_size": 8
   },
   "fsdp": {
     "param_dtype": "bfloat16",

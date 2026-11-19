@@ -92,6 +92,12 @@ class Trainer:
 
         self.model = self._build_model()
         self.model.activation_checkpointing = self.config["activation_checkpointing"]
+        self.eos_id = self.tokenizer.token_to_id(self.config["data"]["eos_token"])
+        if self.config["doc_mask"]:
+            assert hasattr(self.model, "doc_mask_eos"), (
+                f"doc_mask: model {self.config['model']['name']!r} doesn't support document masking"
+            )
+            self.model.doc_mask_eos = self.eos_id
         # each data rank has own random stream, useful for random
         # dropout and masking. tp peers share dp coord
         torch.manual_seed(self.seed + 1 + self.mesh.coordinate("dp"))
@@ -110,6 +116,11 @@ class Trainer:
         self.dataloader = self._build_dataloader()
         # a mix script's loader (dataloader/mixture.py) rather than the hf stream
         self.mixture = isinstance(self.dataloader, MixtureLoader)
+        if self.mixture:
+            assert self.dataloader.eos_id == self.eos_id, (
+                f"mix sources end docs with token {self.dataloader.eos_id}, but "
+                f"data.eos_token is {self.eos_id}"
+            )
         self.global_batch_size = self.config["data"]["global_batch_size"]
         self.micro_batch_size = self.config["data"]["micro_batch_size"]
 

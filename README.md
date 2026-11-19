@@ -49,7 +49,7 @@ into one plain state_dict file.
 ## performance
 
 all numbers are bf16, seq_len 4096, global tokens/sec, plain causal
-attention (no document masking).
+attention unless noted.
 
 ### current build (torch 2.10 cu130), 4x H100 NVL
 
@@ -66,9 +66,26 @@ causal so both do the same attention work. details:
 | 4B, fsdp | 4 | 45.5k | 49.5k | **50.2k** | 46.6k |
 
 the cuda 12.8 -> 13.0 wheel (same torch 2.10) is the whole jump: the torch
-version itself makes no difference. torchtitan's default document masking
-skips attention between packed documents and reaches 250k on 0.6B ddp
-(c4's short docs); torchure has no document masking yet.
+version itself makes no difference.
+
+**document masking** (`"doc_mask": true`: attend within documents only,
+flex attention, positions restart per doc) skips attention between packed
+documents, so it is faster on short-doc data. 0.6B, same box:
+
+| layout | mb | climbmix, causal | climbmix, doc_mask | c4, doc_mask | torchtitan, c4, doc mask |
+|--------|----|------------------|--------------------|--------------|--------------------------|
+| ddp | 4 | 239k | 265k | 270k | 250k |
+| fsdp, bf16 reduce | 8 | 246k | 276k | **281k** | - |
+
+doc masking changes training (no cross-document attention), not just
+speed: loss curves aren't comparable with causal runs.
+
+**vs nanochat** (karpathy/nanochat, FA3, its own gpt + muon), 4x H100 NVL,
+mfu from each model's own `6N + 12·L·H·head_dim·seq` flops/token: nanochat
+at a matching 28-layer, 1024-wide, seq 4096 shape does 376k tok/s at 42.0%
+mfu (its default d24 at seq 2048: 295k, 42.2%); torchure qwen3 0.6B causal
+does 239k-246k at 45.8-47.0%. the tok/s gap is the models (qwen3's 152k
+vocab and 2x wider attention cost ~1.7x the flops per token), not the stack.
 
 the tables below were measured on the cuda 12.8 build.
 

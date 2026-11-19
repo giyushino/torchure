@@ -45,6 +45,9 @@ SCHEMA = {
     "compile": True,
     "compile_mode": "default",
     "activation_checkpointing": False,
+    # attend within documents only (flex attention, positions restart per
+    # doc); documents are split at data.eos_token. qwen3_dense and olmo3
+    "doc_mask": False,
     "log_every": 10,
     "optimizer": {
         "name": REQUIRED,
