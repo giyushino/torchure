@@ -17,6 +17,10 @@ lockstep by averaging grads across the axis after every backward.
   launches what is left with zeros for the missing grads. ranks may differ in
   which grads are missing: the fixed order keeps their collectives paired.
 
+- `reduce_dtype` (e.g. bf16) all-reduces a cast copy of each bucket and
+  copies the average back into the fp32 grads at `sync()`. half the bytes on
+  the wire for a rounding of the average; None reduces in the grad dtype.
+
 - `dim_of(param)` overrides the axis for individual params: expert parallel's
   expert weights are replicated over fewer ranks than the rest of the model.
   None (or an axis of size 1) means the param has no replicas to sync with.
@@ -43,7 +47,6 @@ class _Bucket:
         self.params = params
         self.dim = dim              # the mesh axis these grads are averaged over
         self.pending = len(params)  # params still owing a grad this backward
-        self.launched = False       # all-reduced already this step
         self.flat = None
         self.views = None
         if len(params) > 1:
@@ -64,12 +67,15 @@ class DDP:
         dim="dp",
         bucket_mb=25,
         dim_of: Callable[[nn.Parameter], str | None] | None = None,
+        reduce_dtype: torch.dtype | None = None,
     ):
         self.mesh = mesh
         self.dim = dim
         self.group_size = mesh.size(dim)
         self._dim_of_param = dim_of
-        self._works = []
+        self.reduce_dtype = reduce_dtype
+        # (work, reduced tensor, grad to copy it back into or None if in place)
+        self._works: list[tuple] = []
         self._next = 0  # index of the next bucket to launch this step
         self._buckets: list[_Bucket] = []
         self.requires_sync = True
@@ -153,8 +159,13 @@ class DDP:
             for param, view in zip(bucket.params, bucket.views, strict=True):
                 param.grad = view
             grad = bucket.flat
-        _, work = all_reduce(grad, self.mesh, bucket.dim, "avg", async_op=True)
-        self._works.append(work)
+        if self.reduce_dtype is not None and grad.dtype != self.reduce_dtype:
+            wire = grad.to(self.reduce_dtype)
+            _, work = all_reduce(wire, self.mesh, bucket.dim, "avg", async_op=True)
+            self._works.append((work, wire, grad))
+        else:
+            _, work = all_reduce(grad, self.mesh, bucket.dim, "avg", async_op=True)
+            self._works.append((work, grad, None))
 
     @property
     def shard_dims(self) -> tuple[str, ...]:
@@ -185,7 +196,9 @@ class DDP:
             "microbatch of an accumulation step, so its backward launches the reduces"
         )
         self._launch_ready(force=True)
-        for work in self._works:
+        for work, wire, grad in self._works:
             work.wait()
+            if grad is not None:
+                grad.copy_(wire)
         self._works.clear()
         self._next = 0

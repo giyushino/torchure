@@ -1,7 +1,7 @@
 """
 training orchestrator: build -> init -> parallelize -> compile -> optimizer -> data
 
-TODO: replace the @debug_time profiling decorators with a real profiler
+i want to replace @debug_time with a real profiler wrapper
 """
 
 import atexit
@@ -22,6 +22,7 @@ from torchure.config import load_config, validate
 from torchure.core.mesh import Mesh, build_mesh
 from torchure.core.meta import materialize
 from torchure.dataloader.builder import build_dataloader, shutdown_workers
+from torchure.dataloader.mixture import MixtureLoader
 from torchure.dataloader.prefetcher import CUDAPrefetcher
 from torchure.models.builder import build_model
 from torchure.objectives.builder import build_objective
@@ -44,8 +45,8 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
-# fsdp mixed-precision dtypes by config name. None: no cast, gathered params
-# stay fp32 (for debugging numerics)
+# fsdp mixed-precision dtypes by config name
+# None: no cast, gathered params stay fp32
 _DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
@@ -63,26 +64,25 @@ class Trainer:
         world_size: int,
         benchmark: bool = False,
     ):
-        # TODO: assert model and tokenizer vocab sizes match
         self.config = load_config(train_config_path)
         validate(self.config, world_size)
         self.rank = rank
         self.world_size = world_size
         self.seed = self.config["seed"]
         torch.manual_seed(self.seed)
-        # benchmark mode (train.py --steps): fixed-step tps run, no checkpoints or wandb
+
         self.benchmark = benchmark
         self.device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(local_rank)
         self.mesh = self._build_mesh()
         self.dp_size = self.mesh.size("dp")
-        # the mesh drops size-1 axes, so no tp axis means no tensor parallel
+        # the mesh drops size-1 axes, default to 1
         self.tp_size = self.mesh.sizes.get("tp", 1)
         self.ep_size = self.mesh.sizes.get("ep", 1)
 
-        # "ddp" | "fsdp"
+        # currently we only support ddp | fsdp
         self.parallelism = self.config["parallelism"]
-        # set by _build_model; tp / ep stay None when their axis is absent
+        # set by _build_model
         self.parallel: DDP | FSDP
         self.tp: TP | None = None
         self.ep: EP | None = None
@@ -92,9 +92,8 @@ class Trainer:
 
         self.model = self._build_model()
         self.model.activation_checkpointing = self.config["activation_checkpointing"]
-        # from here on each data rank has its own random stream (dropout,
-        # masking). tp peers share a dp coordinate, hence a stream: they must
-        # compute identical activations.
+        # each data rank has own random stream, useful for random
+        # dropout and masking. tp peers share dp coord
         torch.manual_seed(self.seed + 1 + self.mesh.coordinate("dp"))
         self._compile(self.model)
 
@@ -109,6 +108,8 @@ class Trainer:
         self.max_norm = optim_cfg.get("max_norm")
 
         self.dataloader = self._build_dataloader()
+        # a mix script's loader (dataloader/mixture.py) rather than the hf stream
+        self.mixture = isinstance(self.dataloader, MixtureLoader)
         self.global_batch_size = self.config["data"]["global_batch_size"]
         self.micro_batch_size = self.config["data"]["micro_batch_size"]
 
@@ -163,7 +164,8 @@ class Trainer:
         atexit.register(shutdown_workers, dataloader_iter)
         self.prefetcher = CUDAPrefetcher(
             dataloader_iter, self.device, first_batch=self._resumed_batch,
-            restart=self._next_data_pass,
+            # a mixture never runs out: each source starts its next epoch itself
+            restart=None if self.mixture else self._next_data_pass,
         )
 
         # set by the SIGTERM handler train() installs; see _stop_requested
@@ -207,6 +209,9 @@ class Trainer:
                 "perf/tps": tokens_per_step / step_time,
                 "perf/step_time": step_time,
                 "perf/peak_mem_gib": torch.cuda.max_memory_allocated() / 2**30,
+                # the schedule's mix at this step
+                **({f"mix/{name}": w for name, w in self.dataloader.weights(step).items()}
+                   if self.mixture else {}),
                 **extra,
             },
             step=step,
@@ -214,13 +219,14 @@ class Trainer:
 
     def _build_model(self) -> nn.Module:
         """
-        build, initialize and parallelize the model; sets self.parallel,
-        self.tp and self.ep.
+        build, initialize and parallelize the model
+        we sets self.parallel, self.tp and self.ep here
 
-        plain ddp: build -> init -> replicate. anything sharded (fsdp, tp,
-        ep): build on the meta device (shapes only) -> shard -> init the
-        shards, so no rank ever holds the full weights. tp and ep cut first;
-        fsdp then shards what they left on the rank, and ddp replicates it.
+        plain ddp: build -> init -> replicate
+        anything sharded (fsdp, tp, ep): build on the meta device 
+        (shapes only) -> shard -> init the shards, so no rank holds
+        holds the full weights. tp and ep cut first, then fsdp shards
+        what's left on rank and ddp replicates (bad for heterogeneous)
         """
         model_cfg = self.config["model"]
         if self.parallelism != "fsdp" and self.tp_size == 1 and self.ep_size == 1:
@@ -256,6 +262,7 @@ class Trainer:
                 self.mesh,
                 dim="dp",
                 bucket_mb=self.config["ddp"]["bucket_mb"],
+                reduce_dtype=_DTYPES[self.config["ddp"]["reduce_dtype"]],
                 # under ep, `dp` includes ep; expert weights average over
                 # dp_expert instead (see _expert_axis)
                 dim_of=self._expert_axis("dp", "dp_expert"),
@@ -377,13 +384,14 @@ class Trainer:
             self.ep.finish_init(model)
 
     @debug_time
-    def _build_dataloader(self) -> torchdata.stateful_dataloader.StatefulDataLoader:
+    def _build_dataloader(self) -> torchdata.stateful_dataloader.StatefulDataLoader | MixtureLoader:
         return build_dataloader(
             self.config["data"], self.tokenizer, self.ignore_index,
             self.mesh.coordinate("dp"), self.dp_size,
             # workers survive a job-wide SIGTERM until the final checkpoint;
             # __init__ registers their teardown
             shield_sigterm=True,
+            total_steps=self.num_train_steps,
         )
 
     def _next_data_pass(self):
@@ -471,7 +479,8 @@ class Trainer:
             # the prefetcher holds one batch training hasn't seen yet; save it
             # with the current data pass
             held = self.prefetcher.state_dict()
-            held["epoch"] = self.dataloader.dataset.epoch
+            # the hf dataset's pass; a mixture keeps its epochs in its own state
+            held["epoch"] = 0 if self.mixture else self.dataloader.dataset.epoch
             self.checkpointer.save_prefetcher(held, step, dp_rank)
         self.checkpointer.commit(step)
 
@@ -550,7 +559,8 @@ class Trainer:
                 self._resumed_batch = held["next_batch"]
                 # the dataset doesn't restore its epoch itself, and ignores
                 # state saved in another epoch
-                self.dataloader.dataset.set_epoch(held.get("epoch", 0))
+                if not self.mixture:
+                    self.dataloader.dataset.set_epoch(held.get("epoch", 0))
             self.checkpointer.load_dataloader(self.dataloader, step, dp_rank)
         # each dp rank's own stream (older checkpoints: rank 0's, in
         # trainer.pt). a rank with none, after growing the mesh, keeps its seed

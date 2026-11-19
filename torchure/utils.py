@@ -1,4 +1,3 @@
-import json
 import os
 import time
 
@@ -29,8 +28,3 @@ def checkpoint_dir(config: dict) -> str:
         get_project_dir(), "checkpoints"
     )
     return os.path.join(os.path.expanduser(root), config["run_name"])
-
-
-def load_json(path: str) -> dict:
-    with open(path) as f:
-        return json.load(f)
