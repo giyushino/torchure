@@ -144,6 +144,10 @@ headroom: ddp micro 4 -> 8 on the 0.6B AR model is noise
   number on a diffusion checkpoint. needs a monte-carlo ELBO over t.
 - **diffusion + packing**: packed documents now see each other in both
   directions. llada trains this way, but document masking would be cleaner.
+  main's `doc_mask` can't be reused as is: its mask is causal, and it finds
+  documents by eos in the input ids, which the objective may have masked.
+  the trainer rejects `doc_mask` with `causal: false`. a fix would take the
+  document ids from the clean batch and drop the `q >= kv` term.
 - **diffusion + cp**: cp is not implemented yet; when it is, the causal
   zigzag balancing is unnecessary for bidirectional attention.
 - **looped**: no random-depth training or state injection (Geiping et al.),
