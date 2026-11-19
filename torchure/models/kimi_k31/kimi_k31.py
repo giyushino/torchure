@@ -32,9 +32,8 @@ scaled defaults; `__main__` prints the exact total / active counts):
     the completed block sums, and the current partial
   - first layer is dense (first_k_dense_replace=1 in the real config)
 
-pure pytorch throughout. the kda recurrence is solved chunkwise (64 steps in
-closed form at a time, see _kda_chunk; compiler-disabled, like the tp
-collectives) and the routed experts are one stacked bank driven by a sort and
+pure pytorch throughout. the kda recurrence is solved chunkwise (see
+_kda_scan; compiler-disabled, like the tp collectives) and the routed experts are one stacked bank driven by a sort and
 a grouped matmul (models/moe.py). the scaled config in configs/ turns compile
 off.
 
@@ -83,8 +82,9 @@ class SiTUMLP(nn.Module):
         )
 
 
-# timesteps the kda scan solves in closed form at once
+# timesteps per chunk, and per sub-block inside a chunk (see _kda_scan)
 KDA_CHUNK = 64
+KDA_SUB = 16
 
 
 def _kda_reference(
@@ -115,45 +115,64 @@ def _kda_reference(
     return torch.stack(outs, dim=1)
 
 
-def _kda_chunk(
-    state: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    log_alpha: torch.Tensor, beta: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _kda_intra(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor,
+    beta: torch.Tensor, sub: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    C timesteps of the recurrence in closed form: (state after, outputs).
-    q/k/v/log_alpha (B, H, C, D), beta (B, H, C), state (B, H, D, D).
+    everything inside each chunk that doesn't depend on the incoming state,
+    for all chunks at once. q/k/v/g (B, H, N, C, D) with g the log decay
+    accumulated from the chunk's start, beta (B, H, N, C).
 
-    every step adds a rank-1 write k_t u_t^T to the decayed state, with
-    u_t = beta_t (v_t - S_{t-1}'^T k_t). unrolling, with g_t the log decay
-    accumulated up to step t and w[t, i] = exp(g_t - g_i) the per-channel
-    decay a write at step i has suffered by step t:
-
-        S_t = exp(g_t) S_0 + sum_{i<=t} (w[t, i] k_i) u_i^T
-
-    substituting that into u_t gives a unit lower-triangular system for all
-    C of them at once,
-
-        (I + diag(beta) tril(A, -1)) U = diag(beta) (V - (exp(g) K) S_0),
-        A[t, i] = sum_d k_t[d] w[t, i, d] k_i[d]
-
-    and the outputs and the final state follow from U. w is formed pairwise,
-    exp of a difference that is always <= 0, rather than as exp(g_t) /
-    exp(g_i): a channel that decays hard would overflow the division.
+    returns, per chunk, what _kda_scan's state loop needs:
+        u0, wk   the chunk's writes are u = u0 - wk @ S0
+        out0, p  its outputs are out0 + p @ S0
+        kl       k decayed to the chunk's end: S_end = exp(g_end) S0 + kl^T u
     """
-    g = log_alpha.cumsum(dim=2)                                   # (B, H, C, D)
-    # w[t, i, d] for i <= t; the i > t half is masked off below
-    w = (g.unsqueeze(3) - g.unsqueeze(2)).clamp(max=0).exp()      # (B, H, C, C, D)
+    C = q.shape[-2]
+    # a[t, i] = sum_d k_t[d] exp(g_t[d] - g_i[d]) k_i[d] for i <= t, and aq
+    # the same with q_t. across two sub-blocks the decay factors through the
+    # first step r of the later one, exp(g_t - g_r) * exp(g_r - g_i), both
+    # <= 1, so it is a plain matmul. within a sub-block it is formed pairwise
+    # (exp of a difference <= 0), which never overflows
+    a_rows, aq_rows = [], []
+    for start in range(0, C, sub):
+        rows = slice(start, start + sub)
+        g_r = g[..., start:start + 1, :]
+        kt = k[..., rows, :] * (g[..., rows, :] - g_r).exp()
+        qt = q[..., rows, :] * (g[..., rows, :] - g_r).exp()
+        ki = k[..., :start, :] * (g_r - g[..., :start, :]).exp()
+        w = (g[..., rows, None, :] - g[..., None, rows, :]).clamp(max=0).exp()
+        kk = k[..., rows, :]
+        diag_a = torch.einsum("...td,...tid,...id->...ti", kk, w, kk)
+        diag_q = torch.einsum("...td,...tid,...id->...ti", q[..., rows, :], w, kk)
+        a_rows.append(torch.cat([kt @ ki.transpose(-1, -2), diag_a], dim=-1))
+        aq_rows.append(torch.cat([qt @ ki.transpose(-1, -2), diag_q], dim=-1))
+    def square(rows: list[torch.Tensor]) -> torch.Tensor:
+        return torch.cat([F.pad(r, (0, C - r.shape[-1])) for r in rows], dim=-2)
+
+    a = square(a_rows).tril(-1)
+    aq = square(aq_rows).tril()
+
+    # the writes solve (I + diag(beta) a) u = diag(beta) (v - (exp(g) k) S0);
+    # split into the part without S0 (u0) and the part times S0 (wk)
+    system = a * beta.unsqueeze(-1)
     decay = g.exp()
+    rhs = beta.unsqueeze(-1) * torch.cat([v, k * decay], dim=-1)
+    sol = torch.linalg.solve_triangular(system, rhs, upper=False, unitriangular=True)
+    u0, wk = sol.split([v.shape[-1], k.shape[-1]], dim=-1)
 
-    a = torch.einsum("bhtd,bhtid,bhid->bhti", k, w, k).tril(-1)
-    system = a * beta.unsqueeze(-1)                               # rows scaled by beta_t
-    rhs = beta.unsqueeze(-1) * (v - (k * decay) @ state)
-    u = torch.linalg.solve_triangular(system, rhs, upper=False, unitriangular=True)
+    # o_t = (exp(g_t) q_t) S0 + sum_{i<=t} aq[t, i] u_i
+    out0 = aq @ u0
+    p = q * decay - aq @ wk
+    kl = k * (g[..., -1:, :] - g).exp()
+    return u0, wk, out0, p, kl
 
-    aq = torch.einsum("bhtd,bhtid,bhid->bhti", q, w, k).tril()
-    out = (q * decay) @ state + aq @ u
-    carried = (w[:, :, -1] * k).transpose(-1, -2) @ u             # writes, decayed to the end
-    return decay[:, :, -1].unsqueeze(-1) * state + carried, out
+
+# compiled on its own (the scan around it is compiler-disabled): eager, the
+# pairwise decay's elementwise ops dominate. at B=8, S=4096, H=16, D=128,
+# fwd+bwd on an h100: 213 ms eager, 128 ms compiled
+_kda_intra_compiled = torch.compile(_kda_intra, dynamic=False)
 
 
 @torch.compiler.disable
@@ -161,37 +180,47 @@ def _kda_scan(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     log_alpha: torch.Tensor, beta: torch.Tensor,
     chunk: int = KDA_CHUNK,
-    checkpoint_chunks: bool = True,
 ) -> torch.Tensor:
     """
-    the gated delta rule over a sequence, `chunk` timesteps at a time (see
-    _kda_chunk). q/k/v (B, S, H, D), log_alpha (B, S, H, D) <= 0, beta
-    (B, S, H). the state is (B, H, D, D), kept in fp32.
+    the gated delta rule over a sequence (see _kda_reference), in chunks.
+    q/k/v (B, S, H, D), log_alpha (B, S, H, D) <= 0, beta (B, S, H). the state
+    is (B, H, D, D), kept in fp32.
 
-    S / chunk python steps instead of S. each chunk builds a (C, C, D)
-    pairwise-decay tensor per head, so memory grows with the chunk size;
-    with grad on, chunks run under activation checkpointing by default, so
-    only the state at each chunk boundary is kept for backward, at the price
-    of running each chunk a second time.
+    within a chunk the writes solve a small triangular system (_kda_intra);
+    that, and everything else not involving the state, runs for all chunks
+    at once. only the state is carried chunk to chunk, two small matmuls per
+    chunk, and the outputs then take one batched matmul against every
+    chunk's incoming state.
     """
     B, S, H, D = q.shape
-    state = torch.zeros(B, H, D, D, device=q.device, dtype=torch.float32)
-    # (B, S, H, ...) -> (B, H, S, ...)
-    q = q.float().transpose(1, 2) * (D ** -0.5)
-    k, v, log_alpha = (t.float().transpose(1, 2) for t in (k, v, log_alpha))
-    beta = beta.float().transpose(1, 2)
-    use_checkpoint = checkpoint_chunks and torch.is_grad_enabled() and S > chunk and any(
-        t.requires_grad for t in (q, k, v, log_alpha, beta)
-    )
-    outs = []
-    for s in range(0, S, chunk):
-        args = (state, *(t[:, :, s:s + chunk] for t in (q, k, v, log_alpha, beta)))
-        if use_checkpoint:
-            state, out = checkpoint(_kda_chunk, *args, use_reentrant=False)
-        else:
-            state, out = _kda_chunk(*args)
-        outs.append(out)
-    return torch.cat(outs, dim=2).transpose(1, 2)
+    sub = KDA_SUB if chunk % KDA_SUB == 0 else chunk
+    n = -(-S // chunk)
+    pad = n * chunk - S
+
+    def chunks(t: torch.Tensor) -> torch.Tensor:
+        # (B, S, H, ...) -> (B, H, N, C, ...), zero-padded at the end. a
+        # padded step writes nothing (k = beta = 0) and doesn't decay
+        t = t.float().transpose(1, 2)
+        if pad:
+            t = F.pad(t, (0, 0) * (t.dim() - 3) + (0, pad))
+        return t.reshape(B, H, n, chunk, *t.shape[3:])
+
+    q = chunks(q) * (D ** -0.5)
+    k, v, log_alpha, beta = (chunks(t) for t in (k, v, log_alpha, beta))
+    g = log_alpha.cumsum(dim=3)
+    intra = _kda_intra_compiled if q.is_cuda else _kda_intra
+    u0, wk, out0, p, kl = intra(q, k, v, g, beta, sub)
+    end_decay = g[..., -1, :].exp().unsqueeze(-1)                  # (B, H, N, D, 1)
+
+    state = q.new_zeros(B, H, D, D)
+    states = []
+    for c in range(n):
+        states.append(state)
+        u = u0[:, :, c] - wk[:, :, c] @ state
+        state = end_decay[:, :, c] * state + kl[:, :, c].transpose(-1, -2) @ u
+    out = out0 + p @ torch.stack(states, dim=2)                    # (B, H, N, C, D)
+    out = out.reshape(B, H, n * chunk, -1)[:, :, :S]
+    return out.transpose(1, 2)
 
 
 class KimiDeltaAttention(nn.Module):

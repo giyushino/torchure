@@ -185,7 +185,7 @@ def test_kda_chunkwise():
     harsh = torch.where(torch.rand(B, S, H, D) < 0.5, torch.full((B, S, H, D), -5.0), mild * 1e-3)
     for name, log_alpha in (("mild", mild), ("floor", harsh)):
         ref = _kda_reference(q.double(), k.double(), v.double(), log_alpha.double(), beta.double())
-        for chunk in (7, 64, 1000):  # ragged tail, the default, one chunk
+        for chunk in (7, 32, 64, 1000):  # ragged tail, sub-blocks, the default, one chunk
             out = _kda_scan(q, k, v, log_alpha, beta, chunk=chunk)
             err = (out.double() - ref).abs().max().item()
             assert err < 5e-5, f"kda {name} chunk={chunk}: max err {err:.2e}"
@@ -199,10 +199,10 @@ def test_kda_chunkwise():
         return [t.grad.clone() for t in ins]
 
     want = grads(_kda_reference)
-    for checkpoint_chunks in (True, False):
-        got = grads(lambda *a, c=checkpoint_chunks: _kda_scan(*a, chunk=16, checkpoint_chunks=c))
+    for chunk in (16, 64):
+        got = grads(lambda *a, c=chunk: _kda_scan(*a, chunk=c))
         for g, w in zip(got, want, strict=True):
-            assert torch.allclose(g, w, rtol=1e-3, atol=1e-5), "kda chunkwise grads differ"
+            assert torch.allclose(g, w, rtol=1e-3, atol=1e-5), f"kda chunk={chunk}: grads differ"
     print("kimi_k31: chunkwise kda == step-by-step recurrence (values, grads, decay floor) ok")
 
 
