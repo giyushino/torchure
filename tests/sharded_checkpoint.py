@@ -1,5 +1,5 @@
 """
-the golden resumption test for sharded checkpointing (roadmap phase 3).
+end-to-end resumption test for sharded checkpointing.
 
 run (gloo/cpu, no gpus needed):
     uv run tests/sharded_checkpoint.py

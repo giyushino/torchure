@@ -24,7 +24,7 @@ from torchure.core.placement import (
 
 def test_value_semantics():
     # equality and hashing have to travel together: redistribute dispatches on
-    # placement values and phase 3 puts them in checkpoint metadata dicts
+    # placement values and the checkpointer puts them in metadata dicts
     assert Shard(0) == Shard(0)
     assert Shard(0) != Shard(1)
     assert Replicate() == Replicate()
@@ -91,7 +91,7 @@ def test_local_and_global_shape():
 
 
 def test_indivisible_asserts_loudly():
-    # v0 policy: assert, never pad, never silently truncate
+    # uneven splits: assert, never pad, never silently truncate
     try:
         Shard(0).local_shape((7, 3), 2)
     except AssertionError as e:

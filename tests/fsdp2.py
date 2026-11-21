@@ -296,18 +296,12 @@ def test_multi_step(mesh, dim, device):
         loss.backward()
         fsdp.sync()
 
-        # 1. grads, TIGHT, and BEFORE either optimizer steps -- this is the
-        #    part a sharding bug breaks, and checking it here means the
-        #    optimizer never gets a chance to launder the error into something
-        #    that looks like rounding.
-        # step 0 ONLY. at step 0 both models hold identical weights, so the
-        # grads are comparable at test_grad_parity's tolerance. from step 1 the
-        # two weight sets have legitimately drifted apart (see the weight check
-        # below), so the grads are evaluated at different points and demanding
-        # 1e-6 of them is demanding zero drift -- which is not what this test
-        # is for. on nccl that shows up immediately: bs=4 and bs=1 backwards
-        # pick different cuBLAS reduction orders, and by step 3 the grad gap is
-        # ~2e-6 while the weights and the loss curve still track fine.
+        # 1. grads, tightly, before either optimizer steps: this is what a
+        #    sharding bug breaks, and checking before the step keeps adam from
+        #    blurring the error into something that looks like rounding.
+        #    step 0 only: after that the two weight sets have drifted apart
+        #    legitimately (different reduction orders), so their grads are
+        #    taken at different points and can't be held to 1e-6.
         if step == 0:
             check_grads(errors, model, reference, mesh, dim, tag=f"step{step} ",
                         rtol=1e-4, atol=1e-6)
@@ -317,16 +311,11 @@ def test_multi_step(mesh, dim, device):
         opt.step()
         opt.zero_grad()
 
-        # 2. weights, at a tolerance adam's update actually permits. the
-        #    update is lr * m/(sqrt(v)+eps) -- a NORMALIZED quantity, so for an
-        #    element whose grad is near zero the ratio is ill-conditioned and a
-        #    1e-9 grad difference (pure fp32 associativity: the reduce_scatter
-        #    sums this rank's shard in a different order than the single-process
-        #    reduction) can move the weight by a good fraction of lr. observed:
-        #    exactly 1 element in 2048 drifting ~1.4e-5 with lr=1e-2, while the
-        #    grads above stay equal to 1e-7. atol=1e-4 is still 100x tighter
-        #    than any real sharding bug, which misplaces a whole shard and shows
-        #    up at the O(1e-2) scale of the weights themselves.
+        # 2. weights, at a tolerance adam's update permits. the update is
+        #    lr * m/(sqrt(v)+eps), a normalized quantity: for a near-zero grad,
+        #    fp32 reduction-order noise can move a weight by a fraction of lr.
+        #    atol=1e-4 is still ~100x tighter than a real sharding bug, which
+        #    misplaces a whole shard and shows up at the scale of the weights.
         for (name, p), (_, p_ref) in zip(
             model.named_parameters(), reference.named_parameters(), strict=True
         ):
@@ -334,11 +323,9 @@ def test_multi_step(mesh, dim, device):
                     Shard(0).local_slice(p_ref.data, g, mesh.coordinate(dim)),
                     rtol=1e-4, atol=1e-4)
 
-        # 3. the loss curve, which is the roadmap's actual stated criterion.
-        #    `loss` is THIS rank's bs=1 loss, not the global one -- the mean
-        #    across dp is what equals the single-process bs=N loss, which is
-        #    why the trainer all-reduces it before logging. comparing the local
-        #    loss directly would "fail" on a completely correct run.
+        # 3. the loss curve. `loss` is this rank's bs=1 loss; its mean across
+        #    dp is what equals the single-process bs=N loss (which is why the
+        #    trainer all-reduces it before logging).
         mean_loss = C.all_reduce(loss.detach().clone(), mesh, dim, "avg")
         if abs(mean_loss.item() - ref_loss.item()) > 1e-4:
             errors.append(

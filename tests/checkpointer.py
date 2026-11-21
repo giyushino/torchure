@@ -22,8 +22,6 @@ import tempfile
 import torch
 import torch.nn as nn
 
-from torchdata.stateful_dataloader import StatefulDataLoader
-
 from torchure.checkpoint.checkpointer import Checkpointer
 from torchure.optimizer.scheduler import WarmupStableDecayScheduler
 
@@ -33,13 +31,34 @@ def build_model(seed: int) -> nn.Module:
     return nn.Sequential(nn.Linear(8, 16), nn.SiLU(), nn.Linear(16, 8))
 
 
+class CountingLoader:
+    """a stateful loader in miniature: batches of consecutive ints, position in its state."""
+
+    def __init__(self, n: int, batch_size: int):
+        self.n, self.batch_size, self.pos = n, batch_size, 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> torch.Tensor:
+        batch = torch.arange(self.pos, self.pos + self.batch_size) % self.n
+        self.pos += self.batch_size
+        return batch
+
+    def state_dict(self) -> dict:
+        return {"pos": self.pos}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.pos = state["pos"]
+
+
 def build_state(seed: int):
     model = build_model(seed)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     scheduler = WarmupStableDecayScheduler(
         optimizer, total_steps=100, warmup_ratio=0.1, decay_ratio=0.1
     )
-    loader = StatefulDataLoader(list(range(64)), batch_size=4, num_workers=0)
+    loader = CountingLoader(64, batch_size=4)
     return model, optimizer, scheduler, loader
 
 

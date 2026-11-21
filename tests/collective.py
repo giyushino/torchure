@@ -272,7 +272,7 @@ def test_async_matches_sync(mesh, dim, device):
 
 
 def test_subgroup_isolation(mesh, dim, device):
-    # THE group-construction test: all_reduce along one dim of a 2-d mesh
+    # the group-construction test: all_reduce along one dim of a 2-d mesh
     # must only combine ranks in that dim's subgroup. runs against the real
     # core/mesh.py, not the FlatMesh passed in.
     try:
