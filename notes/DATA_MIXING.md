@@ -6,7 +6,7 @@ parquet tokenized while training (DATA_LOADING.md) as well as the
 pre-tokenized token shards below. code:
 `torchure/dataloader/{sources,shards,mixture,tokenize_shards}.py`, tests:
 `tests/mixture_loader.py`, `tests/data_sources.py` (ci), example:
-`mixes/smoke.py` + `configs/qwen3_dense_mix_smoke.json`.
+`mixes/example_mix.py` + `configs/qwen3_dense_mix_smoke.json`.
 
 ## why not the hf stream (historical)
 
@@ -69,7 +69,7 @@ tokenization uses the same `encode_batch` call as the hf path's packer.
 
 ## the mix script
 
-config: `"data": {"source": null, "mix": "mixes/smoke.py"}` (exactly one of
+config: `"data": {"source": null, "mix": "mixes/example_mix.py"}` (exactly one of
 `source` / `mix`). the script:
 
 ```python
@@ -170,7 +170,7 @@ don't remap (same constraint as the hf path; `resume_dataloader: false`).
 ## gpu check (11/19)
 
 4×h100 nvl, ddp, qwen3 0.6B, compile off, global batch 32×4096,
-`mixes/smoke.py` over 60 steps (switch to 50/50 at step 54), checkpoint at
+`mixes/example_mix.py` over 60 steps (switch to 50/50 at step 54), checkpoint at
 30. run B resumed from 30:
 
 | step | run A loss | run B (resumed) |

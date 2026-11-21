@@ -86,7 +86,7 @@ Each run is described by one JSON file. A few things to know:
   for MoE models). `"parallelism": "ddp"` or `"fsdp"` says how the data
   parallel axes hold the model.
 - **`data` picks the training data.** Use either `source` (one dataset) or
-  `mix` (a Python file of weighted sources, like `mixes/smoke.py`).
+  `mix` (a Python file of weighted sources, like `mixes/example_mix.py`).
 
 Starting points:
 

@@ -14,7 +14,7 @@ tests: `tests/data_sources.py`, `tests/mixture_loader.py` (both ci).
 "data": {"source": "hf://datasets/OptimalScale/ClimbMix", ...}
 "data": {"source": {"path": "hf://datasets/jxie/coco_captions", "files": "data/train-*",
                     "text_field": "caption", "image_field": "image", "window_blocks": 16}, ...}
-"data": {"mix": "mixes/smoke.py", ...}
+"data": {"mix": "mixes/example_mix.py", ...}
 ```
 
 ## why the hf stream went

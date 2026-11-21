@@ -2,7 +2,7 @@
   "base": "qwen3_dense_climbmix.json",
   "data": {
     "source": null,
-    "mix": "mixes/smoke.py"
+    "mix": "mixes/example_mix.py"
   },
   "run_name": "qwen3_dense_mix_smoke"
 }
