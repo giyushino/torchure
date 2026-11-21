@@ -9,6 +9,11 @@ from torchure.loss.cross_entropy import cross_entropy_loss
 from torchure.loss.fused_linear_ce import fused_linear_cross_entropy
 
 
+def model_inputs(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """batch entries the model takes besides the ids (e.g. a vlm's pixel_values)."""
+    return {k: v for k, v in batch.items() if k not in ("input_ids", "labels")}
+
+
 class ARObjective:
     def __init__(
         self,
@@ -28,7 +33,7 @@ class ARObjective:
 
     def compute_loss(self, model: nn.Module, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         if self.fused_linear_ce:
-            hidden = model(batch["input_ids"], return_final_hidden=True)
+            hidden = model(batch["input_ids"], return_final_hidden=True, **model_inputs(batch))
             # next-token shift; the last position has no target
             labels = torch.full_like(batch["labels"], self.ignore_index)
             labels[:, :-1] = batch["labels"][:, 1:]
@@ -43,5 +48,5 @@ class ARObjective:
                 vocab_axis=self.tp.vocab_axis if self.tp is not None else None,
             )
 
-        logits = model(batch["input_ids"])
+        logits = model(batch["input_ids"], **model_inputs(batch))
         return cross_entropy_loss(batch["labels"], logits, self.ignore_index)

@@ -71,15 +71,14 @@ on a doc boundary at the start of each block.
 **caption rows** (`image_field` set; parquet): one image + one caption per
 row, unpacked: `<|vision_start|> <|image_pad|>×n <|vision_end|> caption eos
 pad…`, labels ignore_index on the image span and padding (identical layout
-to the vlm branch's `ImageTextCollator`). images decode on the fetch threads
-(or the `workers` processes)
-with PIL (it releases the gil: 1 → 16 threads scales 221 → 2,390 img/s);
+to the old hf path's `ImageTextCollator`). images decode on the fetch threads
+(or the `workers` processes) with PIL (it releases the gil: 1 → 16 threads scales 221 → 2,390 img/s);
 jpegs use `draft()` (dct-domain 2/4/8x downscale before the bicubic resize,
 +25%; pixels differ slightly from a full decode). `pixel_values` stay
 **uint8** through the loader and the host→device copy; the vision tower
 normalizes (siglip and clip use different constants, so it's the model's
-call). the vlm branch's `SigLIPVisionTower.forward` needs the matching
-two-line change (cast + `/127.5 - 1` when it gets uint8).
+call): `SiglipVisionTower.forward` casts and applies `/127.5 - 1` when it
+gets uint8.
 
 **http.** range reads keep a connection per host per thread and cache each
 file's redirect target. the hub redirects every `resolve/` url to a

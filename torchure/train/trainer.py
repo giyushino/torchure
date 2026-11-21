@@ -96,6 +96,11 @@ class Trainer:
             assert hasattr(self.model, "doc_mask_eos"), (
                 f"doc_mask: model {self.config['model']['name']!r} doesn't support document masking"
             )
+            # layers.doc_mask is causal, and finds documents by eos in the
+            # (possibly noised) input ids
+            assert getattr(self.model, "causal", True), (
+                "doc_mask is causal-only; it can't be combined with causal: false"
+            )
             self.model.doc_mask_eos = self.eos_id
         # each data rank has own random stream, useful for random
         # dropout and masking. tp peers share dp coord

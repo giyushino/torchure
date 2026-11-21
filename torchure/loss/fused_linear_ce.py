@@ -9,7 +9,9 @@ chunk computes its loss AND grad_hidden / grad_W in the forward pass; backward
 just scales the stashed grads in place. nothing logits-sized outlives a chunk,
 and the GEMM count is the same as the unfused path.
 
-matches F.cross_entropy(reduction="mean", ignore_index=...).
+matches F.cross_entropy(reduction="mean", ignore_index=...). optional
+per-token `weights` scale each token's loss (and grad); the mean still
+divides by the number of non-ignored tokens.
 """
 
 import torch
@@ -22,25 +24,30 @@ def _chunk_fwd(
     hidden: torch.Tensor,      # (C, D) activation dtype (bf16 under autocast)
     weight: torch.Tensor,      # (V, D) pre-cast to hidden.dtype
     labels: torch.Tensor,      # (C,) long
-    ignore_index: int,
+    row_weight: torch.Tensor,  # (C,) fp32: the token's weight, 0 on ignored rows
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     logits = (hidden @ weight.t()).float()              # (C, V) fp32
-    valid = labels != ignore_index                       # (C,)
-    safe = torch.where(valid, labels, 0).unsqueeze(1)    # (C, 1) gather-safe
+    safe = labels.clamp_min(0).unsqueeze(1)              # (C, 1) gather-safe
 
     lse = torch.logsumexp(logits, dim=-1)                # (C,)
     target = logits.gather(1, safe).squeeze(1)           # (C,)
-    loss_sum = ((lse - target) * valid).sum()            # fp32 scalar, sum-reduced
+    loss_sum = ((lse - target) * row_weight).sum()       # fp32 scalar, sum-reduced
 
-    # d(loss_sum)/d(logits) = softmax - onehot on valid rows, 0 on ignored rows
+    # d(loss_sum)/d(logits) = (softmax - onehot) * row weight
     probs = torch.exp(logits - lse.unsqueeze(1))
-    probs = probs * valid.unsqueeze(1)
-    probs.scatter_add_(1, safe, -valid.float().unsqueeze(1))
+    probs = probs * row_weight.unsqueeze(1)
+    probs.scatter_add_(1, safe, -row_weight.unsqueeze(1))
 
     grad_logits = probs.to(hidden.dtype)                 # (C, V)
     grad_hidden = grad_logits @ weight                   # (C, D)
     # grad_W is accumulated by the caller with one addmm
     return loss_sum, grad_hidden, grad_logits
+
+
+def _row_weights(labels, ignore_index, weights) -> torch.Tensor:
+    """(N,) fp32 per-token loss weight: `weights` (or 1), 0 where ignored."""
+    valid = (labels != ignore_index).float()
+    return valid if weights is None else valid * weights.float()
 
 
 def _new_grad_weight(weight: torch.Tensor) -> torch.Tensor | None:
@@ -82,9 +89,10 @@ def _scaled_grads(ctx, grad_out) -> tuple[torch.Tensor, torch.Tensor | None]:
 
 class _FusedLinearCE(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, labels, ignore_index, chunk_size):
+    def forward(ctx, hidden, weight, labels, ignore_index, chunk_size, weights):
         N, _ = hidden.shape
         w = weight.to(hidden.dtype)
+        row_weight = _row_weights(labels, ignore_index, weights)
 
         loss_sum = torch.zeros((), dtype=torch.float32, device=hidden.device)
         grad_hidden = torch.empty_like(hidden)
@@ -92,7 +100,7 @@ class _FusedLinearCE(torch.autograd.Function):
 
         for s in range(0, N, chunk_size):
             e = min(s + chunk_size, N)
-            chunk_loss, gh, grad_logits = _chunk_fwd(hidden[s:e], w, labels[s:e], ignore_index)
+            chunk_loss, gh, grad_logits = _chunk_fwd(hidden[s:e], w, labels[s:e], row_weight[s:e])
             loss_sum += chunk_loss
             grad_hidden[s:e] = gh
             if grad_weight is not None:
@@ -110,7 +118,7 @@ class _FusedLinearCE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        return (*_scaled_grads(ctx, grad_out), None, None, None)
+        return (*_scaled_grads(ctx, grad_out), None, None, None, None)
 
 
 # vocab-parallel variant.
@@ -139,11 +147,11 @@ def _vp_stats(logits, row_max, safe, owned):
     return torch.stack([sum_exp, target])                # (2, C)
 
 
-def _vp_grads(logits, lse, target, valid, safe, owned, weight):
-    loss_sum = ((lse - target) * valid).sum()
-    # softmax - onehot, restricted to this rank's vocab rows
-    probs = torch.exp(logits - lse.unsqueeze(1)) * valid.unsqueeze(1)
-    probs.scatter_add_(1, safe, -owned.unsqueeze(1))
+def _vp_grads(logits, lse, target, row_weight, safe, owned, weight):
+    loss_sum = ((lse - target) * row_weight).sum()
+    # (softmax - onehot) * row weight, restricted to this rank's vocab rows
+    probs = torch.exp(logits - lse.unsqueeze(1)) * row_weight.unsqueeze(1)
+    probs.scatter_add_(1, safe, -(owned * row_weight).unsqueeze(1))
     grad_logits = probs.to(weight.dtype)
     return loss_sum, grad_logits @ weight, grad_logits
 
@@ -162,7 +170,7 @@ def _vp(fn, device: torch.device):
 
 class _VocabParallelFusedLinearCE(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, labels, ignore_index, chunk_size, mesh, axis):
+    def forward(ctx, hidden, weight, labels, ignore_index, chunk_size, mesh, axis, weights):
         N, _ = hidden.shape
         w = weight.to(hidden.dtype)
         rows = weight.shape[0]
@@ -172,6 +180,7 @@ class _VocabParallelFusedLinearCE(torch.autograd.Function):
         local = labels - mesh.coordinate(axis) * rows
         owned_all = valid_all & (local >= 0) & (local < rows)
         safe_all = torch.where(owned_all, local, 0).unsqueeze(1)
+        row_weight_all = _row_weights(labels, ignore_index, weights)
 
         loss_sum = torch.zeros((), dtype=torch.float32, device=device)
         grad_hidden = torch.empty_like(hidden)
@@ -179,7 +188,7 @@ class _VocabParallelFusedLinearCE(torch.autograd.Function):
 
         for s in range(0, N, chunk_size):
             e = min(s + chunk_size, N)
-            valid = valid_all[s:e].float()
+            row_weight = row_weight_all[s:e]
             owned = owned_all[s:e].float()
             safe = safe_all[s:e]
 
@@ -190,7 +199,7 @@ class _VocabParallelFusedLinearCE(torch.autograd.Function):
             lse = row_max + torch.log(stats[0])
 
             chunk_loss, gh, grad_logits = _vp(_vp_grads, device)(
-                logits, lse, stats[1], valid, safe, owned, w
+                logits, lse, stats[1], row_weight, safe, owned, w
             )
             loss_sum += chunk_loss
             grad_hidden[s:e] = gh
@@ -212,7 +221,7 @@ class _VocabParallelFusedLinearCE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        return (*_scaled_grads(ctx, grad_out), None, None, None, None, None)
+        return (*_scaled_grads(ctx, grad_out), None, None, None, None, None, None)
 
 
 def fused_linear_cross_entropy(
@@ -222,6 +231,7 @@ def fused_linear_cross_entropy(
     ignore_index: int = -100,
     chunk_size: int = 1024,
     vocab_axis: tuple | None = None,
+    weights: torch.Tensor | None = None,  # (B, S) or (N,) per-token loss weights
 ) -> torch.Tensor:
     """
     vocab_axis=(mesh, axis): `weight` is this rank's slice of the vocab rows
@@ -231,6 +241,8 @@ def fused_linear_cross_entropy(
     if hidden.dim() == 3:
         hidden = hidden.reshape(-1, hidden.shape[-1])
         labels = labels.reshape(-1)
+    if weights is not None:
+        weights = weights.reshape(-1)
     # the final norm returns fp32 even under autocast, and autocast doesn't
     # reach inside the autograd.Function, so cast here or everything runs in fp32
     if torch.is_autocast_enabled(hidden.device.type):
@@ -238,6 +250,6 @@ def fused_linear_cross_entropy(
     if vocab_axis is not None:
         mesh, axis = vocab_axis
         return _VocabParallelFusedLinearCE.apply(
-            hidden, weight, labels, ignore_index, chunk_size, mesh, axis
+            hidden, weight, labels, ignore_index, chunk_size, mesh, axis, weights
         )
-    return _FusedLinearCE.apply(hidden, weight, labels, ignore_index, chunk_size)
+    return _FusedLinearCE.apply(hidden, weight, labels, ignore_index, chunk_size, weights)

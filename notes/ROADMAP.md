@@ -86,11 +86,9 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
   seed at epoch 0, so the run replayed its own data from the start. it now
   reseeds with `seed + step`: a fresh order, which can still overlap what
   the run saw (a mesh-independent loader position is the real fix).
-- **the vlm branch needs a small change to use the new loader**: caption
-  batches carry uint8 `pixel_values`, and `SigLIPVisionTower.forward` must
-  cast and normalize (`/127.5 - 1`) them; its config moves `image_field`
-  into `data.source` and needs `data.workers` (8): on threads the vlm
-  trains 15-30% slower from gil contention (DATA_LOADING.md).
+- **a vlm config needs `data.workers`** (`qwen3_vl_coco.json` sets 8): on
+  threads the vlm trains 15-30% slower from gil contention
+  (DATA_LOADING.md). it could default on for caption sources.
 - **the SIGTERM stop is only checked at log points**, so the worst case
   before the checkpoint starts is `log_every` steps. torchrun gives its
   workers a fixed grace period after forwarding the signal before it
@@ -130,6 +128,10 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
   isn't one, and sequential A/B runs inherit each other's thermal state. see
   CHANGES.md 7/30 for the methodology fix; this also means some of the 8-gpu
   scaling gap in DDP.md is thermal, not comm.
+- **experimental archs (EXPERIMENTAL_ARCHS.md)**: `eval_ppl.py` reports a
+  meaningless number on a masked-diffusion checkpoint; the vlm's vision
+  tower is in fsdp's root unit and uncompiled; vlm + tp is unsupported. new
+  models were only tested multi-rank on gloo/cpu.
 - fixed 7/27: norm weights were bf16 *parameters*, so AdamW's updates rounded
   to nothing and the gains never moved. see DEV_LOG — the CHANGES.md numbers
   were all measured with them frozen and want a re-run.
@@ -657,7 +659,10 @@ already exists), greedy/top-p sampler, a small eval loop (held-out val loss
 per N steps, rank-0 only at first, dp-sharded later). deliberately minimal —
 no serving ambitions.
 
-**M6 — masked-diffusion LM (DLLM).** the objective abstraction in
+**M6 — masked-diffusion LM (DLLM).** **landed on `claude/experimental-arch`
+(11/19)**: `causal` flag, `objectives/masked_diffusion.py`, weighted fused
+loss, llada sampler. see EXPERIMENTAL_ARCHS.md; diffusion eval (ELBO) still
+owed. original plan: the objective abstraction in
 `torchure/objectives/` was built for this moment:
 - model: needs bidirectional attention — `is_causal=False` path through sdpa
   (the mask plumbing exists; add a `causal: bool` to the model config);
@@ -670,6 +675,15 @@ no serving ambitions.
 - sampling: iterative unmasking loop (uses M5's machinery);
 - parallelism note: everything except cp works unchanged; cp's causal zigzag
   balancing becomes plain contiguous sharding for bidirectional attention.
+
+**M8 — looped transformer.** landed on `claude/experimental-arch` (11/19):
+prelude / shared core x num_loops / coda, core = one fsdp unit + one compile
+graph. passes the full tp suite. no random-depth training yet.
+
+**M9 — vlm (qwen3 + siglip).** landed on `claude/experimental-arch` (11/19):
+llava-style projector with pixel shuffle, image-caption rows from the main
+loader (`image_field` in `data.source`, uint8 pixels). no tp, no pretrained weights, no packing. see
+EXPERIMENTAL_ARCHS.md open problems.
 
 **M7 — continuous-diffusion LM (stretch/research).** embedding-space
 diffusion. keep as an explicit maybe: it stresses the objective abstraction

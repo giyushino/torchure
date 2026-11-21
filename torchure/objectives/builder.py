@@ -4,9 +4,11 @@ loss functions.
 """
 
 from torchure.objectives.autoregressive import ARObjective
+from torchure.objectives.masked_diffusion import MaskedDiffusionObjective
 
 OBJECTIVE_REGISTRY = {
     "AR": ARObjective,
+    "masked_diffusion": MaskedDiffusionObjective,
 }
 
 

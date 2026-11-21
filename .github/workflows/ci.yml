@@ -73,3 +73,5 @@ jobs:
         run: uv run --no-sync tests/expert_parallel.py
       - name: model contracts (olmo3, kimi k3.1)
         run: uv run --no-sync tests/models.py
+      - name: "experimental archs: diffusion, looped, vlm (gloo, 2 ranks)"
+        run: uv run --no-sync tests/experimental_archs.py

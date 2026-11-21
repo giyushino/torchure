@@ -22,6 +22,7 @@ It's meant for:
 | | |
 |---|---|
 | **Models** | Qwen3 (dense), OLMo 3 (sliding-window attention), and a Kimi-style mixture-of-experts model with linear attention |
+| **Experimental** | A masked-diffusion LM (`qwen3_diffusion_climbmix.json`, sampled with `torchure.inference.diffusion_generate`), a looped transformer (`looped_qwen3_climbmix.json`), and a Qwen3 + SigLIP VLM on COCO captions (`qwen3_vl_coco.json`, needs `uv sync --extra vision`). See `notes/EXPERIMENTAL_ARCHS.md` |
 | **Parallelism** | DDP, FSDP (a from-scratch FSDP2), HSDP, tensor + sequence parallel, expert parallel, freely combined on one device mesh |
 | **Data** | Streams datasets straight from the Hugging Face Hub, HTTP or local disk (jsonl, parquet, pre-tokenized shards) and tokenizes on the fly, so there's no preprocessing step. Weighted mixes of several datasets whose weights can change over training |
 | **Training** | bf16, fused linear + cross-entropy loss, `torch.compile`, activation checkpointing, document masking, WSD/cosine schedules, optional wandb logging |

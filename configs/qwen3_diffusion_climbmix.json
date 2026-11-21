@@ -1,0 +1,15 @@
+{
+  "base": "qwen3_dense_climbmix.json",
+  "model": {
+    "config": {
+      "causal": false
+    }
+  },
+  "objective": {
+    "name": "masked_diffusion",
+    "config": {
+      "mask_token_id": 151669
+    }
+  },
+  "run_name": "qwen3_diffusion_climbmix"
+}
