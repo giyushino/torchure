@@ -79,7 +79,7 @@ class Trainer:
         self.tp_size = self.mesh.sizes.get("tp", 1)
         self.ep_size = self.mesh.sizes.get("ep", 1)
 
-        # currently we only support ddp | fsdp
+        # "ddp" | "fsdp"
         self.parallelism = self.config["parallelism"]
         # set by _build_model
         self.parallel: DDP | FSDP
