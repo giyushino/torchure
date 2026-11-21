@@ -66,7 +66,7 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
 | trainer | single-gpu and dp through the same path (world_size=1 is not a special case). lifecycle build → parallelize → init → optimizer → data, so sharded init slots in without reordering. grad accumulation (`global_batch_size / (micro_batch_size × dp)` microbatches) and grad-norm clipping both land in `train_step`; `train_step` returns a metrics dict (loss, grad_norm). no eval loop, no metrics logger, `self.parallel` is DDP or FSDP behind one surface (`requires_sync`, `sync()`, `shard_dims`, `shard_dim_of`), so `train_step` and checkpointing never branch on the strategy. torch is seeded from `config.seed`: one shared seed through init, then a per-dp-rank stream (`seed + 1 + dp coord`) |
 | checkpointing | **done (phase 3; multi-axis layout 11/10).** shard layouts are a grid over one or more axes (dp_shard, tp), each piece a box of the full tensor, so any grid loads onto any other. per-step dirs, `resume: null \| "auto" \| <step>`, full state (model/optimizer/scheduler/dataloader/rng/config). sharded: one rank per shard writes `{model,optimizer}_shard{k}.pt`, load reshards any saved shard count onto the current layout (fsdp ↔ hsdp ↔ ddp) via mmap range reads. per-dp-rank dataloader and rng files. per-rank `.done{rank}of{world}` markers instead of a barrier. async by default (`checkpointing.async_save`): cpu snapshot, background-thread write. a mesh change needs `resume_dataloader: false`. the prefetcher's held batch is saved, so resume no longer skips one. SIGTERM → checkpoint at the next log point → exit (second SIGTERM kills). tests: `tests/checkpointer.py`, `tests/sharded_checkpoint.py` (both in ci) |
 | objectives | AR CE, with the chunked fused-linear-CE landed and wired into `ARObjective` (default on). backward scales the stashed grads in place — see DEV_LOG 7/27 |
-| dataloader | two paths, chosen by `data.name` / `data.mix`. **hf:** streaming HF + packing (stream + best-fit-decreasing) + stateful; splits by the mesh's dp coordinate. **mix (11/19):** pre-tokenized token shards (`tokenize_shards.py`) read by byte range from disk / http / `hf://`, mixed per step by a python schedule (`mixes/*.py`); exact per-step counts, rank-disjoint blocks, O(1) resume — see DATA_MIXING.md, `tests/mixture_loader.py` (ci). both feed the CUDA prefetcher. packing allows cross-document attention unless `doc_mask` is on (flex attention, qwen3 + olmo3; TORCHTITAN_COMPARE.md) |
+| dataloader | **one path (11/19)**, no torch DataLoader / hf `datasets`: `data.source` (one dataset) or `data.mix` (a python schedule, `mixes/*.py`). sources: raw jsonl (byte-range blocks split at newlines, no index), jsonl.zst/.gz (whole-file blocks), parquet (row-group blocks), all tokenized on fetch threads (or `data.workers` processes); image-caption parquet decoded the same way (uint8 pixels); optional pre-tokenized token shards (`tokenize_shards.py`). local / http / `hf://`, kept-alive connections + cached hub redirects. exact per-step counts, rank-disjoint blocks, O(1) resume. loader-only 5.9x the old hf path's text tok/s and 4.5x its coco images/s, first batch in seconds; end-to-end equal to the old path for text and the vlm (vlm with `data.workers`) — DATA_LOADING.md, DATA_MIXING.md, `tests/{data_sources,mixture_loader}.py` (ci). feeds the CUDA prefetcher. packing allows cross-document attention unless `doc_mask` is on (flex attention, qwen3 + olmo3; TORCHTITAN_COMPARE.md) |
 
 ### known correctness debt
 
@@ -79,11 +79,18 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
   through a schedule switch; `mix/*` reaches wandb. see DATA_MIXING.md.
 - fixed 11/10: prefetcher one-batch skip on resume. the held batch is saved
   as `prefetcher_dp{c}.pt` and handed back first on resume.
-- **the trainer's dataloader workers ignore SIGTERM** (so a group-wide
-  SIGTERM leaves the run able to reach its checkpoint). opt-in via
-  `build_dataloader(shield_sigterm=True)`; the trainer pairs it with an atexit
-  teardown (`dataloader.builder.shutdown_workers`). other callers
-  (`eval_ppl.py`) get ordinary workers.
+- 11/19: the loader is threads in the trainer process by default; with
+  `data.workers: N` it uses N spawn processes, which ignore SIGTERM (as the
+  old torch workers did) and are killed by `MixtureLoader.close()` (atexit).
+- fixed 11/19: `resume_dataloader: false` rebuilt the loader with the same
+  seed at epoch 0, so the run replayed its own data from the start. it now
+  reseeds with `seed + step`: a fresh order, which can still overlap what
+  the run saw (a mesh-independent loader position is the real fix).
+- **the vlm branch needs a small change to use the new loader**: caption
+  batches carry uint8 `pixel_values`, and `SigLIPVisionTower.forward` must
+  cast and normalize (`/127.5 - 1`) them; its config moves `image_field`
+  into `data.source` and needs `data.workers` (8): on threads the vlm
+  trains 15-30% slower from gil contention (DATA_LOADING.md).
 - **the SIGTERM stop is only checked at log points**, so the worst case
   before the checkpoint starts is `log_every` steps. torchrun gives its
   workers a fixed grace period after forwarding the signal before it

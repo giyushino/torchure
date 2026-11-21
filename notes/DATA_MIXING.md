@@ -1,12 +1,14 @@
 # data mixing (11/19)
 
-a second data path beside the hf stream: pre-tokenized token shards, read
-by byte range, mixed per optimizer step by a python schedule. code:
-`torchure/dataloader/{shards,mixture,tokenize_shards}.py`, tests:
-`tests/mixture_loader.py` (ci), example: `mixes/smoke.py` +
-`configs/qwen3_dense_mix_smoke.json`.
+sources mixed per optimizer step by a python schedule. since 11/19 this is
+the only data path: the hf stream is gone, and sources can be raw jsonl /
+parquet tokenized while training (DATA_LOADING.md) as well as the
+pre-tokenized token shards below. code:
+`torchure/dataloader/{sources,shards,mixture,tokenize_shards}.py`, tests:
+`tests/mixture_loader.py`, `tests/data_sources.py` (ci), example:
+`mixes/smoke.py` + `configs/qwen3_dense_mix_smoke.json`.
 
-## why not the hf stream
+## why not the hf stream (historical)
 
 - **resume.** a streamed jsonl shard has no seek, so resuming means
   re-downloading and re-parsing everything already consumed in the current
@@ -21,9 +23,11 @@ the fix isn't "do the http ourselves", it's a format with random access.
 once rows are addressable by byte offset, resume, shuffling and mixing all
 become arithmetic.
 
-## format
+## token-shard format (optional since 11/19)
 
-a source is a directory or url prefix:
+raw sources need no preparation; a token-shard copy is for data reused
+across many runs or epochs. a token-shard source is a directory or url
+prefix:
 
 ```
 index.json   {"format": "torchure-tokens", "version": 1, "dtype": "uint32",
@@ -44,8 +48,9 @@ request. a source with fewer blocks than dp ranks gets smaller blocks.
 
 locations: a local path (pread), `http(s)://` (any server that honors
 `Range`: r2, s3, a cdn), or `hf://datasets/<org>/<name>[/<subdir>]` (→ the
-hub's resolve url; `HF_TOKEN` is sent if set and stripped on the redirect to
-the cdn). reads retry 408/425/429/5xx and connection errors with capped
+hub's resolve url; `HF_TOKEN` is sent only to the hub, never to the cdn it
+redirects to; redirects are cached per file and connections kept alive,
+DATA_LOADING.md). reads retry 408/425/429/5xx and connection errors with capped
 exponential backoff + jitter; a server that ignores Range is an error, not a
 silent whole-file download. measured 11/19: a 16MB range read through the
 hub's redirect takes ~0.62s (~25MB/s per connection); training needs
@@ -54,7 +59,7 @@ hub's redirect takes ~0.62s (~25MB/s per connection); training needs
 making a source:
 
 ```
-uv run -m torchure.dataloader.tokenize_shards --dataset OptimalScale/ClimbMix \
+uv run -m torchure.dataloader.tokenize_shards --source hf://datasets/OptimalScale/ClimbMix \
     --tokenizer Qwen/Qwen3-0.6B --eos-token "<|endoftext|>" \
     --max-tokens 2e9 --out data/climbmix_qwen3
 hf upload <org>/climbmix-qwen3 data/climbmix_qwen3 --repo-type dataset   # optional
@@ -64,18 +69,25 @@ tokenization uses the same `encode_batch` call as the hf path's packer.
 
 ## the mix script
 
-config: `"data": {"name": null, "mix": "mixes/smoke.py"}` (exactly one of
-`name` / `mix`). the script:
+config: `"data": {"source": null, "mix": "mixes/smoke.py"}` (exactly one of
+`source` / `mix`). the script:
 
 ```python
-SOURCES = {"climbmix": "hf://datasets/<org>/climbmix-qwen3", "fineweb_edu": "data/fwedu"}
+SOURCES = {
+    "climbmix": "hf://datasets/OptimalScale/ClimbMix",              # raw jsonl
+    "fineweb_edu": "hf://datasets/HuggingFaceFW/fineweb-edu/sample/10BT",  # raw parquet
+    "code": "data/stack_qwen3",                                      # token shards
+}
 
 def weights(step: int, total_steps: int) -> dict[str, float]:
     edu = 0.1 if step < 0.9 * total_steps else 0.5
     return {"climbmix": 1 - edu, "fineweb_edu": edu}
 ```
 
-weights are relative; a source left out gets 0; unknown names, negatives
+a value is a location or a dict `{"path", "files", "text_field",
+"image_field", "window_blocks"}` (DATA_LOADING.md). sources must agree on
+the row type: text and image-caption sources don't mix yet. weights are
+relative; a source left out gets 0; unknown names, negatives
 and all-zero are errors. **`weights` must be a pure function of its
 arguments**: every rank calls it independently and a resume calls it
 again. the normalized mix is logged to wandb as `mix/<name>`.
