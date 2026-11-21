@@ -1,0 +1,168 @@
+# torchure
+
+A pure pytorch training stack for autoregressive transformer LLMs. No
+megatron, deepspeed, accelerate, or liger. the device mesh, collectives, and
+parallelism are implemented here and tested against pytorch's own.
+
+## usage
+
+one json config drives a run, from a single gpu up to multi-node data parallel
+(ddp, fsdp, hsdp), with no code changes to scale up or down. see `configs/`
+for examples and `notes/` for optimization history and the roadmap.
+
+torch is installed from pytorch's cuda 13.0 index (`[tool.uv.sources]` in
+`pyproject.toml`), which needs nvidia driver >= 580. on an older driver,
+delete that block and run `uv lock` to get pypi's default cuda 12.8 build
+(about 20% slower on h100, see below).
+
+```bash
+uv pip install -e .            # add ".[wandb]" for wandb logging
+# or: uv sync --extra wandb    (plain `uv sync` drops wandb)
+
+# single gpu
+uv run -m torchure.train.train --config configs/qwen3_dense_climbmix.json
+
+# multi gpu
+uv run torchrun --nproc-per-node 8 -m torchure.train.train \
+    --config configs/qwen3_dense_climbmix_ddp.json
+
+# benchmark mode: N steps, no checkpointing, prints tps + peak mem
+uv run torchrun --nproc-per-node 8 -m torchure.train.train \
+    --config configs/qwen3_dense_climbmix_ddp.json --steps 20
+```
+
+## configs
+
+a config is checked against a schema (`torchure/config.py`) before anything
+is built: an unknown key is an error, optional keys get their defaults there.
+`"base": "other.json"` starts from another config and overrides it, so most
+files in `configs/` only state what differs from `qwen3_dense_climbmix.json`.
+
+`mesh` picks the layout: `dp_replicate`, `dp_shard` (`dp` for short), `tp`,
+`ep`. `ep` is expert parallel for moe models (`kimi_k31`): each ep rank
+holds a slice of every layer's experts and reads its own data, and tokens
+travel to the experts. see `configs/kimi_k31_4b_climbmix_fsdp_ep.json`.
+
+`torchure.inference.export` turns any checkpoint, however it was sharded,
+into one plain state_dict file.
+
+## performance
+
+all numbers are bf16, seq_len 4096, global tokens/sec, plain causal
+attention unless noted.
+
+### current build (torch 2.10 cu130), 4x H100 NVL
+
+global batch 32 (0.6B) / 16 (4B), no grad accumulation. torchtitan is main
+@ 1ae2914 on torch 2.16 nightly (cu132), with its collator patched to plain
+causal so both do the same attention work. details:
+`notes/TORCHTITAN_COMPARE.md`.
+
+| model, layout | mb | torchure, cu128 | torchure, cu130 | + bf16 grad reduce | torchtitan |
+|---------------|----|-----------------|-----------------|--------------------|------------|
+| 0.6B, ddp | 4 | 196k | 239k | 243k | 213k |
+| 0.6B, fsdp | 4 | 186k | 227k | 232k | 199k |
+| 0.6B, fsdp | 8 | - | 243k | **246k** | 218k |
+| 4B, fsdp | 4 | 45.5k | 49.5k | **50.2k** | 46.6k |
+
+the cuda 12.8 -> 13.0 wheel (same torch 2.10) is the whole jump: the torch
+version itself makes no difference.
+
+**document masking** (`"doc_mask": true`: attend within documents only,
+flex attention, positions restart per doc) skips attention between packed
+documents, so it is faster on short-doc data. 0.6B, same box:
+
+| layout | mb | climbmix, causal | climbmix, doc_mask | c4, doc_mask | torchtitan, c4, doc mask |
+|--------|----|------------------|--------------------|--------------|--------------------------|
+| ddp | 4 | 239k | 265k | 270k | 250k |
+| fsdp, bf16 reduce | 8 | 246k | 276k | **281k** | - |
+
+doc masking changes training (no cross-document attention), not just
+speed: loss curves aren't comparable with causal runs.
+
+**vs nanochat** (karpathy/nanochat, FA3, its own gpt + muon), 4x H100 NVL,
+mfu from each model's own `6N + 12·L·H·head_dim·seq` flops/token: nanochat
+at a matching 28-layer, 1024-wide, seq 4096 shape does 376k tok/s at 42.0%
+mfu (its default d24 at seq 2048: 295k, 42.2%); torchure qwen3 0.6B causal
+does 239k-246k at 45.8-47.0%. the tok/s gap is the models (qwen3's 152k
+vocab and 2x wider attention cost ~1.7x the flops per token), not the stack.
+
+the tables below were measured on the cuda 12.8 build.
+
+### ddp vs fsdp vs hsdp, 2x8 H100 SXM (infiniband)
+
+cells are tps / mfu (989 TFLOPS peak, `6N + 12·L·H·head_dim·seq` flops/token).
+no grad accumulation; mb = micro batch per gpu. hsdp = fsdp within a node,
+replicated across nodes. fsdp is torchure's own fsdp2 (`parallelism/fsdp2.py`).
+
+**qwen3 0.6B**
+
+| layout | mb 4 | mb 8 | mb 12 |
+|--------|------|------|-------|
+| ddp, 8 gpus | 483k / 38.2% | 509k / 40.3% | - |
+| fsdp, 8 gpus | 483k / 38.2% | 513k / 40.6% | 528k / 41.8% |
+| ddp, 16 gpus | 928k / 36.7% | 989k / 39.1% | - |
+| fsdp, 16 gpus | 782k / 30.9% | 990k / 39.1% | **1.06M / 41.9%** |
+| hsdp, 2x8 gpus | 753k / 29.8% | 902k / 35.7% | 974k / 38.5% |
+
+**qwen3 4B**
+
+| layout | mb 1 | mb 2 | mb 3 | mb 4 |
+|--------|------|------|------|------|
+| ddp, 8 gpus | 84k / 33.4% | - | - | - |
+| fsdp, 8 gpus | 97k / 38.6% | 112k / 44.6% | 119k / **47.3%** | oom |
+| ddp, 16 gpus | 120k / 23.8% | - | - | - |
+| fsdp, 16 gpus | 105k / 20.8% | 160k / 31.6% | 202k / 40.0% | **217k** / 43.0% |
+| hsdp, 2x8 gpus | 100k / 19.8% | 148k / 29.4% | 179k / 35.5% | oom |
+
+### single node, qwen3 0.6B, mb 2
+
+| hardware | tps | ddp scaling eff |
+|----------|-----|-----------------|
+| 1x A40 | ~13.3k | |
+| 1x A6000 | ~14.4k | |
+| 1x H100 NVL | ~54.5k | |
+| 8x A40 | ~73.5k | 69% |
+| 8x A6000 | ~86.4k | 60% |
+| 4x H100 NVL | ~198k | 92% |
+
+### tensor parallel, 4x H100 NVL (nvlink pairs 0-1 and 2-3)
+
+cells are tps / mfu (835 TFLOPS peak, same flops formula) / peak mem. 50-step
+runs, sequence parallel on unless noted. dp x tp layouts put each tp pair on
+an nvlink pair. `sp_dim` is what sp shards between regions (`tp.sp_dim`):
+"seq" (default) or "batch", which keeps each rank's chunk contiguous so the
+collectives need no layout copies (needs micro batch % tp == 0).
+
+**qwen3 0.6B**, global batch 32, no grad accumulation
+
+| layout | mb | result |
+|--------|----|--------|
+| ddp, 4 gpus | 8 | 198k / 37.1% / 56.2 GiB |
+| fsdp, 4 gpus | 8 | **198k / 37.1%** / 47.1 GiB |
+| tp 4 | 32 | 83k / 15.5% / 59.6 GiB |
+| fsdp 2 x tp 2, no sp | 16 | 172k / 32.2% / 53.3 GiB |
+
+| dp 2 x tp 2, mb 16 | fsdp | ddp |
+|--------------------|------|-----|
+| sp_dim seq | 162k / 30.4% / 49.8 GiB | 152k / 28.6% / 56.3 GiB |
+| sp_dim seq, overlap backward | 157k / 29.5% / 54.7 GiB | 147k / 27.6% / 61.1 GiB |
+| sp_dim seq, overlap collective_matmul | 155k / 29.0% / 54.7 GiB | 144k / 26.9% / 61.1 GiB |
+| sp_dim batch | **174k / 32.6%** / 49.7 GiB | **162k / 30.5%** / 56.3 GiB |
+| sp_dim batch, overlap backward | 171k / 32.2% / 54.5 GiB | 160k / 30.0% / 61.1 GiB |
+| sp_dim batch, overlap collective_matmul | 168k / 31.5% / 54.5 GiB | 156k / 29.3% / 61.1 GiB |
+
+**qwen3 4B**, global batch 16
+
+| layout | mb | result |
+|--------|----|--------|
+| ddp, 4 gpus | 4 | oom |
+| fsdp, 4 gpus | 4 | **44.4k / 41.7%** / 82.1 GiB |
+| ddp 2 x tp 2 | 8 | oom |
+| ddp 2 x tp 2 (2x accum) | 4 | 36.2k / 34.0% / 77.0 GiB |
+| fsdp 2 x tp 2, sp_dim seq | 8 | 39.3k / 36.9% / 86.4 GiB |
+| fsdp 2 x tp 2, sp_dim batch | 8 | 41.5k / 39.0% / 86.3 GiB |
+| fsdp 2 x tp 2, any overlap | 8 | oom (seq + collective_matmul hangs instead) |
+| tp 4 | 16 | oom |
+| tp 4 (2x accum) | 8 | 23.0k / 21.6% / 63.2 GiB |
+

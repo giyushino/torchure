@@ -1,168 +1,163 @@
 # torchure
 
-A pure pytorch training stack for autoregressive transformer LLMs. No
-megatron, deepspeed, accelerate, or liger. the device mesh, collectives, and
-parallelism are implemented here and tested against pytorch's own.
+A training stack for transformer language models, written in plain PyTorch.
 
-## usage
+Most LLM training code builds on large frameworks: Megatron, DeepSpeed,
+Accelerate, or PyTorch's own `torch.distributed` sharding APIs. torchure
+implements those pieces itself: the device mesh, the collectives, and data,
+fully sharded, tensor and expert parallelism. Each one is small enough to
+read, and each is tested against PyTorch's own version. The only runtime
+dependencies are `torch`, `numpy`, `tokenizers` and `pyarrow`.
 
-one json config drives a run, from a single gpu up to multi-node data parallel
-(ddp, fsdp, hsdp), with no code changes to scale up or down. see `configs/`
-for examples and `notes/` for optimization history and the roadmap.
+It's meant for:
 
-torch is installed from pytorch's cuda 13.0 index (`[tool.uv.sources]` in
-`pyproject.toml`), which needs nvidia driver >= 580. on an older driver,
-delete that block and run `uv lock` to get pypi's default cuda 12.8 build
-(about 20% slower on h100, see below).
+- **learning how distributed training works.** You can follow a gradient
+  from the backward pass through the bucketed all-reduce or reduce-scatter,
+  without digging through framework layers.
+- **training small-to-mid-size models** (0.6B–7B) on anything from one GPU
+  to several nodes, with the same code and only a config change.
+
+## What's included
+
+| | |
+|---|---|
+| **Models** | Qwen3 (dense), OLMo 3 (sliding-window attention), and a Kimi-style mixture-of-experts model with linear attention |
+| **Parallelism** | DDP, FSDP (a from-scratch FSDP2), HSDP, tensor + sequence parallel, expert parallel, freely combined on one device mesh |
+| **Data** | Streams datasets straight from the Hugging Face Hub, HTTP or local disk (jsonl, parquet, pre-tokenized shards) and tokenizes on the fly, so there's no preprocessing step. Weighted mixes of several datasets whose weights can change over training |
+| **Training** | bf16, fused linear + cross-entropy loss, `torch.compile`, activation checkpointing, document masking, WSD/cosine schedules, optional wandb logging |
+| **Checkpoints** | Sharded and async. They resume on a *different* number of GPUs or a different layout, and a job that gets SIGTERM saves before it exits |
+| **Inference** | Export any checkpoint to a single `state_dict`, measure perplexity, or run a simple text-continuation REPL |
+
+## Quick start
+
+You need Python 3.14, [uv](https://docs.astral.sh/uv/), and an NVIDIA GPU.
 
 ```bash
-uv pip install -e .            # add ".[wandb]" for wandb logging
-# or: uv sync --extra wandb    (plain `uv sync` drops wandb)
-
-# single gpu
-uv run -m torchure.train.train --config configs/qwen3_dense_climbmix.json
-
-# multi gpu
-uv run torchrun --nproc-per-node 8 -m torchure.train.train \
-    --config configs/qwen3_dense_climbmix_ddp.json
-
-# benchmark mode: N steps, no checkpointing, prints tps + peak mem
-uv run torchrun --nproc-per-node 8 -m torchure.train.train \
-    --config configs/qwen3_dense_climbmix_ddp.json --steps 20
+git clone <this repo> && cd torchure
+uv sync                      # or: uv sync --extra wandb
 ```
 
-## configs
+> **Driver note:** torch is installed from PyTorch's CUDA 13.0 index, which
+> needs NVIDIA driver ≥ 580. On an older driver, delete the
+> `[tool.uv.sources]` block in `pyproject.toml` and run `uv lock` to get the
+> default CUDA 12.8 build. It works the same, just about 20% slower on H100.
 
-a config is checked against a schema (`torchure/config.py`) before anything
-is built: an unknown key is an error, optional keys get their defaults there.
-`"base": "other.json"` starts from another config and overrides it, so most
-files in `configs/` only state what differs from `qwen3_dense_climbmix.json`.
+Train a 0.6B Qwen3 on one GPU. Data streams from the Hub, so there's
+nothing to download first:
 
-`mesh` picks the layout: `dp_replicate`, `dp_shard` (`dp` for short), `tp`,
-`ep`. `ep` is expert parallel for moe models (`kimi_k31`): each ep rank
-holds a slice of every layer's experts and reads its own data, and tokens
-travel to the experts. see `configs/kimi_k31_4b_climbmix_fsdp_ep.json`.
+```bash
+uv run -m torchure.train.train --config configs/qwen3_dense_climbmix.json
+```
 
-`torchure.inference.export` turns any checkpoint, however it was sharded,
-into one plain state_dict file.
+Same model, 8 GPUs, data parallel:
 
-## performance
+```bash
+uv run torchrun --nproc-per-node 8 -m torchure.train.train \
+    --config configs/qwen3_dense_climbmix_ddp.json
+```
 
-all numbers are bf16, seq_len 4096, global tokens/sec, plain causal
-attention unless noted.
+Add `--steps 20` to either command for a quick benchmark: it runs 20 steps,
+skips checkpointing, and prints throughput and peak memory.
 
-### current build (torch 2.10 cu130), 4x H100 NVL
+After training, use a checkpoint:
 
-global batch 32 (0.6B) / 16 (4B), no grad accumulation. torchtitan is main
-@ 1ae2914 on torch 2.16 nightly (cu132), with its collator patched to plain
-causal so both do the same attention work. details:
-`notes/TORCHTITAN_COMPARE.md`.
+```bash
+# perplexity on fresh batches
+uv run -m torchure.inference.eval_ppl --config <config> --step <step>
+# interactive text continuation
+uv run -m torchure.inference.chat --config <config> --step <step>
+# one plain state_dict file, however the checkpoint was sharded
+uv run -m torchure.inference.export --help
+```
 
-| model, layout | mb | torchure, cu128 | torchure, cu130 | + bf16 grad reduce | torchtitan |
-|---------------|----|-----------------|-----------------|--------------------|------------|
-| 0.6B, ddp | 4 | 196k | 239k | 243k | 213k |
-| 0.6B, fsdp | 4 | 186k | 227k | 232k | 199k |
-| 0.6B, fsdp | 8 | - | 243k | **246k** | 218k |
-| 4B, fsdp | 4 | 45.5k | 49.5k | **50.2k** | 46.6k |
+## Configs
 
-the cuda 12.8 -> 13.0 wheel (same torch 2.10) is the whole jump: the torch
-version itself makes no difference.
+Each run is described by one JSON file. A few things to know:
 
-**document masking** (`"doc_mask": true`: attend within documents only,
-flex attention, positions restart per doc) skips attention between packed
-documents, so it is faster on short-doc data. 0.6B, same box:
+- **Configs inherit.** `"base": "other.json"` starts from another config and
+  overrides parts of it, so most files in `configs/` only list what differs
+  from `qwen3_dense_climbmix.json`.
+- **Configs are validated.** Every config is checked against the schema in
+  `torchure/config.py` before anything is built. Unknown keys are errors, and
+  optional keys get their defaults there.
+- **`mesh` picks the parallel layout.** Its axes are `dp_replicate`,
+  `dp_shard` (or just `dp`), `tp` (tensor parallel) and `ep` (expert parallel,
+  for MoE models). `"parallelism": "ddp"` or `"fsdp"` says how the data
+  parallel axes hold the model.
+- **`data` picks the training data.** Use either `source` (one dataset) or
+  `mix` (a Python file of weighted sources, like `mixes/smoke.py`).
 
-| layout | mb | climbmix, causal | climbmix, doc_mask | c4, doc_mask | torchtitan, c4, doc mask |
-|--------|----|------------------|--------------------|--------------|--------------------------|
-| ddp | 4 | 239k | 265k | 270k | 250k |
-| fsdp, bf16 reduce | 8 | 246k | 276k | **281k** | - |
+Starting points:
 
-doc masking changes training (no cross-document attention), not just
-speed: loss curves aren't comparable with causal runs.
+| config | what it runs |
+|---|---|
+| `qwen3_dense_climbmix.json` | Qwen3 0.6B, single GPU |
+| `qwen3_dense_climbmix_ddp.json` | the same, data parallel |
+| `qwen3_dense_climbmix_fsdp_h100.json` / `_hsdp_h100.json` / `_tp_h100.json` | FSDP, hybrid sharding, tensor parallel |
+| `qwen3_dense_mix_smoke.json` | a two-dataset mix whose weights change over training |
+| `olmo3_7b_dolma.json` | OLMo 3 7B |
+| `kimi_k31_4b_climbmix_fsdp_ep.json` | 4B mixture-of-experts with FSDP + expert parallel |
 
-**vs nanochat** (karpathy/nanochat, FA3, its own gpt + muon), 4x H100 NVL,
-mfu from each model's own `6N + 12·L·H·head_dim·seq` flops/token: nanochat
-at a matching 28-layer, 1024-wide, seq 4096 shape does 376k tok/s at 42.0%
-mfu (its default d24 at seq 2048: 295k, 42.2%); torchure qwen3 0.6B causal
-does 239k-246k at 45.8-47.0%. the tok/s gap is the models (qwen3's 152k
-vocab and 2x wider attention cost ~1.7x the flops per token), not the stack.
+## Performance
 
-the tables below were measured on the cuda 12.8 build.
+All numbers are bf16, sequence length 4096, global tokens/sec.
 
-### ddp vs fsdp vs hsdp, 2x8 H100 SXM (infiniband)
+**vs torchtitan** (PyTorch's reference trainer), 4× H100 NVL, Qwen3 with
+plain causal attention:
 
-cells are tps / mfu (989 TFLOPS peak, `6N + 12·L·H·head_dim·seq` flops/token).
-no grad accumulation; mb = micro batch per gpu. hsdp = fsdp within a node,
-replicated across nodes. fsdp is torchure's own fsdp2 (`parallelism/fsdp2.py`).
+| model, layout | torchure | torchtitan |
+|---|---|---|
+| 0.6B, DDP | 243k | 213k |
+| 0.6B, FSDP | 246k | 218k |
+| 4B, FSDP | 50.2k | 46.6k |
 
-**qwen3 0.6B**
+**Scaling** to 2 nodes × 8 H100 SXM (InfiniBand), FSDP:
 
-| layout | mb 4 | mb 8 | mb 12 |
-|--------|------|------|-------|
-| ddp, 8 gpus | 483k / 38.2% | 509k / 40.3% | - |
-| fsdp, 8 gpus | 483k / 38.2% | 513k / 40.6% | 528k / 41.8% |
-| ddp, 16 gpus | 928k / 36.7% | 989k / 39.1% | - |
-| fsdp, 16 gpus | 782k / 30.9% | 990k / 39.1% | **1.06M / 41.9%** |
-| hsdp, 2x8 gpus | 753k / 29.8% | 902k / 35.7% | 974k / 38.5% |
+| model | 8 GPUs | 16 GPUs | MFU at 16 |
+|---|---|---|---|
+| Qwen3 0.6B | 528k | 1.06M | 41.9% |
+| Qwen3 4B | 119k | 217k | 43.0% |
 
-**qwen3 4B**
+**Document masking** (`"doc_mask": true`) stops tokens from attending across
+packed documents. On short-document data it's also faster: 0.6B FSDP goes
+from 246k to 276k tok/s. It changes what the model learns, though, so loss
+curves aren't comparable with plain causal runs.
 
-| layout | mb 1 | mb 2 | mb 3 | mb 4 |
-|--------|------|------|------|------|
-| ddp, 8 gpus | 84k / 33.4% | - | - | - |
-| fsdp, 8 gpus | 97k / 38.6% | 112k / 44.6% | 119k / **47.3%** | oom |
-| ddp, 16 gpus | 120k / 23.8% | - | - | - |
-| fsdp, 16 gpus | 105k / 20.8% | 160k / 31.6% | 202k / 40.0% | **217k** / 43.0% |
-| hsdp, 2x8 gpus | 100k / 19.8% | 148k / 29.4% | 179k / 35.5% | oom |
+The old README (`readme_old.md`) has the full tables, and `notes/` has
+the write-ups: the torchtitan comparison, DDP/FSDP/TP sweeps on several GPU
+types, the MoE work, and the data loader design.
 
-### single node, qwen3 0.6B, mb 2
+## Repository layout
 
-| hardware | tps | ddp scaling eff |
-|----------|-----|-----------------|
-| 1x A40 | ~13.3k | |
-| 1x A6000 | ~14.4k | |
-| 1x H100 NVL | ~54.5k | |
-| 8x A40 | ~73.5k | 69% |
-| 8x A6000 | ~86.4k | 60% |
-| 4x H100 NVL | ~198k | 92% |
+```
+torchure/
+  core/          device mesh, collectives, a minimal DTensor, grad clipping
+  parallelism/   ddp, fsdp2, tensor parallel (+ comm overlap), expert parallel
+  models/        qwen3, olmo3, kimi_k31, shared layers and moe
+  dataloader/    streaming sources, mixing, packing, prefetch
+  checkpoint/    sharded, async, reshardable checkpoints
+  loss/          cross entropy and fused linear + cross entropy
+  train/         entrypoint, trainer, overlap profiler
+  inference/     export, perplexity, chat
+configs/         run configs
+mixes/           data mix scripts
+tests/           standalone test scripts
+notes/           design notes, benchmarks, roadmap
+```
 
-### tensor parallel, 4x H100 NVL (nvlink pairs 0-1 and 2-3)
+## Tests
 
-cells are tps / mfu (835 TFLOPS peak, same flops formula) / peak mem. 50-step
-runs, sequence parallel on unless noted. dp x tp layouts put each tp pair on
-an nvlink pair. `sp_dim` is what sp shards between regions (`tp.sp_dim`):
-"seq" (default) or "batch", which keeps each rank's chunk contiguous so the
-collectives need no layout copies (needs micro batch % tp == 0).
+Each test is a standalone script. Most run on CPU with the gloo backend, so
+they don't need GPUs:
 
-**qwen3 0.6B**, global batch 32, no grad accumulation
+```bash
+uv run tests/fsdp2.py --world-size 4
+uv run tests/tensor_parallel.py
+uv run tests/sharded_checkpoint.py
+```
 
-| layout | mb | result |
-|--------|----|--------|
-| ddp, 4 gpus | 8 | 198k / 37.1% / 56.2 GiB |
-| fsdp, 4 gpus | 8 | **198k / 37.1%** / 47.1 GiB |
-| tp 4 | 32 | 83k / 15.5% / 59.6 GiB |
-| fsdp 2 x tp 2, no sp | 16 | 172k / 32.2% / 53.3 GiB |
+`.github/workflows/ci.yml` has the full list CI runs.
 
-| dp 2 x tp 2, mb 16 | fsdp | ddp |
-|--------------------|------|-----|
-| sp_dim seq | 162k / 30.4% / 49.8 GiB | 152k / 28.6% / 56.3 GiB |
-| sp_dim seq, overlap backward | 157k / 29.5% / 54.7 GiB | 147k / 27.6% / 61.1 GiB |
-| sp_dim seq, overlap collective_matmul | 155k / 29.0% / 54.7 GiB | 144k / 26.9% / 61.1 GiB |
-| sp_dim batch | **174k / 32.6%** / 49.7 GiB | **162k / 30.5%** / 56.3 GiB |
-| sp_dim batch, overlap backward | 171k / 32.2% / 54.5 GiB | 160k / 30.0% / 61.1 GiB |
-| sp_dim batch, overlap collective_matmul | 168k / 31.5% / 54.5 GiB | 156k / 29.3% / 61.1 GiB |
+## License
 
-**qwen3 4B**, global batch 16
-
-| layout | mb | result |
-|--------|----|--------|
-| ddp, 4 gpus | 4 | oom |
-| fsdp, 4 gpus | 4 | **44.4k / 41.7%** / 82.1 GiB |
-| ddp 2 x tp 2 | 8 | oom |
-| ddp 2 x tp 2 (2x accum) | 4 | 36.2k / 34.0% / 77.0 GiB |
-| fsdp 2 x tp 2, sp_dim seq | 8 | 39.3k / 36.9% / 86.4 GiB |
-| fsdp 2 x tp 2, sp_dim batch | 8 | 41.5k / 39.0% / 86.3 GiB |
-| fsdp 2 x tp 2, any overlap | 8 | oom (seq + collective_matmul hangs instead) |
-| tp 4 | 16 | oom |
-| tp 4 (2x accum) | 8 | 23.0k / 21.6% / 63.2 GiB |
-
+MIT. See [LICENSE](LICENSE).
