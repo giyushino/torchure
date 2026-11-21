@@ -1,7 +1,7 @@
 {
   "base": "qwen3_dense_climbmix.json",
   "data": {
-    "name": "allenai/dolma3_mix-6T"
+    "source": "hf://datasets/allenai/dolma3_mix-6T"
   },
   "run_name": "dolma3_test_run_1"
 }
