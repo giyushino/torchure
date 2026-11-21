@@ -6,9 +6,8 @@ run (gloo/cpu, no gpus needed, works on a single-gpu box):
 or under torchrun (required for nccl, needs one gpu per rank):
     uv run torchrun --nproc-per-node 2 tests/collective.py --backend nccl
 
-the tests are implemented; the collectives in torchure/core/collective.py
-are the stubs. a test goes green when its collective honors the contract in
-its docstring (in-place vs new tensor, coordinate vs global rank, etc.).
+each test holds a collective to the contract in its docstring (in-place vs
+new tensor, coordinate vs global rank, etc.).
 
 value scheme used throughout (see rank_pattern): rank at coordinate c holds
     x_c = arange(numel).reshape(shape) * (c + 1)

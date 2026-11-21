@@ -1,7 +1,7 @@
 """
 dataloader builder. there is one loader, MixtureLoader (mixture.py): a single
-dataset is `data.source`, a mix of several is `data.mix`. no torch DataLoader,
-no worker processes, no hf `datasets`.
+dataset is `data.source`, a mix of several is `data.mix`. no torch DataLoader
+and no hf `datasets`.
 """
 
 from tokenizers import Tokenizer

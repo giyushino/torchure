@@ -4,26 +4,22 @@ tests for torchure/core/grad_helper.py -- global grad-norm clipping.
 run (gloo/cpu, no gpus needed):
     uv run tests/grad_helper.py --world-size 2
 
-two things are under test and they fail in very different ways:
+two paths are under test:
 
-- the LOCAL path (shard_dims=()), which is what pure DDP uses: grads are
-  replicas post-sync, so every rank already holds the whole gradient vector and
-  the norm is a local computation. checked against
-  `torch.nn.utils.clip_grad_norm_` on a real (tiny) Qwen3, so the tied
-  embedding -- one param reached through two modules, and `model.parameters()`
-  must yield it once or the norm double-counts it -- is exercised.
+- LOCAL (shard_dims=()), what pure ddp uses: after sync the grads are
+  replicas, so every rank holds the whole gradient and the norm is a local
+  computation. checked against `torch.nn.utils.clip_grad_norm_` on a tiny
+  real Qwen3, whose tied embedding must be counted once, not twice.
 
-- the SHARDED path (shard_dims=("dp",)), which nothing in the trainer uses yet
-  but fsdp2/tp inherit directly: each rank holds a slice of the gradient
-  vector, so the norm needs sum-of-p-th-powers reduced across the axis. norms
-  themselves are NOT additive; the test pins a known vector split across ranks
-  against the true norm of the unsplit vector, which catches the two obvious
-  wrong implementations (all_reduce the norms with "sum", or with "max").
+- SHARDED (shard_dims=("dp",)), what fsdp / tp / ep use: each rank holds a
+  slice of the gradient, so the squared norms are summed across the axis.
+  norms themselves are NOT additive: the test splits a known vector across
+  ranks and checks against the norm of the whole, which catches all_reducing
+  the norms with "sum" or "max".
 
 `test_below_threshold_is_noop` is a regression test: `clip_coef` was once
-clamped to `max_norm` instead of `1.0`, which silently AMPLIFIED every
-gradient that did not need clipping whenever max_norm > 1 (and shrank it when
-max_norm < 1). it is correct at exactly max_norm == 1.0, which is the value
+clamped to `max_norm` instead of `1.0`, which scaled every grad that needed
+no clipping by max_norm. it is correct at exactly max_norm == 1.0, the value
 every config ships, so it passed casual testing.
 """
 

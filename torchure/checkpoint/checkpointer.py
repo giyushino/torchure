@@ -2,36 +2,34 @@
 checkpointing: checkpoints/<run>/<step>/ with one torch.save file per
 component. load_* applies state in place onto a freshly built trainer.
 
-model and optimizer state may be sharded (fsdp). a `ShardLayout` says how THIS
-run lays params out; with the default layout nothing is sharded and the files
-are the plain `model.pt` / `optimizer.pt` this module has always written.
+model and optimizer state may be sharded. a `ShardLayout` says how THIS run
+lays params out; with the default (unsharded) layout the files are plain
+`model.pt` / `optimizer.pt`.
 
 sharded save: a layout has one or more shard AXES (fsdp's dp_shard, tensor
-parallel's tp, or both), and the ranks form a grid over them. the rank at grid
-cell k (row-major) writes `model_shard{k}.pt` / `optimizer_shard{k}.pt`, its
-local state_dict as is. cell 0 also writes `{model,optimizer}_shards.json`:
-the grid, each tensor's unsharded shape, and its `splits` -- which axes cut
-it, along which tensor dim, outermost first. a tensor an axis doesn't cut is
-replicated along that axis and read from coordinate 0.
+parallel's tp, expert parallel's ep), and the ranks form a grid over them.
+the rank at grid cell k (row-major) writes its local state_dict as is, to
+`model_shard{k}.pt` / `optimizer_shard{k}.pt`. cell 0 also writes
+`{model,optimizer}_shards.json`: the grid, each tensor's unsharded shape,
+and its `splits` -- which axes cut it, along which tensor dim, outermost
+first. a tensor an axis doesn't cut is replicated along that axis and read
+from coordinate 0. uneven shards are stored as fsdp holds them, zero-padded
+to equal length; the recorded shape says where the real rows end.
 
-every piece therefore owns a BOX of the full tensor. uneven shards are stored
-as fsdp holds them, zero-padded to equal length; the recorded shape says
-where the real rows end.
-
-load reshards: a checkpoint saved on any grid (including the unsharded one)
-loads onto any current layout, by copying the overlap of each saved box with
-the box this rank wants. files are opened with mmap, so each rank reads only
-the byte ranges it owns and no rank materializes the full model.
+resharding load: every saved piece is a BOX of the full tensor, so a
+checkpoint saved on any grid (including the unsharded one) loads onto any
+current layout, by copying the overlap of each saved box with the box this
+rank wants. files are opened with mmap, so each rank reads only the byte
+ranges it owns and no rank materializes the full model.
 
 optimizer state follows its param: a state tensor shaped like the param
 (adam's exp_avg / exp_avg_sq) is sharded the same way; anything else (the
 `step` counter) is replicated.
 
 completion: `commit(step)` writes this rank's `.done{rank}of{world}` marker
-after its last file. a step is complete once every rank's marker is there, so
-no collective fences the save (a legacy `.complete` file still counts).
-
-retention: `prune(keep_last_n)` deletes older complete checkpoints.
+after its last file. a step is complete once every rank's marker is there,
+so the save needs no collective (a legacy `.complete` file still counts).
+`prune(keep_last_n)` deletes older complete checkpoints.
 
 async (`async_save=True`): save_* snapshot state to cpu and return; commit()
 hands the snapshot to a background thread that writes the files and then the
@@ -61,11 +59,14 @@ Splits = tuple[tuple[int, int], ...]   # ((shard axis index, tensor dim), ...) o
 @dataclass(frozen=True)
 class ShardLayout:
     """
-    how the current run shards params. `counts` is the number of shards along
-    each shard axis and `coords` this rank's cell. for sharded params only,
-    `splits` maps id(param) -> the (axis, tensor dim) cuts applied to it,
-    outermost first, and `shapes` -> its unsharded shape (a local shard may
-    be padded). the default is the unsharded layout.
+    how the current run shards params. the default is the unsharded layout.
+
+    counts   number of shards along each shard axis
+    coords   this rank's cell in that grid
+    splits   id(param) -> the (axis, tensor dim) cuts applied to it, outermost
+             first. sharded params only
+    shapes   id(param) -> its unsharded shape (a local shard may be padded).
+             sharded params only
     """
 
     counts: tuple[int, ...] = ()
@@ -86,9 +87,9 @@ class ShardLayout:
     def of(cls, model: nn.Module, parallel, mesh, tp=None, ep=None) -> "ShardLayout":
         """
         the layout `model` has on this rank under a data-parallel strategy
-        (DDP / FSDP) and, optionally, tensor and/or expert parallel on top.
-        all expose `shard_dims`, `shard_dim_of` and `full_shape_of`. tp and
-        ep cut first: fsdp shards whatever they left on the rank.
+        (DDP / FSDP) plus, optionally, tensor and/or expert parallel. each
+        strategy exposes `shard_dims`, `shard_dim_of` and `full_shape_of`. tp
+        and ep cut first: fsdp shards whatever they left on the rank.
         """
         sources = [s for s in (tp, ep, parallel) if s is not None and s.shard_dims]
         if not sources:
@@ -161,11 +162,12 @@ def _read(
     layout: ShardLayout,
 ) -> torch.Tensor:
     """
-    one tensor of the current layout, from its saved pieces. `pick(shard)`
-    fetches the tensor from one saved shard file. returns this rank's box of
-    it (the whole tensor when `want_splits` is empty), zero-padded to the
-    stored length. always an owning copy: the inputs are mmap views, and a
-    view handed to load_state_dict's deepcopy would drag its whole backing
+    this rank's box of one tensor (the whole tensor when `want_splits` is
+    empty), assembled from its saved pieces and zero-padded to the stored
+    length. `pick(shard)` fetches the tensor from one saved shard file.
+
+    always returns an owning copy: the inputs are mmap views, and a view
+    handed to load_state_dict's deepcopy would drag its whole backing
     storage along.
     """
     want_lo, want_size, want_stored = _box(shape, want_splits, layout.counts, layout.coords)
@@ -202,9 +204,9 @@ def _read(
 
 def _legacy_meta(meta: dict, shards: list[dict], pick_of) -> dict:
     """
-    the single-axis metadata written before layouts had more than one axis
-    (`num_shards`, `dims`, optional `sizes`), in the current form.
-    `pick_of(name, key)` fetches a tensor from a shard.
+    convert the old single-axis metadata (`num_shards`, `dims`, optional
+    `sizes`) to the current form. `pick_of(name, key)` fetches a tensor
+    from a shard.
     """
     out = {"counts": [meta["num_shards"]], "splits": {}, "shapes": {}}
     if any(isinstance(v, dict) for v in meta["dims"].values()):
@@ -271,10 +273,10 @@ class Checkpointer:
 
     def prune(self, keep_last_n: int, keep: tuple[int, ...] = ()) -> list[int]:
         """
-        delete all but the newest `keep_last_n` COMPLETE checkpoints, and
-        return the steps deleted. incomplete step dirs are left alone (one
-        may be another rank's save in flight), and so are the steps in
-        `keep`. call from one rank only.
+        delete all but the newest `keep_last_n` COMPLETE checkpoints and return
+        the steps deleted. steps in `keep` are left alone, and so are incomplete
+        step dirs (one may be another rank's save in flight). call from one
+        rank only.
         """
         assert keep_last_n >= 1, "prune would delete every checkpoint"
         steps = sorted(self._steps())
@@ -313,8 +315,8 @@ class Checkpointer:
 
     def commit(self, step: int) -> None:
         """
-        this rank is done saving `step`: mark it, after every file is on disk.
-        async, this starts the background write and returns.
+        mark `step` as saved by this rank, once all its files are on disk.
+        async: start the background write and return.
         """
         marker = os.path.join(
             self._step_dir(step, create=True), f".done{self.rank}of{self.world_size}"

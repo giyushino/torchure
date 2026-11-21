@@ -1,29 +1,32 @@
 """
-ddp: replicate the model along the mesh's dp axis and keep replicas in
-lockstep by averaging grads across the axis after every backward.
+ddp: every rank along the mesh's dp axis holds a full replica of the model.
+grads are averaged across the axis after backward, which keeps the replicas
+in lockstep.
 
-- buckets follow reverse `model.parameters()` order (roughly backward order),
-  so all-reduces launch from grad hooks while backward is still running.
-- small params share a flat buffer per bucket: grads are copied in, `.grad`
-  is repointed at views of it, and the buffer is all-reduced in place.
-- a param at or over the bucket cap (e.g. the tied embedding) is all-reduced
-  directly through its `.grad`, with no staging copy.
-- `sync()` waits on all handles; call it between backward and optimizer.step.
+- params are grouped into buckets in reverse `model.parameters()` order
+  (roughly backward order), so all-reduces launch from grad hooks while
+  backward is still running.
+- a bucket's grads are copied into one flat buffer that is all-reduced in
+  place; `.grad` is repointed at views of it. a param at or over the bucket
+  cap (e.g. the tied embedding) is all-reduced directly through its `.grad`,
+  with no staging copy.
+- buckets launch in bucket order, on every rank, as each becomes ready. a
+  param that got no grad this step (an moe expert no token picked, a param
+  the forward never used) leaves its bucket unready; `sync()` launches what
+  is left, with zeros for the missing grads. ranks may differ in which grads
+  are missing: the fixed order keeps their collectives paired.
+- `sync()` waits on every reduce; call it between backward and
+  optimizer.step.
 - `requires_sync` is the no_sync switch for grad accumulation: False for the
   first K-1 microbatches, True for the last.
-- buckets are all-reduced in bucket order, on every rank, whenever each
-  becomes ready. a param that got no grad this step (an moe expert no token
-  picked, a param the forward never used) leaves its bucket unready; `sync()`
-  launches what is left with zeros for the missing grads. ranks may differ in
-  which grads are missing: the fixed order keeps their collectives paired.
-
 - `reduce_dtype` (e.g. bf16) all-reduces a cast copy of each bucket and
-  copies the average back into the fp32 grads at `sync()`. half the bytes on
-  the wire for a rounding of the average; None reduces in the grad dtype.
-
-- `dim_of(param)` overrides the axis for individual params: expert parallel's
-  expert weights are replicated over fewer ranks than the rest of the model.
-  None (or an axis of size 1) means the param has no replicas to sync with.
+  copies the average back into the fp32 grads at `sync()`: half the bytes on
+  the wire, at the cost of rounding the average. None reduces in the grad
+  dtype.
+- `dim_of(param)` overrides the axis for individual params: expert
+  parallel's expert weights are replicated over fewer ranks than the rest of
+  the model. None (or an axis of size 1) means the param has no replicas to
+  sync with.
 
 one DDP instance per model: hooks are registered once and never removed.
 """

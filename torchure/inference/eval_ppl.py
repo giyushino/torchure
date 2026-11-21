@@ -1,12 +1,10 @@
 """
 perplexity of a checkpoint over freshly streamed batches of its training set.
 
-no held-out split exists for climbmix (the data config only declares
-"train"), so this is in-distribution perplexity, not a real held-out
-number -- a progress/sanity signal, not a benchmark. the seed is bumped
-from the training config's so the shuffle buffer doesn't hand back the
-exact order the run trained on (a reshuffle can't guarantee zero overlap
-without an actual held-out split).
+there is no held-out split, so this is in-distribution perplexity: a
+progress / sanity signal, not a benchmark. the data seed is bumped from the
+training config's so the batches don't come in the order the run trained
+on, but they can still overlap what it saw.
 
     uv run -m torchure.inference.eval_ppl \
         --config configs/qwen3_dense_climbmix_ddp.json --step 42000

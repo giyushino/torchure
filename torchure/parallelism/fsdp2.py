@@ -1,50 +1,41 @@
 """
-fsdp2: per-parameter Shard(0) sharding along `dp_shard`; hsdp when
-`replicate_dim` is set too.
+fsdp2: every param is sharded along dim 0 (`Shard(0)`) over `dp_shard` and
+gathered only while its unit computes. hsdp when `replicate_dim` is set too.
 
-each param keeps ONE nn.Parameter whose `.data` is swapped between its fp32
-shard (optimizer) and a gathered full buffer (forward/backward). that keeps the
-tied embedding tied, lets grad hooks register once, and means the optimizer
-never sees a DTensor.
+a param keeps ONE nn.Parameter; its `.data` is swapped between the fp32
+shard (what the optimizer sees) and a gathered full buffer (forward and
+backward). so a tied weight stays tied, grad hooks register once, and the
+optimizer never sees a DTensor.
 
-units: the caller passes the submodules to treat as units (for a transformer,
-its blocks); fsdp never looks at the model's attribute names. unit 0 is the
-root unit, everything NOT inside a passed unit (for a transformer: embed, final
-norm, head). it is held unsharded from forward until its backward, because
-code outside `model.forward` may still read those weights (a fused loss reading
-the head weight, for one). each passed unit goes through:
+units: the caller passes the submodules to gather and free together (for a
+transformer, its blocks); fsdp never looks at the model's attribute names.
+each unit goes through:
 
     forward-pre    all_gather; prefetch next unit
     forward-post   reshard (storage resize to 0, not a dropped ref)
     backward-pre   re-gather; prefetch previous unit
     post-backward  reduce_scatter grads -> sharded fp32, reshard
 
-grads are reduce-scattered every microbatch (holding a full unsharded grad per
-unit across an accumulation step is the memory fsdp exists to reclaim), so
-`requires_sync` is ignored.
+unit 0 is the root: every param NOT inside a passed unit (embed, final norm,
+head). it stays gathered from forward until its backward, because code
+outside `model.forward` may still read those weights (the fused loss reads
+the head weight).
 
-uneven shards: a param whose dim 0 doesn't divide by the shard count is padded.
-every rank's shard has ceil(rows / shards) rows, zero-filled past the rows it
-owns; the gathered buffer carries the padding at its tail and the param is a
-view of the real rows. padding rows get zero grads, so they stay zero.
-
-meta init: built from a model on the `meta` device, fsdp allocates only this
-rank's shards (never the full weights) and the caller then runs the model's
-init on them, followed by `finish_init()`.
-
-activation checkpointing: a checkpointed unit's forward is re-run inside its
-backward. the forward hooks stand down for that re-run (the backward-pre hook
-has already gathered the unit, and resharding there would free weights the
-backward is about to read).
-
-missing grads: a unit's grads are reduced once every one of its params has
-its grad. a param that gets none in a backward (an moe expert no token picked,
-a param the forward never used) would leave the unit waiting forever, so a
-unit left short is closed with zeros for the missing grads: a block unit
-when the backward moves on to another unit, the rest at the next forward or
-at sync(). ranks may differ in which grads are missing, so a late close
-lands exactly where an on-time one would have: every rank issues the same
-collectives in the same order.
+- grad accumulation: grads are reduce-scattered every microbatch, so
+  `requires_sync` is ignored. holding full grads across an accumulation step
+  would give back the memory fsdp exists to save.
+- uneven shards: a param whose dim 0 doesn't divide by the shard count is
+  zero-padded to ceil(rows / shards) rows per rank. padding rows get zero
+  grads, so they stay zero.
+- meta init: a model on the `meta` device is materialized as this rank's
+  shards only, never the full weights (see FSDP).
+- activation checkpointing re-runs a unit's forward inside its backward.
+  the forward hooks skip that re-run: resharding there would free weights
+  the backward is about to read.
+- missing grads: a unit reduces its grads once every param has one. a param
+  that gets none (an moe expert no token picked) is reduced as zeros once
+  the backward has moved on, so the unit never waits forever and every rank
+  still issues the same collectives in the same order.
 
 not done yet: dedicated comm stream, flat per-unit buffers.
 """
@@ -126,20 +117,21 @@ class FSDP:
     """
     shard `model` along `shard_dim`; a no-op when that axis has size 1.
 
-    units           submodules gathered / resharded independently, in any
-                    order (the forward order is recorded on the first step).
-                    params outside them form the root unit. units must not
-                    nest or share a param.
-    replicate_dim   hsdp: reduce-scatter on shard_dim, then all-reduce on this.
-    replicate_dim_of  per-param override of replicate_dim (expert weights
-                    have fewer replicas than dense ones); None = no replicas.
-    param_dtype     dtype params are gathered and computed in; None = no cast.
-    reduce_dtype    dtype grads are reduced in; None = the grad's own.
+    units             submodules gathered / resharded independently, in any
+                      order (the forward order is recorded on the first
+                      step). params outside them form the root unit. units
+                      must not nest or share a param.
+    replicate_dim     hsdp: reduce-scatter on shard_dim, then all-reduce on this.
+    replicate_dim_of  per-param override of replicate_dim (expert weights have
+                      fewer replicas than dense ones); None = no replicas.
+    param_dtype       dtype params are gathered and computed in; None = no cast.
+    reduce_dtype      dtype grads are reduced in; None = the grad's own.
+    prefetch          how many units ahead to start gathering.
 
-    a `model` built on the meta device is materialized sharded on `device`,
-    with uninitialized values: run the model's init next, then finish_init().
-    that init sees shards, so it must be elementwise (normal_, zeros_, ones_),
-    not derived from a weight's shape.
+    a `model` on the meta device is materialized sharded on `device`, with
+    uninitialized values: run the model's init next, then finish_init(). the
+    init sees shards, so it must be elementwise (normal_, zeros_, ones_), not
+    derived from a weight's shape.
     """
 
     def __init__(
@@ -166,8 +158,8 @@ class FSDP:
         self.group_size = mesh.size(shard_dim)
         self.replicate_size = mesh.size(replicate_dim) if replicate_dim is not None else 1
 
-        # ignored (fsdp reduces every microbatch); here so the trainer's
-        # accumulation loop works unchanged
+        # ignored (fsdp reduces every microbatch). exists so the trainer can
+        # treat ddp and fsdp the same
         self.requires_sync = True
         self._pending: list[_PendingReduce] = []        # reduce-scatters in flight
         self._all_reducing: list[_PendingReduce] = []   # hsdp all-reduces in flight
@@ -389,10 +381,10 @@ class FSDP:
 
     def _detach_grad(self, st: _ParamState) -> None:
         """
-        clear `.grad` before a backward accumulates an unsharded-shaped grad
-        into it. normally zero_grad already did. if sync() was called
-        mid-accumulation, `.grad` still holds the sharded grad it published:
-        take that back into sharded_grad so no microbatch is lost.
+        clear `.grad` before backward accumulates an unsharded-shaped grad into
+        it. zero_grad normally did already. after a sync() in the middle of an
+        accumulation step `.grad` still holds the sharded grad sync() published:
+        fold it back into sharded_grad so no microbatch is lost.
         """
         grad = st.param.grad
         if grad is None:
@@ -491,8 +483,8 @@ class FSDP:
 
     def _close_open_units(self) -> None:
         """
-        reduce the block units whose backward has ended short of a grad for
-        every param, in the order they began it.
+        reduce the block units whose backward ended without a grad for every
+        param, in the order they began it.
         """
         for unit in self._open:
             if unit.in_backward:
@@ -501,8 +493,8 @@ class FSDP:
 
     def _close_backward(self) -> None:
         """
-        the backward (if one ran) is over: close every unit it left short,
-        blocks first and the root last, where a full backward puts them.
+        the backward (if one ran) is over: close every unit it left short of
+        grads. blocks first and the root last, the order a full backward gives.
         """
         self._close_open_units()
         root = self._units[0]
@@ -547,9 +539,9 @@ class FSDP:
 
     def _drain(self, final: bool = False) -> None:
         """
-        hsdp pipeline: wait the previous unit's reduce-scatters and launch
-        their replica all-reduces async, finishing the ones from the unit
-        before. `final` (from sync) flushes everything.
+        wait for the previous unit's reduce-scatters. under hsdp, launch their
+        replica all-reduces async and finish the ones launched last time.
+        `final` (from sync) waits for everything.
         """
         self._finish_all_reduces()
         while self._pending:
@@ -615,10 +607,10 @@ class FSDP:
 
     def reshard(self) -> None:
         """
-        point every param back at its shard and free the gathered buffers.
-        only needed after a forward with NO backward (eval, generation): the
-        root unit stays gathered until a backward, and a checkpoint needs
-        every param sharded. a training step never has to call this.
+        point every param back at its shard and free the gathered buffers. only
+        needed after a forward with NO backward (eval, generation), where the
+        root unit would otherwise stay gathered; a checkpoint needs every param
+        sharded. a training step never has to call this.
         """
         assert not self._open and not self._fired, "reshard() in the middle of a backward"
         for unit in self._units:

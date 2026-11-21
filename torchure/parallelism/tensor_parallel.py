@@ -1,8 +1,8 @@
 """
-tensor parallel: split the weights of a layer across the mesh's tp axis, so
-each rank computes a slice of the layer's features.
+tensor parallel: split a layer's weights across the mesh's tp axis, so each
+rank computes a slice of the layer's features.
 
-two ways to split a linear (`weight[out, in]`):
+a linear (`weight[out, in]`) splits one of two ways:
 
     column   split the OUTPUT features: weight is Shard(0). takes a replicated
              input, each rank computes its slice of the output. no comm in
@@ -18,35 +18,21 @@ then one row linear last. a region costs one collective in forward (its
 output) and one in backward (the grad of its input).
 
 this file knows nothing about any model. the model says which of its modules
-are which (`Qwen3.tp_plan`); the split itself is forced by the dataflow.
+play which role (`Qwen3.tp_plan`; the roles are listed on `TP`).
 
-    column      linears sharded on dim 0 (bias too, if any)
-    row         linears sharded on dim 1 (no bias: every rank would add it)
-    regions     modules that get the two collectives. the replicated input is
-                the first positional arg
-    shared      modules INSIDE a region whose params are replicated but see
-                only this rank's features (a norm applied per head). each
-                rank's grad is a partial sum, so sync() all_reduces them
-    embeddings  nn.Embedding modules feeding the residual stream
-    heads       linears mapping the residual stream to vocab logits
-    vocab       the subset of embeddings + heads whose weight is sharded on
-                dim 0, the vocab (a tied weight is listed under both)
-    seq_local   modules with replicated params that sit BETWEEN regions (the
-                block norms). only matters under sequence parallel
+vocab parallel: the embedding / head weight is sharded by vocab rows. a
+sharded embedding looks up only the ids in its own rows and outputs zeros
+for the rest; the ranks' outputs sum to the full lookup. a sharded head
+produces this rank's slice of the logits and, called as a module, gathers
+them into full logits. the fused loss (loss/fused_linear_ce.py) takes the
+local weight instead and never builds full logits.
 
-vocab parallel. a sharded embedding looks up only the ids in its own rows and
-contributes zeros for the rest; the ranks' outputs sum to the full lookup. a
-sharded head produces this rank's slice of the logits. called as a module it
-gathers them into full logits; the memory-efficient path is the fused loss
-(loss/fused_linear_ce.py), which takes the local weight and never builds them.
-
-sequence parallel (`sequence_parallel=True`). between regions the activations
-are replicated, which under plain tp means every rank holds all of them. sp
-shards them along the sequence dim instead: a region gathers the sequence on
-entry and reduce-scatters it on exit, the same bytes on the wire as the two
+sequence parallel (sp): between regions the activations are replicated, so
+under plain tp every rank holds all of them. sp shards them along the
+sequence dim instead: a region gathers the sequence on entry and
+reduce-scatters it on exit, the same bytes on the wire as the two
 all_reduces it replaces. ops between regions (norms, residual adds) then run
-on 1/tp of the tokens, so `seq_local` params get partial grads and join
-`shared`.
+on 1/tp of the tokens.
 
     op                     forward              backward
     region entry           identity             all_reduce
@@ -59,36 +45,15 @@ on 1/tp of the tokens, so `seq_local` params get partial grads and join
     head input, vocab      identity             all_reduce
     head output, vocab     all_gather(vocab)    local slice(vocab)
 
-everything else is replicated and needs nothing: tp peers get the same batch
+everything else is replicated and needs no comm: tp peers get the same batch
 and the same activations, so they compute the same grads. nothing re-syncs
 those replicas, which relies on the kernels being deterministic across peers,
 same as megatron.
 
-two ways to build:
-
-    from full weights (tests, small models): init the full model on the same
-    seed on every rank, then TP(...) keeps this rank's slices.
-
-    from meta: build the model under torch.device("meta"), TP(...) only
-    rewrites shapes; then fsdp materializes it (or core.meta.materialize
-    without fsdp), the model's init fills this rank's shards -- so it must be
-    elementwise -- and finish_init() makes the replicated params agree.
-
-usage:
-    tp = TP(mesh, **model.tp_plan(mesh.size("tp")))
-    ...
-    loss.backward(); parallel.sync(); tp.sync(); optimizer.step()
-
-tp.sync() must come after the data-parallel sync: that one is still reducing
-the same grad tensors in the background until it returns. tp composes with
-ddp or fsdp on the dp axes: fsdp shards whatever tp left on this rank.
-
-comm/compute overlap (`overlap`, needs sequence parallel): "backward" or
-"collective_matmul" swap each region's entry gather + column linears and its
-row linear + exit scatter for the fused ops in tp_overlap.py. the region's
-pre hook runs every column linear at once and parks the outputs; the column
-linears' own forward just hands them back, and the row linear's forward is
-the fused matmul + reduce_scatter.
+overlap (`overlap="backward"` or `"collective_matmul"`, needs sp): a region's
+entry gather + column linears, and its row linear + exit scatter, are
+replaced by the fused ops in tp_overlap.py. the region's pre hook runs all
+of its column linears at once; their own forward just returns the result.
 
 compile: the collectives are opaque to torch.compile (`compiler.disable`), so
 a compiled block splits into graphs around them and they run eagerly between.
@@ -229,6 +194,42 @@ def _reduce_grad(x, mesh, axis):
 
 
 class TP:
+    """
+    the roles a model's `tp_plan` hands out:
+
+        column      linears sharded on dim 0 (bias too, if any)
+        row         linears sharded on dim 1 (no bias: every rank would add it)
+        regions     modules that get the two collectives. the replicated input is
+                    the first positional arg
+        shared      modules INSIDE a region whose params are replicated but see
+                    only this rank's features (a norm applied per head). each
+                    rank's grad is a partial sum, so sync() all_reduces them
+        embeddings  nn.Embedding modules feeding the residual stream
+        heads       linears mapping the residual stream to vocab logits
+        vocab       the subset of embeddings + heads to shard by vocab rows
+                    (a tied weight is listed under both)
+        seq_local   modules with replicated params that sit BETWEEN regions (the
+                    block norms). under sequence parallel they see 1/tp of the
+                    tokens, so their grads are synced like `shared`
+
+    two ways to build:
+    - from full weights (tests, small models): init the full model on the same
+      seed on every rank; TP keeps this rank's slices.
+    - from meta: build the model under torch.device("meta"); TP only rewrites
+      shapes. then materialize it (fsdp, or core.meta.materialize), run the
+      model's init on this rank's shards (so it must be elementwise) and call
+      finish_init().
+
+    usage:
+        tp = TP(mesh, **model.tp_plan(mesh.size("tp")))
+        ...
+        loss.backward(); parallel.sync(); tp.sync(); optimizer.step()
+
+    tp.sync() must come after the data-parallel sync, which is still reducing
+    the same grad tensors in the background until it returns. tp composes with
+    ddp or fsdp on the dp axes: fsdp shards whatever tp left on this rank.
+    """
+
     def __init__(
         self,
         mesh: MeshLike,
@@ -387,10 +388,10 @@ class TP:
 
     def finish_init(self, model: nn.Module) -> None:
         """
-        call once after initializing a model built from meta (and after
-        fsdp's finish_init, if any). each rank initialized on its own seed so
-        its tp shards are its own; this makes everything NOT sharded over tp,
-        buffers included, agree with tp coordinate 0.
+        call once after initializing a model built from meta (and after fsdp's
+        finish_init, if any). each rank initialized on its own seed, which is
+        right for its tp shards; everything NOT sharded over tp (buffers
+        included) is copied from tp coordinate 0 so the ranks agree.
         """
         if self.group_size == 1:
             return
@@ -407,8 +408,8 @@ class TP:
     def _region_post(self, module: nn.Module, args: tuple, output: torch.Tensor) -> torch.Tensor:
         return _exit_region(output, self.mesh, self.dim, self._seq_dim)
 
-    # opaque to dynamo like the collectives: traced, the per-region lookup
-    # guards on the module and recompiles once per region
+    # compiler-disabled like the collectives: if traced, the per-region
+    # lookup would guard on the module and recompile once per region
     @torch.compiler.disable
     def _fused_region_pre(self, module: nn.Module, args: tuple) -> tuple:
         cols = self._region_columns[id(module)]
@@ -466,10 +467,10 @@ class TP:
 
     def head_input(self, hidden: torch.Tensor) -> torch.Tensor:
         """
-        the final hidden states as a head (or a loss computed straight from
-        the head's weight) must see them: the whole sequence. a gather under
-        sequence parallel, otherwise a no-op. the head hooks call this; a
-        loss that bypasses the head module must call it itself.
+        the final hidden states, as a head needs them: the whole sequence. a
+        gather under sequence parallel, otherwise a no-op. the head hooks call
+        this; a loss that reads the head's weight directly, bypassing the
+        module, must call it itself.
         """
         if self._seq_dim is None:
             return hidden

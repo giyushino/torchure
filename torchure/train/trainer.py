@@ -1,7 +1,7 @@
 """
 training orchestrator: build -> init -> parallelize -> compile -> optimizer -> data
 
-i want to replace @debug_time with a real profiler wrapper
+TODO: replace @debug_time with a real profiler wrapper
 """
 
 import atexit
@@ -44,8 +44,8 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
-# fsdp mixed-precision dtypes by config name
-# None: no cast, gathered params stay fp32
+# config dtype names (fsdp param / reduce dtype, ddp reduce dtype).
+# None: no cast
 _DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
@@ -222,14 +222,14 @@ class Trainer:
 
     def _build_model(self) -> nn.Module:
         """
-        build, initialize and parallelize the model
-        we sets self.parallel, self.tp and self.ep here
+        build, initialize and parallelize the model. sets self.parallel,
+        self.tp and self.ep.
 
-        plain ddp: build -> init -> replicate
-        anything sharded (fsdp, tp, ep): build on the meta device 
-        (shapes only) -> shard -> init the shards, so no rank holds
-        holds the full weights. tp and ep cut first, then fsdp shards
-        what's left on rank and ddp replicates (bad for heterogeneous)
+        plain ddp: build -> init -> replicate.
+        anything sharded (fsdp, tp, ep): build on the meta device (shapes only)
+        -> shard -> init the shards, so no rank ever holds the full weights. tp
+        and ep cut first; then fsdp shards what's left on the rank, or ddp
+        replicates it (bad for heterogeneous).
         """
         model_cfg = self.config["model"]
         if self.parallelism != "fsdp" and self.tp_size == 1 and self.ep_size == 1:
@@ -302,10 +302,10 @@ class Trainer:
 
     def _expert_axis(self, dense: str, expert: str):
         """
-        a `param -> axis` function telling ddp / fsdp which axis to average
-        each grad over. an expert weight lives on one ep rank, so it averages
-        over `expert` (the dp axes without ep); everything else over `dense`.
-        None without ep: every param uses the same axis.
+        a `param -> axis` function telling ddp / fsdp which axis to average each
+        grad over: `expert` (the dp axes without ep) for an expert weight, which
+        lives on one ep rank, and `dense` for everything else. returns None
+        without ep, where every param uses the same axis.
         """
         if self.ep is None:
             return None
@@ -369,10 +369,10 @@ class Trainer:
 
     def _init_shards(self, model: nn.Module) -> None:
         """
-        init a model materialized from meta. each rank fills its own shards
-        on a seed per (dp_shard, tp, ep) cell, so different shards get
-        different values; the finish_init calls then copy everything meant
-        to be replicated (hsdp replicas, uncut params, buffers) from one rank.
+        init a model materialized from meta. each rank fills its own shards,
+        seeded per (dp_shard, tp, ep) cell so different shards get different
+        values. the finish_init calls then copy everything meant to be
+        replicated (hsdp replicas, uncut params, buffers) from one rank.
         """
         cell = self.mesh.coordinate("dp_shard") if self.parallelism == "fsdp" else 0
         cell = cell * self.tp_size + (self.mesh.coordinate("tp") if self.tp else 0)
@@ -409,9 +409,10 @@ class Trainer:
 
     def _writes_model_state(self) -> bool:
         """
-        one rank per distinct shard writes model/optimizer state: the one at
-        coordinate 0 on every axis the state is replicated over. under ddp
-        that is rank 0 alone; fsdp, tp and ep each add their shard axis.
+        whether this rank writes model/optimizer state. one rank per distinct
+        shard does: the one at coordinate 0 on every axis the state is
+        replicated over. under ddp that is rank 0 alone; fsdp, tp and ep each
+        add their shard axis.
         """
         shard_dims = (
             self.parallel.shard_dims
@@ -426,8 +427,9 @@ class Trainer:
 
     def _writes_dp_state(self) -> bool:
         """
-        rng, dataloader and prefetcher state is one file per dp coordinate;
-        tp peers hold identical copies, so only tp coordinate 0 writes.
+        whether this rank writes rng, dataloader and prefetcher state, which is
+        one file per dp coordinate. tp peers hold identical copies, so only tp
+        coordinate 0 writes.
         """
         return self.tp_size == 1 or self.mesh.coordinate("tp") == 0
 
@@ -472,11 +474,9 @@ class Trainer:
 
     def _on_sigterm(self, signum, frame) -> None:
         """
-        first SIGTERM: checkpoint and exit at the next stop check. a second
-        one more than 5s later: die now.
-
-        the window exists because one kill often arrives twice (directly, and
-        forwarded by torchrun).
+        first SIGTERM: checkpoint and exit at the next stop check. a second one
+        more than 5s later: die now. the 5s window is there because one kill
+        often arrives twice (directly, and forwarded by torchrun).
         """
         now = time.monotonic()
         if self._sigterm and now - self._sigterm_at > 5.0:
@@ -488,8 +488,8 @@ class Trainer:
 
     def _stop_requested(self) -> bool:
         """
-        collective: has any rank been sent SIGTERM? ranks receive it at
-        different times, so they vote here and all stop on the same step.
+        has any rank been sent SIGTERM? a collective: ranks receive the signal
+        at different times, so they vote here and all stop on the same step.
         costs a host sync, so it runs every `stop_check_every` steps.
         """
         flag = torch.tensor(float(self._sigterm), device=self.device)

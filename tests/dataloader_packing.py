@@ -2,22 +2,15 @@
 benchmark + correctness suite for the packing strategies in
 torchure.dataloader.packers (ListPacker / NumpyPacker / TensorPacker).
 
-two things matter and they're kept separate:
+  correctness   every strategy must emit *identical* blocks for identical
+                input; timings are only trusted after this passes.
+  speed         pack() only, on pre-tokenized synthetic docs (tokenization
+                is shared by every strategy and would dominate). warmup +
+                repeats + median/stdev keep single-call noise out of the
+                comparison.
 
-  correctness -- every strategy must emit *identical* blocks for identical
-                 input. a fast packer that drops or reorders tokens is not a
-                 win, so timings are only trusted after this passes.
-
-  speed       -- pack() only. tokenization is shared across strategies and
-                 would dominate the measurement, so the benchmark feeds
-                 pre-tokenized synthetic docs straight into pack(). warmup +
-                 repeats + median/stdev keep single-call noise from driving the
-                 comparison (the reason a timing *decorator* is the wrong tool:
-                 it measures one call and leaks timing into the return value).
-
-  run benchmark:    PYTHONPATH=. python tests/dataloader_packing.py
-  run correctness:  PYTHONPATH=. python tests/dataloader_packing.py --check
-                    (or `pytest tests/dataloader_packing.py` if pytest is added)
+  run benchmark:    uv run tests/dataloader_packing.py
+  run correctness:  uv run tests/dataloader_packing.py --check
 """
 
 from __future__ import annotations
@@ -50,11 +43,10 @@ def make_corpus(
     vocab_size: int = 32000,
 ) -> list[list[int]]:
     """
-    a fixed, seeded corpus of pre-tokenized docs with varying lengths, so every
-    run and every strategy sees the exact same input. ids start at 2 to keep the
-    eos separator (0) and pad filler (1) distinguishable from real tokens, so the
-    token-retention metrics can count "real" tokens as everything that isn't eos
-    or pad.
+    a fixed, seeded corpus of pre-tokenized docs of varying length, so every
+    run and every strategy sees the same input. ids start at 2, so eos (0)
+    and pad (1) never appear as real tokens and the token-retention metrics
+    can count everything that isn't eos or pad.
     """
     rng = random.Random(seed)
     return [
@@ -105,11 +97,9 @@ def _check_bestfit(n_docs: int = 500) -> None:
     best-fit emits different blocks than the stream packers (that's the point),
     so it gets invariants instead of block-equality:
 
-      - every block is exactly seq_len (the collator stacks fixed-length rows);
-      - no truncation: every real token survives. the corpus has no eos/pad ids
-        (ids start at 2, eos is 0, pad is 1), so eos/pad in the output are only
-        separator/filler -- the multiset of real (non-eos, non-pad) tokens must
-        equal the input's exactly. the stream packers fail this on purpose (they
+      - every block is exactly seq_len;
+      - no truncation: the multiset of real (non-eos, non-pad) tokens equals
+        the input's exactly. the stream packers fail this on purpose (they
         drop each batch's tail).
     """
     docs = make_corpus(n_docs=n_docs)

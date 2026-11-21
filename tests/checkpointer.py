@@ -8,8 +8,9 @@ exact, scheduler position/lr exact, and the dataloader resumes from the
 next unseen batch rather than batch 0.
 
 also covers resume discovery: latest()/valid_step() must only surface
-steps carrying a .complete marker, so a run that died mid-checkpoint
-falls back to the last whole one instead of loading a torn dir.
+steps every rank has committed (its done-marker, or the legacy .complete),
+so a run that died mid-checkpoint falls back to the last whole one instead
+of loading a torn dir.
 
 cpu-only, no gpu or dataset download needed:
     uv run tests/checkpointer.py

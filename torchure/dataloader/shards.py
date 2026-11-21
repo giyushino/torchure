@@ -7,10 +7,10 @@ a source is a directory (or url prefix) holding
                        "tokenizer": ..., "eos_id": ..., "files": [{"path", "num_tokens"}]}
     000000.bin ...    raw little-endian tokens, every doc followed by eos
 
-written by torchure/dataloader/tokenize_shards.py; the other source kinds
-(raw jsonl / parquet, tokenized while training) are in sources.py. a source is cut into
-seq_len rows (per file; each file's tail < seq_len is dropped) and the rows
-into blocks: one block is one range request. see notes/DATA_MIXING.md.
+written by tokenize_shards.py. (the other source kinds, raw jsonl / parquet
+tokenized while training, are in sources.py.) each file is cut into seq_len
+rows, dropping its tail of < seq_len tokens, and the rows are grouped into
+blocks: one block is one range request. see notes/DATA_MIXING.md.
 
 locations:
     /abs/or/relative/dir          local disk (pread)
@@ -57,9 +57,10 @@ def _is_http(location: str) -> bool:
 
 class _StripAuthOnRedirect(urllib.request.HTTPRedirectHandler):
     """
-    urllib forwards every header through a redirect. the hub redirects to a
-    presigned cdn url, which rejects a second auth mechanism, and the token
-    has no business leaving huggingface.co anyway. Range is kept.
+    drop the Authorization header when a redirect leaves the host (urllib
+    forwards every header). the hub redirects to a presigned cdn url, which
+    rejects a second auth mechanism, and the token has no business leaving
+    huggingface.co anyway. Range is kept.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -76,11 +77,11 @@ class Reader:
     """
     byte-range reads of one source's files, shared by every fetch thread.
 
-    over http, range reads keep one connection per host per thread, and
-    remember where each file redirected to: the hub answers every resolve url
-    with a redirect to a presigned cdn url, and a fresh connection plus that
-    redirect is most of a 3.5MB read's time (0.38s vs 0.08s measured). a
-    cached redirect that stops working (the signature expired: 401/403/404
+    over http, range reads keep one connection per host per thread and
+    remember where each file redirected to. the hub answers every resolve
+    url with a redirect to a presigned cdn url, and a fresh connection plus
+    that redirect is most of a 3.5MB read's time (0.38s vs 0.08s measured).
+    a cached redirect that stops working (expired signature: 401/403/404
     from the cdn) is dropped and resolved again.
     """
 

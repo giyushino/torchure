@@ -1,8 +1,9 @@
 """
-registry + build helpers for optimizers and schedulers. weight decay applies
-only to the weights of linear, embedding, conv and expert-bank layers. biases, norm
-weights and bare nn.Parameters (gates, learned queries, log-rates) are exempt,
-whatever their shape.
+registry + build helpers for optimizers and schedulers.
+
+weight decay applies only to the weights of linear, embedding, conv and
+expert-bank layers. biases, norm weights and bare nn.Parameters (gates,
+learned queries, log-rates) are exempt, whatever their shape.
 """
 
 import torch.nn as nn

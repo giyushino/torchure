@@ -19,11 +19,11 @@ scaled defaults; `__main__` prints the exact total / active counts):
     per-head sigmoid output gate. optional dsa: a learned indexer scores
     positions and each query attends to its top-k (off by default; at the
     scaled context it is an inference optimisation, not a quality lever)
-  - latent moe: hidden -> latent (0.5x) -> routed situ experts -> latent
-    norm happens on the way in -> up to hidden; shared experts run on the
-    hidden stream in parallel. sigmoid router, top-k renormalised,
-    aux-free: a router bias buffer steers the top-k choice and is moved
-    by a balancing rule, not by gradient (see balance_step)
+  - latent moe: hidden -> down to latent (0.5x) -> latent norm -> routed
+    situ experts -> up to hidden; shared experts run on the hidden stream
+    in parallel. sigmoid router, top-k renormalised. load balancing is
+    aux-loss free: a router bias buffer steers the top-k choice and is
+    moved by a balancing rule, not by gradient (see balance_step)
   - situ-glu: beta1*tanh(g/beta1) * sigmoid(g) * beta2*tanh(u/beta2),
     beta1=4, beta2=25, so outputs are bounded by 100
   - block attention residuals: sublayer outputs sum into a per-block
@@ -33,21 +33,15 @@ scaled defaults; `__main__` prints the exact total / active counts):
   - first layer is dense (first_k_dense_replace=1 in the real config)
 
 pure pytorch throughout. the kda recurrence is solved chunkwise (see
-_kda_scan; compiler-disabled, like the tp collectives) and the routed experts are one stacked bank driven by a sort and
-a grouped matmul (models/moe.py). the scaled config in configs/ turns compile
-off.
+_kda_scan; compiler-disabled, like the tp collectives). the routed experts
+are one stacked bank driven by a sort and a grouped matmul (models/moe.py).
+the scaled config in configs/ turns compile off.
 
 trainer contract, same as qwen3: `blocks`, `norm`, `lm_head.weight`,
 `init_weights()`, `tp_plan()`, `activation_checkpointing`,
-forward(..., return_final_hidden=True). tp is vocab-only (see tp_plan):
-the current tp engine shards (b, s, d) regions, and neither the kda scan,
-mla's latent bottleneck, nor expert dispatch fit that vocabulary. the
+forward(..., return_final_hidden=True). tp is vocab-only (see tp_plan); the
 scaling paths are fsdp/dp over `blocks` and expert parallel over the routed
 experts (`ep_plan`, parallelism/expert_parallel.py).
-
-load balancing is aux-loss free: `balance_step` (called by the trainer after
-every optimizer step) nudges each layer's router bias toward the experts
-that got fewer tokens than their share, and reports the spread.
 """
 
 import math
@@ -628,12 +622,11 @@ class KimiK31(nn.Module):
 
     def tp_plan(self, tp_size: int, vocab_parallel: bool = True) -> dict[str, list[nn.Module]]:
         """
-        vocab only. the kda scan, mla's latent bottleneck and expert
-        dispatch do not fit the tp engine's (b, s, d) region vocabulary,
-        so block weights stay replicated over tp and dp/fsdp does the
-        sharding. sequence parallel must be off for this model (there are
-        no regions for it to shard between); the trainer config for kimi
-        has to say so explicitly.
+        vocab only. the tp engine shards (b, s, d) regions, and neither the kda
+        scan, mla's latent bottleneck nor expert dispatch fits that shape, so
+        block weights stay replicated over tp and dp/fsdp does the sharding.
+        there are no regions for sequence parallel to shard between, so the
+        trainer turns it off for this model.
         """
         return {
             "column": [], "row": [], "regions": [], "shared": [],
@@ -656,14 +649,14 @@ class KimiK31(nn.Module):
     @torch.no_grad()
     def balance_step(self, reduce=None) -> dict[str, torch.Tensor]:
         """
-        aux-loss-free load balancing, once per optimizer step: every
-        layer's router bias moves `router_bias_rate` toward the experts that
-        got fewer tokens than the mean since the last call, away from the
-        ones that got more. returns the spread (see moe.balance_stats).
+        aux-loss-free load balancing, once per optimizer step. every layer's
+        router bias moves by `router_bias_rate`: up for experts that got fewer
+        tokens than the mean since the last call, down for those that got more.
+        returns the spread (see moe.balance_stats).
 
         `reduce(tensor)` sums a tensor in place over every rank that saw
-        different data, so all ranks apply the same update and the bias
-        stays replicated.
+        different data, so all ranks apply the same update and the bias stays
+        replicated.
         """
         layers = self.moe_layers()
         if not layers:

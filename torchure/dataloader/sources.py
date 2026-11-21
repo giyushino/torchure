@@ -1,8 +1,8 @@
 """
 raw-data sources for the mixture loader: jsonl and parquet files read by
-byte range from local disk or over http, tokenized as they arrive. nothing
-is downloaded ahead of time or written to disk. pre-tokenized token shards
-(shards.py) are the fourth kind, for data you tokenize once and reuse.
+byte range from local disk or over http, and tokenized as they arrive.
+nothing is downloaded ahead of time or written to disk. pre-tokenized token
+shards (shards.py) are the other kind, for data you tokenize once and reuse.
 
 every source looks the same to mixture.py:
 
@@ -30,16 +30,15 @@ tokenize_shards.py), each followed by eos, concatenated and cut into seq_len
 rows. the block's tail (< seq_len tokens) is dropped: ~0.1% of a 16MB block.
 
 caption rows (the source sets image_field; parquet only): one image and one
-caption per row, unpacked,
+caption per row, not packed with other rows:
 
     <|vision_start|> <|image_pad|> x num_image_tokens <|vision_end|> caption eos pad...
 
 labels are ignore_index over the image span and the padding. images are
-decoded and resized here, on the fetch threads (PIL releases the gil while
-decoding). jpegs use PIL's draft mode, which downscales by 2/4/8 inside the
-decoder before the bicubic resize: ~25% faster, and the pixels differ
-slightly from a full-size decode. pixel_values stay uint8 (3, S, S): the model
-normalizes them (on the gpu, after a 4x smaller copy).
+decoded and resized here, on the fetch threads. jpegs use PIL's draft mode
+(downscale by 2/4/8 inside the decoder, before the bicubic resize): ~25%
+faster, with pixels slightly different from a full-size decode.
+pixel_values stay uint8 (3, S, S); the model normalizes them on the gpu.
 """
 
 import fnmatch
@@ -212,8 +211,9 @@ class RowGroup:
 
 class RawSource:
     """
-    shared by the raw kinds: records(block) -> {field: list}, then text rows
-    or caption rows. subclasses set self.blocks.
+    base of the raw kinds. a subclass sets self.blocks and implements
+    records(block) -> {field: list}; this class turns the records into text
+    rows or caption rows.
     """
     window_blocks: int | None = None
 

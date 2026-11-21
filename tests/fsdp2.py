@@ -139,10 +139,10 @@ def check_grads(errors, model, reference, mesh, dim, tag="", rtol=1e-4, atol=1e-
 
 def test_shard_and_replicate(mesh, dim, device):
     """
-    ctor must (a) make every rank agree on the full weights before slicing --
-    nothing in this repo seeds torch, so ranks init DIFFERENT models -- and
-    (b) leave params pointing at their shard, which is what makes the
-    optimizer allocate sharded state.
+    ctor must (a) make every rank agree on the full weights before slicing
+    (here each rank inits a DIFFERENT model, seeded by its rank) and (b)
+    leave params pointing at their shard, which is what makes the optimizer
+    allocate sharded state.
     """
     model = build_model(seed=dist.get_rank(), device=device)
     fsdp = FSDP(model, mesh, model.blocks, shard_dim=dim, replicate_dim=None)

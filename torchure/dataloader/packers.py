@@ -1,8 +1,10 @@
 """
-packing strategies for the dataloader .map step.
+packing strategies: tokenized docs -> seq_len blocks. not used by the loader
+(MixtureLoader's sources pack rows themselves); kept for the benchmark in
+tests/dataloader_packing.py.
 
 stream packers concatenate docs with an eos between them and slice into
-back-to-back seq_len blocks (no padding; each map-batch's tail is dropped).
+back-to-back seq_len blocks (no padding; each batch's tail is dropped).
 list/numpy/tensor variants emit identical blocks and differ only in speed.
 
 best-fit only saves ~0.04% of tokens on climbmix, possibly because its docs

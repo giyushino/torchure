@@ -1,38 +1,37 @@
 """
 expert parallel: split a moe layer's experts across the mesh's ep axis and
-move the tokens to them, instead of moving the expert weights to the tokens.
+move the tokens to the experts, instead of the expert weights to the tokens.
 
 each ep rank holds `num_experts / ep` experts of every bank (`Shard(0)` on
 the expert dim) and its OWN batch: ep ranks are data-parallel for everything
-that is not an expert. inside a moe layer the (token, expert) pairs a rank
-routed are sent to the ranks holding those experts and the outputs come
-back:
+that is not an expert. inside a moe layer, the (token, expert) pairs a rank
+routed are sent to the ranks holding those experts and the outputs come back:
 
     counts per expert          --all_gather-->   who sends how many to whom
     rows, grouped by expert    --all_to_all-->   to the rank holding the expert
     local experts (one grouped matmul over everyone's rows)
     outputs                    --all_to_all-->   back, in the order they left
 
-two all_to_alls per layer in forward and two in backward (the grads retrace
-the same route). the split sizes have to be python ints, so each layer costs
-one host sync.
+that is two all_to_alls per layer in forward and two in backward (the grads
+retrace the same route), plus one host sync per layer: the split sizes have
+to be python ints.
 
 this file knows nothing about any model: the model hands over its expert
-banks (`model.ep_plan()`, models/moe.py's ExpertBank) and the bank calls
+banks (`model.ep_plan()`, models/moe.py's ExpertBank) and each bank calls
 back through `bank.remote`.
 
 grads. the loss is the mean over all data ranks, ep ranks included.
-- dense params: each rank has a copy and a grad from its own batch, so
+- dense params: every rank has a copy and a grad from its own batch, so
   ddp / fsdp average over `dp` (which includes ep), as usual.
-- an expert lives on one ep rank, and the return trip of the dispatch already
-  delivered the grads from every ep peer's tokens there: a SUM over the ep
-  group. `sync()` divides by ep to make it a mean; ddp / fsdp then average
-  only over the other copies of that expert (`dp_expert`, the dp axes
-  without ep).
+- expert params: an expert lives on one ep rank, and the dispatch's return
+  trip already delivered the grads from every ep peer's tokens there, as a
+  SUM over the ep group. `sync()` divides by ep to make it a mean; ddp /
+  fsdp then average only over the other copies of that expert (`dp_expert`,
+  the dp axes without ep).
 
-two ways to build, as for tensor parallel: from full weights (every rank
-inits the full model on one seed, EP keeps its slice), or from a meta model
-(EP only rewrites shapes; after materialize + init, `finish_init`).
+built like tensor parallel: from full weights (every rank inits the full
+model on one seed, EP keeps its slice) or from a meta model (EP only
+rewrites shapes; call `finish_init` after materialize + init).
 
 tests: uv run tests/expert_parallel.py  (gloo/cpu, no gpus needed)
 """
@@ -133,8 +132,8 @@ class EP:
     def _remote(self, bank: ExpertBank, x: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
         """
         `bank(x, counts)` across the ep group. x (M, in) is this rank's rows
-        sorted by (global) expert id, counts (num_experts,) how many each
-        expert gets. returns their outputs (M, out) in the same order.
+        sorted by (global) expert id; counts (num_experts,) is how many rows
+        each expert gets. returns the outputs (M, out) in the same order.
         """
         size = self.group_size
         per_rank = bank.num_experts // size

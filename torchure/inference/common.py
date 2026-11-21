@@ -1,7 +1,7 @@
 """
-shared model/tokenizer/checkpoint loading for one-off inference scripts
-(perplexity eval, chat repl). these run outside the Trainer/DDP path
-entirely -- single process, straight off a checkpoint dir on disk.
+shared model / tokenizer / checkpoint loading for the one-off inference
+scripts (perplexity eval, chat repl). they run outside the Trainer: a single
+process, straight off a checkpoint dir on disk.
 """
 from tokenizers import Tokenizer
 

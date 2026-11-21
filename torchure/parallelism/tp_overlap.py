@@ -1,7 +1,7 @@
 """
-tp comm/compute overlap: fused autograd ops that own both a region's
-sequence-parallel collective and the matmuls next to it, so the collective
-can run while those matmuls do. only meaningful under sequence parallel.
+tp comm/compute overlap: autograd ops that fuse a region's sequence-parallel
+collective with the matmuls next to it, so the collective can run while the
+matmuls do. only meaningful under sequence parallel.
 
     column(x_local, Ws)   all_gather(x) along the sp dim, then y_i = x_full @ W_i^T
                           for every column linear of the region
@@ -10,35 +10,36 @@ can run while those matmuls do. only meaningful under sequence parallel.
 the plain path (tensor_parallel.py's _Gather/_Scatter around ordinary
 linears) runs each collective with nothing behind it. two modes here:
 
-    "backward"            column backward: dX = sum_i dY_i W_i, launch the
-                          reduce_scatter of dX async, compute the weight grads
-                          dW_i = dY_i^T X_full (which don't need it) while it
-                          flies, then wait. forward and the row op are the
-                          plain collective + matmul, fused into one node.
+    "backward"            only column's backward overlaps. it launches the
+                          reduce_scatter of dX = sum_i dY_i W_i async and
+                          computes the weight grads dW_i = dY_i^T X_full
+                          (which don't need dX) while it is in flight.
+                          everything else is the plain collective + matmul,
+                          fused into one node.
 
-    "collective_matmul"   additionally split every collective into tp ring
-                          steps over the token chunks and pipeline them with
-                          the matmuls (megatron tp_comm_overlap / pytorch
-                          async tp):
-                            all_gather + matmul    compute on the chunk held
-                                                   while the next one arrives
-                            matmul + reduce_scatter compute the partial for the
-                                                   next chunk while the running
-                                                   sum travels the ring
+    "collective_matmul"   additionally splits every collective into tp ring
+                          steps over the token chunks and interleaves them
+                          with the matmuls (megatron tp_comm_overlap /
+                          pytorch async tp):
+                          - all_gather + matmul: compute on the chunk held
+                            while the next one arrives
+                          - matmul + reduce_scatter: compute the partial for
+                            the next chunk while the running sum travels the
+                            ring
 
-layout. everything works on "rows": the activation with its sp dim moved to
-the front and flattened to (tokens, features), so rank k's chunk of the full
-tensor is the contiguous block of rows [k*n, (k+1)*n). with the sp dim at 0
-(sharding the batch) or a batch of 1, those moves are free views; sharding
-the sequence of a batch > 1 costs a copy each way, as the plain path does.
+rows. everything works on the activation with its sp dim moved to the front
+and flattened to (tokens, features), so rank k's chunk of the full tensor is
+the contiguous rows [k*n, (k+1)*n). with the sp dim at 0 (sharding the
+batch) or a batch of 1, those moves are free views; sharding the sequence of
+a batch > 1 costs a copy each way, as the plain path does.
 
 precision. matmuls run in the autocast dtype (what F.linear under autocast
-would do); x is gathered in that dtype (half the bytes of the plain path,
-which gathers the fp32 norm output and casts after). grads of x are
+would do). x is gathered in that dtype: half the bytes of the plain path,
+which gathers the fp32 norm output and casts after. grads of x are
 reduce-scattered in x's own dtype, as the plain path does.
 
-the ops take and return grads for the weights as autograd inputs, so the
-grad-accumulate hooks ddp and fsdp hang off the params fire as usual.
+the weights are autograd inputs of these ops and get their grads back as
+outputs, so the grad hooks ddp and fsdp hang off the params fire as usual.
 """
 
 import torch
@@ -118,9 +119,9 @@ def _gather_matmul(ring: _Ring, x_rows, weights, overlap: bool):
 
 def _matmul_scatter(ring: _Ring, partial_of, overlap: bool, between=None):
     """
-    reduce_scatter of a (g*n, d) partial sum: partial_of(k) returns this
-    rank's partial for row chunk k, partial_of(None) the whole thing.
-    `between` runs while the last collective is in flight (weight grads).
+    reduce_scatter of a (g*n, d) partial sum. partial_of(k) returns this
+    rank's partial for row chunk k; partial_of(None) returns all of it.
+    `between` (the weight grads) runs while the last collective is in flight.
     """
     if not overlap:
         full = partial_of(None)

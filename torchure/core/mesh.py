@@ -115,14 +115,15 @@ class Mesh:
 
 def build_mesh(spec: dict[str, int]) -> Mesh:
     """
-    the mesh a training run uses, from a config's mesh spec: axes put in
-    AXIS_ORDER, `dp: N` read as shorthand for `dp_shard: N`, and the derived
-    axes added:
+    the mesh a training run uses, from a config's mesh spec. axes are put in
+    AXIS_ORDER, `dp: N` is read as shorthand for `dp_shard: N`, and these
+    derived axes are added:
 
-        dp      every rank that reads its own data: dp_replicate x dp_shard,
-                and x ep under expert parallel (ep ranks are data-parallel
-                for everything but the experts). the dataloader split, loss
-                averaging and dense grad sync all run over it.
+        dp                every rank that reads its own data: dp_replicate x
+                          dp_shard, and x ep under expert parallel (ep ranks
+                          are data-parallel for everything but the experts).
+                          the dataloader split, loss averaging and dense grad
+                          sync all run over it
 
     and, only with ep > 1:
 

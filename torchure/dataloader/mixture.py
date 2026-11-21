@@ -1,9 +1,10 @@
 """
-the dataloader: a mixture of sources, scheduled by a python script. one
-source is the special case `data.source`, a mix of one at weight 1.
+the dataloader: a weighted mixture of sources, scheduled by a python script.
+a single dataset (`data.source`) is the special case: a mix of one at
+weight 1.
 
-sources (sources.py) are raw jsonl / parquet, tokenized on the fly, or
-pre-tokenized token shards, each a local path, an http(s) url or
+sources (sources.py) are raw jsonl / parquet tokenized on the fly, or
+pre-tokenized token shards. each is a local path, an http(s) url or
 hf://datasets/<org>/<name>[/<subdir>]. the mix script (config `data.mix`)
 is plain python:
 
@@ -16,22 +17,22 @@ is plain python:
     def weights(step: int, total_steps: int) -> dict[str, float]:
         return {"web": 0.8, "code": 0.2} if step < 0.9 * total_steps else {"web": 0.5, "code": 0.5}
 
-weights are relative (normalized here); a source left out gets 0. the
-function is called once per optimizer step and must be a pure function of
-its arguments: every rank calls it independently and a resume calls it
-again, so anything else (randomness, wall clock, files) desyncs ranks.
+weights are relative (normalized here); a source left out gets 0. weights()
+is called once per optimizer step and must be a pure function of its
+arguments: every rank calls it independently and a resume calls it again,
+so anything else (randomness, wall clock, files) desyncs the ranks.
 
 per step:
-  1. weights(step) * global_batch_size is added to a per-source credit; the
-     step's row counts are the credits rounded (largest remainder) so they
-     sum to exactly global_batch_size. the rounding error carries over, so a
-     source at weight 0.001 still gets its share over time instead of
-     rounding to 0 every step.
+  1. each source gets weights(step) * global_batch_size rows, rounded
+     (largest remainder) so the counts sum to exactly global_batch_size.
+     the rounding error carries over to the next step as a per-source
+     credit, so a source at weight 0.001 still gets its share over time
+     instead of rounding to 0 every step.
   2. the global batch's source labels are shuffled with rng(seed, step), and
      rank r's micro batch m reads positions [(m*dp + r)*b, +b). every rank
      computes the whole (cheap) plan, so the ranks need no communication.
   3. each rank reads each source from its own stream (SourceStream): the
-     source's blocks are permuted per epoch, dealt round-robin to the dp
+     source's blocks are permuted per epoch and dealt round-robin to the dp
      ranks (disjoint, so each rank downloads 1/dp of the data), and rows are
      shuffled within windows of `window_blocks` blocks. the next window
      downloads in the background while the current one is consumed.
@@ -39,13 +40,12 @@ per step:
 state is a handful of integers per source plus the credits, so resume is
 O(1): it refetches the current window and nothing else.
 
-no torch DataLoader. by default (`workers: 0`) blocks are fetched,
-tokenized and decoded on `fetch_threads` threads in the trainer's process
-(tokenizers and PIL release the gil for their heavy parts); the trainer's
-thread only gathers rows into a batch. with `workers: N`, N processes each
-fetch whole blocks and send back the rows: decoding images holds the gil
-long enough to slow the training loop itself (notes/DATA_LOADING.md), text
-tokenizing doesn't. either way a block is fetched once, by one rank.
+no torch DataLoader. by default (`workers: 0`) blocks are fetched, tokenized
+and decoded on `fetch_threads` threads in the trainer's process, and the
+trainer's thread only gathers rows into a batch. with `workers: N`, N
+processes do that work instead. that pays off for images, whose decoding
+holds the gil long enough to slow the training loop (notes/DATA_LOADING.md);
+text tokenizing doesn't. either way a block is fetched once, by one rank.
 """
 
 import importlib.util
@@ -91,9 +91,9 @@ def normalize(raw: dict, names: list[str], step: int) -> np.ndarray:
 
 def allocate(credit: np.ndarray, weights: np.ndarray, total: int) -> tuple[np.ndarray, np.ndarray]:
     """
-    (non-negative counts summing to `total`, credit carried forward). the
-    credit is what each source is owed (negative: it got ahead); it stays
-    within about one row per source.
+    returns (counts, credit carried forward). counts are non-negative and
+    sum to `total`. the credit is what each source is still owed (negative:
+    it got ahead); it stays within about one row per source.
     """
     owed = credit + weights * total
     counts = np.maximum(np.floor(owed), 0).astype(np.int64)
@@ -120,9 +120,9 @@ def _source_key(name: str) -> int:
 
 class SourceStream:
     """
-    one rank's endless, shuffled row stream over one source. position is
-    (epoch, window, pos): the window's rows are permuted, pos indexes that
-    permutation. rows are dicts of arrays (input_ids, and labels and
+    one rank's endless, shuffled row stream over one source. its position is
+    (epoch, window, pos): the window's rows are permuted and pos indexes
+    that permutation. rows are dicts of arrays (input_ids, plus labels and
     pixel_values for caption sources).
     """
 
@@ -183,7 +183,7 @@ class SourceStream:
         """
         make the current window resident and keep the next prefetch_windows
         downloading. a window can come out empty (raw text blocks shorter than
-        seq_len); it's skipped, as if its rows had been consumed.
+        seq_len); it is skipped, as if its rows had been consumed.
         """
         skipped = 0
         while True:
@@ -260,11 +260,15 @@ def _single_source(step: int, total_steps: int) -> dict[str, float]:
 
 class MixtureLoader:
     """
-    yields this dp rank's micro batches, microbatches_per_step of them per
-    optimizer step, forever: {"input_ids", "labels"} int64 (micro_batch_size,
-    seq_len), plus uint8 "pixel_values" (micro_batch_size, 3, S, S) from
-    caption sources (the model normalizes them). labels are unshifted; shifting is the
-    objective's job. state_dict / load_state_dict for checkpoints.
+    yields this dp rank's micro batches forever, microbatches_per_step of
+    them per optimizer step:
+
+        input_ids, labels   int64 (micro_batch_size, seq_len). labels are
+                            unshifted; shifting is the objective's job
+        pixel_values        uint8 (micro_batch_size, 3, S, S), caption sources
+                            only. the model normalizes them
+
+    state_dict / load_state_dict for checkpoints.
 
     data_cfg needs exactly one of `mix` (a mix script) or `source` (one
     source spec, see sources.parse_spec). `tokenizer` (a tokenizers.Tokenizer)
