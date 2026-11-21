@@ -9,7 +9,6 @@ authors = [{name="giyushino", email="allanzhang440@gmail.com" }]
 requires-python = "==3.14.*"
 keywords = ["pytorch", "training"]
 
-# kept minimal on purpose
 dependencies = [
     "torch==2.10",
     "numpy==2.4.6",
