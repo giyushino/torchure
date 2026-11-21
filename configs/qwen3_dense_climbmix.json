@@ -38,19 +38,14 @@
     }
   },
   "data": {
-    "name": "OptimalScale/ClimbMix",
-    "split": "train",
+    "source": "hf://datasets/OptimalScale/ClimbMix",
     "tokenizer": "Qwen/Qwen3-0.6B",
     "eos_token": "<|endoftext|>",
     "pad_token": "<|fim_pad|>",
-    "text_field": "text",
-    "shuffle_buffer": 1000,
     "seed": 42,
-    "num_workers": 4,
     "global_batch_size": 2,
     "micro_batch_size": 2,
-    "seq_len": 4096,
-    "pack_batch": 1000
+    "seq_len": 4096
   },
   "checkpointing": {
     "save_steps": 10000,

@@ -1,16 +1,16 @@
 """
-comm/compute overlap profiler -- roadmap phase 1 exit criterion (c).
+comm/compute overlap profiler.
 
 measures how much of the grad all-reduce is hidden behind backward.
 
 capture a trace and print the table:
 
-    uv run torchrun --nproc-per-node 8 -m torchure.train.profile_overlap \
+    uv run torchrun --nproc-per-node 8 -m torchure.profiling.overlap \
         --config configs/qwen3_dense_climbmix_ddp.json --out traces/overlap_dp8.json
 
 re-analyze one you already have (no gpus, no rendezvous):
 
-    uv run -m torchure.train.profile_overlap --analyze traces/overlap_dp8.json
+    uv run -m torchure.profiling.overlap --analyze traces/overlap_dp8.json
 
 the trace also loads in ui.perfetto.dev.
 

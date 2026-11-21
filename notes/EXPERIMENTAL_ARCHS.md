@@ -9,7 +9,7 @@ is the one that reaches into the dataloader.
 |---|---|---|---|
 | masked diffusion lm | `qwen3_diffusion_climbmix.json` | `objectives/masked_diffusion.py`, `inference/diffusion_generate.py` | qwen3 `causal` flag; per-token `weights` in the fused loss |
 | looped transformer | `looped_qwen3_climbmix.json` | `models/looped/looped.py` | qwen3 `transformer_blocks()` / `run_block()` hooks, `depth` for the init scale |
-| qwen3 + siglip vlm | `qwen3_vl_coco.json` | `models/vlm/{siglip,vlm}.py`, `dataloader/vlm.py` | qwen3 `inputs_embeds`; `data.image_field`; objectives pass extra batch keys to the model; trainer hands the model's image spec to the loader; `pillow` extra |
+| qwen3 + siglip vlm | `qwen3_vl_coco.json` | `models/vlm/{siglip,vlm}.py` (caption rows: `dataloader/sources.py`) | qwen3 `inputs_embeds`; `image_field` in `data.source`; objectives pass extra batch keys to the model; trainer hands the model's image spec to the loader; `pillow` extra |
 
 ## design
 
@@ -41,7 +41,10 @@ projector with 2x2 pixel shuffle (196 patches → 49 tokens), and
 qwen's own `<|vision_start|>` / `<|image_pad|>` / `<|vision_end|>` tokens are
 used. data: one image per row, no packing, right-padded; only caption + eos
 are scored. COCO captions (`jxie/coco_captions`, 182 parquet train shards)
-stream through the existing hf path.
+are a caption source of the main loader (one row group per block, decoded in
+`data.workers: 8` processes, uint8 pixels normalized by the tower; see
+DATA_LOADING.md). the numbers below were measured on the old hf-stream loader;
+the new one matched it end to end (DATA_LOADING.md, 11/19).
 
 ## verification
 
@@ -110,9 +113,9 @@ from TORCHTITAN_COMPARE.md: `--steps 60`, mean tps over steps 21–60, torch
   the gradients.
 - vlm scales ~77% from 1 gpu, but that compares a cu128 1-gpu run with a
   cu130 4-gpu run. likely cause: a short step (32k tokens) with a full 664M
-  gradient all-reduce each step. not profiled. COCO's 182 shards don't divide
-  over 4 ranks, so each rank reads the whole stream; a rank's loader still
-  delivers ~1,000 images/s (measured), well above the ~340/s it needs.
+  gradient all-reduce each step. not profiled. (on the old hf loader COCO's
+  182 shards didn't divide over 4 ranks, so each rank read the whole stream;
+  the new loader splits row groups between ranks.)
 
 ### vlm micro batch 64 -> 128
 

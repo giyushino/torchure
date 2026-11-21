@@ -67,7 +67,7 @@ its default regional compile: loss / activation / rope).
 
 ## hill climb (on cu130): what moved and what didn't
 
-profile of 0.6B ddp micro 4 (`profile_overlap.py`), per step: compute
+profile of 0.6B ddp micro 4 (`torchure/profiling/overlap.py`), per step: compute
 ~524ms (gemm 47%, attention 29% — cudnn sdpa bwd alone 112ms — triton
 fused elementwise 18%, adamw 2%), nccl 159ms of which 16ms (2.9%) exposed.
 single gpu does 64.5k (258k x4), so ddp costs ~8%: ~3% exposed comm, ~3%

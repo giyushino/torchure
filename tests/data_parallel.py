@@ -4,13 +4,13 @@ parity tests for torchure/parallelism/data_parallel.py.
 run (gloo/cpu, no gpus needed):
     uv run tests/data_parallel.py --world-size 4
 
-the invariant (roadmap phase 1 exit criterion): N ranks x bs=1 with ddp grad
+the invariant: N ranks x bs=1 with ddp grad
 sync must produce the same grads as 1 process x bs=N -- averaging per-rank
 mean-loss grads equals the global mean-loss grad when shards are equal sized.
 the batch is deterministic, so every rank recomputes the single-process
 reference locally and no gathers are needed for the comparison.
 
-phase 1.3 adds the same invariant one level up, for grad accumulation: N ranks
+a second test checks the same invariant one level up, for grad accumulation: N ranks
 x K microbatches of bs=1 must equal 1 process x bs=(N*K), with exactly ONE
 grad sync per step. that test also asserts directly that no collective is
 launched while `requires_sync` is False -- suppression failing is otherwise
@@ -114,7 +114,7 @@ def test_grad_parity(mesh, dim, bucket_mb: float, reduce_dtype: torch.dtype | No
 
 
 def test_grad_accumulation(mesh, dim, bucket_mb: float, microbatches: int):
-    """phase 1.3 no_sync semantics: K local backwards, exactly ONE grad sync.
+    """no_sync semantics: K local backwards, exactly ONE grad sync.
 
     the invariant is the same one as test_grad_parity, one level up: N ranks x
     K microbatches of bs=1 must equal 1 process x bs=(N*K). all microbatches
@@ -179,7 +179,7 @@ TESTS = [
                                         reduce_dtype=torch.bfloat16)),
     ("test_parity_bf16_reduce_inplace", partial(test_grad_parity, bucket_mb=0.0,
                                                 reduce_dtype=torch.bfloat16)),
-    # phase 1.3: grad accumulation, across the same three bucket shapes
+    # grad accumulation, across the same three bucket shapes
     ("test_accum_2mb_one_bucket", partial(test_grad_accumulation, bucket_mb=25, microbatches=2)),
     ("test_accum_4mb_many_buckets", partial(test_grad_accumulation, bucket_mb=0.008, microbatches=4)),
     ("test_accum_3mb_inplace", partial(test_grad_accumulation, bucket_mb=0.0, microbatches=3)),

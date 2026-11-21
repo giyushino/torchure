@@ -1,19 +1,20 @@
 [project]
 name = "torchure"
 version = "0.1.0"
-description = "training stack"
+description = "a pure pytorch training stack for transformer llms"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{name="giyushino", email="allanzhang440@gmail.com" }]
 
 requires-python = "==3.14.*"
 keywords = ["pytorch", "training"]
 
-# kept minimal on purpose
 dependencies = [
     "torch==2.10",
     "numpy==2.4.6",
     "tokenizers",
-    "datasets",
-    "torchdata",
+    # parquet sources (dataloader/sources.py)
+    "pyarrow",
 ]
 
 
@@ -31,7 +32,7 @@ torch = { index = "pytorch-cu130" }
 
 [project.optional-dependencies]
 wandb = ["wandb>=0.16"]
-# image decoding for vlm data (data.image_field)
+# image-caption sources (a vlm's data): jpeg/png decoding
 vision = ["pillow"]
 
 [build-system]

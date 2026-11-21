@@ -91,7 +91,13 @@ class SiglipVisionTower(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """(N, 3, H, W) in [-1, 1] -> (N, grid * grid, emb_dim) patch features."""
+        """
+        (N, 3, H, W) -> (N, grid * grid, emb_dim) patch features. pixels are
+        floats in [-1, 1], or uint8 (what the loader sends: dataloader/sources.py),
+        normalized here with siglip's mean = std = 0.5.
+        """
+        if pixel_values.dtype == torch.uint8:
+            pixel_values = pixel_values.to(self.patch_embedding.weight.dtype) / 127.5 - 1.0
         x = self.patch_embedding(pixel_values).flatten(2).transpose(1, 2)
         x = x + self.position_embedding.weight
         for layer in self.layers:

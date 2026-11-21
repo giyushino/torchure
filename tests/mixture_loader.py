@@ -114,9 +114,10 @@ def test_streams_disjoint(tmp: str) -> None:
     pool = ThreadPoolExecutor(2)
     seen = []
     for rank in range(4):
-        stream = SourceStream(src, "web", 3, rank, 4, 2, pool)
+        stream = SourceStream(src, "web", 3, rank, 4, 2,
+                              lambda block: pool.submit(src.fetch, block))
         while stream.epoch == 0:
-            seen.append(int(stream.take()[0]))
+            seen.append(int(stream.take()["input_ids"][0]))
     pool.shutdown()
     assert len(seen) == len(set(seen)) == src.num_rows, "epoch 0 must cover each row exactly once"
     # rows are whole seq_len slices of the right file (no straddling the tail)
@@ -235,18 +236,20 @@ def test_config(mix: str) -> None:
         except ConfigError:
             pass
         else:
-            raise AssertionError("name + mix together must be rejected")
+            raise AssertionError("source + mix together must be rejected")
         only = os.path.join(tmp, "only.json")
         with open(only, "w") as f:
-            json.dump({"base": base, "data": {"mix": mix, "name": None}}, f)
+            json.dump({"base": base, "data": {"mix": mix, "source": None}}, f)
         cfg = load_config(only)
         assert cfg["data"]["mix"] == mix and cfg["data"]["block_mb"] == 16
-    print("ok  config: exactly one of data.name / data.mix")
+    print("ok  config: exactly one of data.source / data.mix")
 
 
 def test_tokenizer_mismatch(mix: str) -> None:
     try:
-        MixtureLoader(data_cfg(mix), 0, 1, total_steps=10, tokenizer="other/tokenizer")
+        # a tokenizer object, so the loader doesn't fetch "other/tokenizer" from the hub
+        MixtureLoader(data_cfg(mix, tokenizer="other/tokenizer"), 0, 1, total_steps=10,
+                      tokenizer=object())
     except AssertionError as e:
         assert "tokenized with" in str(e)
     else:

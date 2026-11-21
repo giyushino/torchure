@@ -186,7 +186,7 @@ def test_sharded_norm(mesh, dim):
 
 
 def test_replicated_grads_are_not_reduced(mesh, dim):
-    """the DDP case, and the trap the roadmap's 1.3 wording invites.
+    """the DDP case: replicated grads must not be reduced again.
 
     post-sync DDP grads are REPLICAS: every rank already holds the whole
     gradient vector, so the local norm is the global norm and shard_dims must

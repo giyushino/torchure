@@ -40,19 +40,14 @@
     }
   },
   "data": {
-    "name": "allenai/dolma3_mix-6T",
-    "split": "train",
+    "source": "hf://datasets/allenai/dolma3_mix-6T",
     "tokenizer": "allenai/Olmo-3-7B-Instruct",
     "eos_token": "<|endoftext|>",
     "pad_token": "<|pad|>",
-    "text_field": "text",
-    "shuffle_buffer": 1000,
     "seed": 42,
-    "num_workers": 4,
     "global_batch_size": 2,
     "micro_batch_size": 2,
-    "seq_len": 4096,
-    "pack_batch": 1000
+    "seq_len": 4096
   },
   "checkpointing": {
     "save_steps": 10000,

@@ -51,19 +51,21 @@
     }
   },
   "data": {
-    "name": "jxie/coco_captions",
-    "split": "train",
+    "source": {
+      "path": "hf://datasets/jxie/coco_captions",
+      "files": "data/train-*",
+      "text_field": "caption",
+      "image_field": "image",
+      "window_blocks": 16
+    },
     "tokenizer": "Qwen/Qwen3-0.6B",
     "eos_token": "<|endoftext|>",
     "pad_token": "<|fim_pad|>",
-    "text_field": "caption",
-    "shuffle_buffer": 1000,
     "seed": 42,
-    "num_workers": 8,
     "global_batch_size": 64,
     "micro_batch_size": 64,
     "seq_len": 128,
-    "image_field": "image"
+    "workers": 8
   },
   "checkpointing": {
     "save_steps": 10000,

@@ -20,12 +20,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
-from PIL import Image
 
 from torchure.core.mesh import Mesh
 from torchure.core.meta import materialize
 from torchure.core.placement import Shard
-from torchure.dataloader.vlm import ImageTextCollator
 from torchure.loss.fused_linear_ce import fused_linear_cross_entropy
 from torchure.models.looped.looped import LoopedQwen3
 from torchure.models.qwen3.qwen3 import Qwen3
@@ -230,30 +228,19 @@ def test_vlm_text_only():
     assert model(x).shape == (2, SEQ, VOCAB)
 
 
-def test_image_text_collator():
-    from tokenizers import Tokenizer
-
-    tok = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-    eos, pad = tok.token_to_id("<|endoftext|>"), tok.token_to_id("<|fim_pad|>")
-    collate = ImageTextCollator(tok, -100, 16, eos, pad, image_size=8, num_image_tokens=4)
-    images = [Image.new("RGB", (20, 10), (255, 0, 0)), Image.new("L", (5, 5), 0)]
-    batch = collate([
-        {"image": images[0], "text": "a red square"},
-        {"image": images[1], "text": "a very long caption " * 10},
-    ])
-    ids_, labels, pixels = batch["input_ids"], batch["labels"], batch["pixel_values"]
-    assert pixels.shape == (2, 3, 8, 8)
-    assert pixels[0, 0].eq(1).all() and pixels[0, 1].eq(-1).all() and pixels[1].eq(-1).all()
-
-    caption = tok.encode("a red square", add_special_tokens=False).ids
-    n = 6 + len(caption) + 1  # vision_start + 4 pads + vision_end, caption, eos
-    assert ids_[0, :6].tolist() == collate.prefix
-    assert ids_[0, 6:n].tolist() == caption + [eos]
-    assert ids_[0, n:].eq(pad).all()
-    assert labels[0, :6].eq(-100).all() and labels[0, n:].eq(-100).all()
-    assert torch.equal(labels[0, 6:n], ids_[0, 6:n])
-    # truncated row: no eos, no pad, every text position scored
-    assert labels[1, 6:].ne(-100).all() and ids_[1, -1] != pad
+def test_vlm_uint8_pixels():
+    """the loader sends uint8 pixels (dataloader/sources.py); the tower
+    normalizes them to siglip's [-1, 1], same as float input. the caption row
+    layout itself is tested in tests/data_sources.py."""
+    model = build(Qwen3VL, VLM)
+    size = model.image_size
+    raw = torch.randint(0, 256, (2, 3, size, size), dtype=torch.uint8,
+                        generator=torch.Generator().manual_seed(2))
+    x = ids()
+    x[:, 1:1 + model.num_image_tokens] = IMAGE_TOKEN
+    got = model(x, pixel_values=raw)
+    want = model(x, pixel_values=raw.float() / 127.5 - 1.0)
+    assert torch.allclose(got, want, atol=1e-5), (got - want).abs().max()
 
 
 # --- fsdp ------------------------------------------------------------------

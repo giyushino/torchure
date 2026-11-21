@@ -226,7 +226,7 @@ def all_to_all(
     """
     group = mesh.get_group(dim)
     group_size = mesh.size(dim)
-    assert not async_op, "all_to_all is sync-only (v0)"
+    assert not async_op, "all_to_all is sync-only"
     if input_splits is not None or output_splits is not None:
         assert input_splits is not None and output_splits is not None, (
             "uneven all_to_all needs both input_splits and output_splits"
