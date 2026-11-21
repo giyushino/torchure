@@ -6,12 +6,9 @@ dataloader's own state is one batch ahead of training. a checkpoint saves that
 held batch (`state_dict`) and resume hands it back as `first_batch`, so the
 resumed run sees every batch exactly once.
 
-a loader that runs out is restarted through `restart` (the next pass over the
-data), so a run longer than the dataset keeps going. each dp rank restarts on
-its own, whenever its own shards run out.
+the loader never runs out (each source starts its next epoch itself); if
+one does, the prefetcher ends too.
 """
-
-from collections.abc import Callable, Iterator
 
 import torch
 
@@ -26,12 +23,8 @@ class CUDAPrefetcher:
         loader_iter,
         device: torch.device,
         first_batch: dict[str, torch.Tensor] | None = None,
-        restart: Callable[[], Iterator] | None = None,
     ):
         self.loader_iter = loader_iter
-        # called when the loader runs out; returns the iterator of the next
-        # pass. None: the prefetcher just ends (StopIteration)
-        self.restart = restart
         self.device = device
         self.stream = torch.cuda.Stream()
         self.next_batch: dict[str, torch.Tensor] | None = None
@@ -51,17 +44,8 @@ class CUDAPrefetcher:
             try:
                 batch = next(self.loader_iter)
             except StopIteration:
-                if self.restart is None:
-                    self.next_batch = None
-                    return
-                self.loader_iter = self.restart()
-                try:
-                    batch = next(self.loader_iter)
-                except StopIteration:
-                    raise RuntimeError(
-                        "the dataloader yielded no batch on a fresh pass: this "
-                        "rank's share of the dataset is smaller than one micro batch"
-                    ) from None
+                self.next_batch = None
+                return
         with torch.cuda.stream(self.stream):
             self.next_batch = {
                 k: v.to(self.device, non_blocking=True) for k, v in batch.items()

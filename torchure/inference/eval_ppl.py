@@ -5,8 +5,8 @@ no held-out split exists for climbmix (the data config only declares
 "train"), so this is in-distribution perplexity, not a real held-out
 number -- a progress/sanity signal, not a benchmark. the seed is bumped
 from the training config's so the shuffle buffer doesn't hand back the
-exact stream order the run trained on (streaming shuffle can't guarantee
-zero overlap without an actual held-out split).
+exact order the run trained on (a reshuffle can't guarantee zero overlap
+without an actual held-out split).
 
     uv run -m torchure.inference.eval_ppl \
         --config configs/qwen3_dense_climbmix_ddp.json --step 42000
@@ -37,7 +37,6 @@ def main() -> None:
 
     data_cfg = dict(config["data"])
     data_cfg["seed"] = data_cfg["seed"] + 1
-    data_cfg["num_workers"] = 1  # persistent_workers=True in build_dataloader needs > 0
     ignore_index = config["objective"]["config"]["ignore_index"]
     loader = build_dataloader(
         data_cfg, tokenizer, ignore_index, dp_rank=0, dp_size=1,
@@ -60,6 +59,7 @@ def main() -> None:
                   f"|| running avg loss={running:.4f} || running ppl={math.exp(running):.2f}")
 
     avg_loss = sum(losses) / len(losses)
+    loader.close()
     n_tokens = len(losses) * data_cfg["micro_batch_size"] * data_cfg["seq_len"]
     print(f"\n{len(losses)} batches ({n_tokens} tokens) || avg loss={avg_loss:.4f} "
           f"|| perplexity={math.exp(avg_loss):.2f}")

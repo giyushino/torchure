@@ -2,21 +2,16 @@
 example mix (see notes/DATA_MIXING.md): mostly climbmix, annealing into
 fineweb-edu over the last 10% of training, which is also wsd's decay phase.
 
-the sources are local slices made by tokenize_shards.py:
-
-    uv run -m torchure.dataloader.tokenize_shards --dataset OptimalScale/ClimbMix \
-        --tokenizer Qwen/Qwen3-0.6B --eos-token "<|endoftext|>" \
-        --max-tokens 3e7 --shard-tokens 1e7 --out data/smoke_climbmix
-    uv run -m torchure.dataloader.tokenize_shards --dataset HuggingFaceFW/fineweb-edu \
-        --config sample-10BT --tokenizer Qwen/Qwen3-0.6B --eos-token "<|endoftext|>" \
-        --max-tokens 1e7 --shard-tokens 1e7 --out data/smoke_fwedu
-
-a location can also be an http(s) url or hf://datasets/<org>/<name>.
+both stream straight from the hub and are tokenized while training: climbmix
+is jsonl (byte-range blocks), fineweb-edu's 10BT sample is parquet
+(row-group blocks). a location can also be a local directory or file, an
+http(s) url to one file, or a token-shard directory made by
+tokenize_shards.py.
 """
 
 SOURCES = {
-    "climbmix": "data/smoke_climbmix",
-    "fineweb_edu": "data/smoke_fwedu",
+    "climbmix": "hf://datasets/OptimalScale/ClimbMix",
+    "fineweb_edu": "hf://datasets/HuggingFaceFW/fineweb-edu/sample/10BT",
 }
 
 

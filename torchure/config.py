@@ -57,29 +57,30 @@ SCHEMA = {
     },
     "objective": {"name": REQUIRED, "config": FREE},
     "data": {
-        # exactly one of: `name`, an hf dataset streamed and tokenized on the
-        # fly, or `mix`, a mix script over pre-tokenized sources
-        # (dataloader/mixture.py, notes/DATA_MIXING.md)
-        "name": None,
+        # exactly one of: `source`, one dataset (a location string, or
+        # {"path", "files", "text_field", "image_field", "window_blocks"}),
+        # or `mix`, a mix script over several (dataloader/{sources,mixture}.py,
+        # notes/DATA_LOADING.md)
+        "source": None,
         "mix": None,
-        "config": None,
-        "split": "train",
         "tokenizer": REQUIRED,
         "eos_token": REQUIRED,
         "pad_token": REQUIRED,
-        "text_field": "text",
-        "shuffle_buffer": 1000,
         "seed": 42,
-        "num_workers": 4,
         "global_batch_size": REQUIRED,
         "micro_batch_size": REQUIRED,
         "seq_len": REQUIRED,
-        "pack_batch": 1000,
-        # mix only: bytes per range request, blocks per shuffle window, and
-        # download threads
+        # bytes per range request (token shards, jsonl), blocks per shuffle
+        # window, windows downloading ahead of the current one, and the
+        # threads that download / tokenize / decode
         "block_mb": 16,
         "window_blocks": 4,
+        "prefetch_windows": 2,
         "fetch_threads": 8,
+        # > 0: that many processes fetch / tokenize / decode instead of the
+        # threads, keeping the gil free for the training loop. worth it for
+        # images, not for text (notes/DATA_LOADING.md)
+        "workers": 0,
     },
     "checkpointing": {
         "save_steps": REQUIRED,
@@ -234,8 +235,10 @@ def _check_values(config: dict) -> None:
     expect(ckpt["stop_check_every"] is None or ckpt["stop_check_every"] >= 1,
            "checkpointing.stop_check_every: expected null or >= 1")
     data = config["data"]
-    expect((data["name"] is None) != (data["mix"] is None),
-           "data needs exactly one of `name` (an hf dataset) or `mix` (a mix script)")
+    expect((data["source"] is None) != (data["mix"] is None),
+           "data needs exactly one of `source` (one dataset) or `mix` (a mix script)")
+    expect(data["source"] is None or isinstance(data["source"], (str, dict)),
+           "data.source must be a location string or an object with `path`")
     expect(data["mix"] is None or os.path.isfile(data["mix"]),
            f"data.mix {data['mix']!r}: no such file")
     expect(data["global_batch_size"] % data["micro_batch_size"] == 0,

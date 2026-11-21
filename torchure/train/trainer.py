@@ -12,7 +12,6 @@ from datetime import datetime
 
 import torch
 import torch.nn as nn
-import torchdata
 from tokenizers import Tokenizer
 
 from torchure.checkpoint.checkpointer import Checkpointer, ShardLayout
@@ -21,7 +20,7 @@ from torchure.core.grad_helper import clip_grad_norm
 from torchure.config import load_config, validate
 from torchure.core.mesh import Mesh, build_mesh
 from torchure.core.meta import materialize
-from torchure.dataloader.builder import build_dataloader, shutdown_workers
+from torchure.dataloader.builder import build_dataloader
 from torchure.dataloader.mixture import MixtureLoader
 from torchure.dataloader.prefetcher import CUDAPrefetcher
 from torchure.models.builder import build_model
@@ -114,13 +113,10 @@ class Trainer:
         self.max_norm = optim_cfg.get("max_norm")
 
         self.dataloader = self._build_dataloader()
-        # a mix script's loader (dataloader/mixture.py) rather than the hf stream
-        self.mixture = isinstance(self.dataloader, MixtureLoader)
-        if self.mixture:
-            assert self.dataloader.eos_id == self.eos_id, (
-                f"mix sources end docs with token {self.dataloader.eos_id}, but "
-                f"data.eos_token is {self.eos_id}"
-            )
+        assert self.dataloader.eos_id == self.eos_id, (
+            f"data sources end docs with token {self.dataloader.eos_id}, but "
+            f"data.eos_token is {self.eos_id}"
+        )
         self.global_batch_size = self.config["data"]["global_batch_size"]
         self.micro_batch_size = self.config["data"]["micro_batch_size"]
 
@@ -168,15 +164,11 @@ class Trainer:
         self.start_step = self._resume()
         self._setup_wandb()
 
-        # must come after _resume restores the dataloader state
-        dataloader_iter = iter(self.dataloader)
-        # workers ignore SIGTERM (see builder._ignore_sigterm), so they must be
-        # torn down explicitly on every exit path or the process hangs at exit
-        atexit.register(shutdown_workers, dataloader_iter)
+        # must come after _resume restores the dataloader state. the loader
+        # never runs out: each source starts its next epoch itself
+        atexit.register(self.dataloader.close)
         self.prefetcher = CUDAPrefetcher(
-            dataloader_iter, self.device, first_batch=self._resumed_batch,
-            # a mixture never runs out: each source starts its next epoch itself
-            restart=None if self.mixture else self._next_data_pass,
+            self.dataloader, self.device, first_batch=self._resumed_batch
         )
 
         # set by the SIGTERM handler train() installs; see _stop_requested
@@ -222,7 +214,7 @@ class Trainer:
                 "perf/peak_mem_gib": torch.cuda.max_memory_allocated() / 2**30,
                 # the schedule's mix at this step
                 **({f"mix/{name}": w for name, w in self.dataloader.weights(step).items()}
-                   if self.mixture else {}),
+                   if len(self.dataloader.names) > 1 else {}),
                 **extra,
             },
             step=step,
@@ -395,32 +387,17 @@ class Trainer:
             self.ep.finish_init(model)
 
     @debug_time
-    def _build_dataloader(self) -> torchdata.stateful_dataloader.StatefulDataLoader | MixtureLoader:
+    def _build_dataloader(self) -> MixtureLoader:
         return build_dataloader(
             self.config["data"], self.tokenizer, self.ignore_index,
             self.mesh.coordinate("dp"), self.dp_size,
-            # workers survive a job-wide SIGTERM until the final checkpoint;
-            # __init__ registers their teardown
-            shield_sigterm=True,
             total_steps=self.num_train_steps,
+            # a vlm's image spec, for caption sources
+            vision=(
+                (self.model.image_size, self.model.num_image_tokens)
+                if hasattr(self.model, "num_image_tokens") else None
+            ),
         )
-
-    def _next_data_pass(self):
-        """
-        this rank's shards ran out: start the next pass, reshuffled (the hf
-        dataset reshuffles per epoch). the epoch is saved with the prefetcher
-        state, so a resume lands in the same pass.
-        """
-        dataset = self.dataloader.dataset
-        epoch = dataset.epoch + 1
-        dataset.set_epoch(epoch)
-        print(f"[dp {self.mesh.coordinate('dp')}] data exhausted, starting pass {epoch}")
-        loader_iter = iter(self.dataloader)
-        # persistent workers return the same iterator; only a new one needs
-        # its teardown registered
-        if loader_iter is not self.prefetcher.loader_iter:
-            atexit.register(shutdown_workers, loader_iter)
-        return loader_iter
 
     def _build_mesh(self) -> Mesh:
         """the config's mesh plus the derived data axis `dp` (core/mesh.py)."""
@@ -490,8 +467,6 @@ class Trainer:
             # the prefetcher holds one batch training hasn't seen yet; save it
             # with the current data pass
             held = self.prefetcher.state_dict()
-            # the hf dataset's pass; a mixture keeps its epochs in its own state
-            held["epoch"] = 0 if self.mixture else self.dataloader.dataset.epoch
             self.checkpointer.save_prefetcher(held, step, dp_rank)
         self.checkpointer.commit(step)
 
@@ -568,11 +543,12 @@ class Trainer:
             held = self.checkpointer.load_prefetcher(step, dp_rank)
             if held is not None:
                 self._resumed_batch = held["next_batch"]
-                # the dataset doesn't restore its epoch itself, and ignores
-                # state saved in another epoch
-                if not self.mixture:
-                    self.dataloader.dataset.set_epoch(held.get("epoch", 0))
             self.checkpointer.load_dataloader(self.dataloader, step, dp_rank)
+        else:
+            # a fresh shuffle, not the start of the run's own order again
+            # (which the same seed would replay). it can still overlap what
+            # the run already saw
+            self.dataloader.reseed(self.dataloader.seed + step)
         # each dp rank's own stream (older checkpoints: rank 0's, in
         # trainer.pt). a rank with none, after growing the mesh, keeps its seed
         rng = self.checkpointer.load_rng(step, dp_rank)
