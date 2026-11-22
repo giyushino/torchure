@@ -11,8 +11,8 @@ multi gpu:
     uv run torchrun --nproc-per-node 8 -m torchure.train.train \
         --config configs/qwen3_dense_climbmix_ddp.json
 
-benchmark mode (fixed step count, no checkpointing, prints tokens/sec and
-peak memory):
+benchmark mode (fixed step count, no checkpointing, prints tokens/sec, peak
+memory and the steady-state tokens/sec past --warmup-steps):
 
     uv run -m torchure.train.train --config configs/qwen3_dense_climbmix.json --steps 20
 """
@@ -36,6 +36,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="benchmark mode: run exactly N steps (no checkpointing) and print "
              "tps/peak mem. omit to run the config's full schedule",
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=None,
+        help="with --steps: steps left out of the steady-state tps "
+             "(default min(20, steps // 2))",
     )
     return parser.parse_args()
 
@@ -70,7 +77,7 @@ def main() -> None:
             benchmark=args.steps is not None,
         )
         if args.steps is not None:
-            trainer.train_n_step_test(args.steps)
+            trainer.train_n_step_test(args.steps, args.warmup_steps)
         else:
             trainer.train()
     finally:

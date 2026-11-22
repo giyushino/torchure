@@ -33,12 +33,13 @@ def _chunk_fwd(
     target = logits.gather(1, safe).squeeze(1)           # (C,)
     loss_sum = ((lse - target) * row_weight).sum()       # fp32 scalar, sum-reduced
 
-    # d(loss_sum)/d(logits) = (softmax - onehot) * row weight
-    probs = torch.exp(logits - lse.unsqueeze(1))
-    probs = probs * row_weight.unsqueeze(1)
-    probs.scatter_add_(1, safe, -row_weight.unsqueeze(1))
-
-    grad_logits = probs.to(hidden.dtype)                 # (C, V)
+    # d(loss_sum)/d(logits) = (softmax - onehot) * row weight. the softmax is
+    # written straight in the activation dtype (no fp32 (C, V) buffer); the
+    # target entry, where the onehot's -1 lands, is computed in fp32 and
+    # rounded once, so a confident target keeps its small grad
+    grad_logits = (torch.exp(logits - lse.unsqueeze(1)) * row_weight.unsqueeze(1)).to(hidden.dtype)
+    target_grad = (torch.exp(target - lse) - 1) * row_weight
+    grad_logits.scatter_(1, safe, target_grad.to(hidden.dtype).unsqueeze(1))  # (C, V)
     grad_hidden = grad_logits @ weight                   # (C, D)
     # grad_W is accumulated by the caller with one addmm
     return loss_sum, grad_hidden, grad_logits
@@ -149,10 +150,13 @@ def _vp_stats(logits, row_max, safe, owned):
 
 def _vp_grads(logits, lse, target, row_weight, safe, owned, weight):
     loss_sum = ((lse - target) * row_weight).sum()
-    # (softmax - onehot) * row weight, restricted to this rank's vocab rows
-    probs = torch.exp(logits - lse.unsqueeze(1)) * row_weight.unsqueeze(1)
-    probs.scatter_add_(1, safe, -(owned * row_weight).unsqueeze(1))
-    grad_logits = probs.to(weight.dtype)
+    # (softmax - onehot) * row weight, restricted to this rank's vocab rows;
+    # as in _chunk_fwd, only the entry at `safe` is finished in fp32 (for a
+    # row whose label another rank owns that is column 0, rewritten as is)
+    grad_logits = (torch.exp(logits - lse.unsqueeze(1)) * row_weight.unsqueeze(1)).to(weight.dtype)
+    at_safe = logits.gather(1, safe).squeeze(1)
+    safe_grad = (torch.exp(at_safe - lse) - owned) * row_weight
+    grad_logits.scatter_(1, safe, safe_grad.to(weight.dtype).unsqueeze(1))
     return loss_sum, grad_logits @ weight, grad_logits
 
 
@@ -243,8 +247,9 @@ def fused_linear_cross_entropy(
         labels = labels.reshape(-1)
     if weights is not None:
         weights = weights.reshape(-1)
-    # the final norm returns fp32 even under autocast, and autocast doesn't
-    # reach inside the autograd.Function, so cast here or everything runs in fp32
+    # autocast doesn't reach inside the autograd.Function, so a hidden state
+    # that arrives in fp32 (a model that doesn't cast its residual stream)
+    # would run everything in fp32; a no-op when it is already cast
     if torch.is_autocast_enabled(hidden.device.type):
         hidden = hidden.to(torch.get_autocast_dtype(hidden.device.type))
     if vocab_axis is not None:

@@ -93,7 +93,7 @@ class Trainer:
         self.model.activation_checkpointing = self.config["activation_checkpointing"]
         self.eos_id = self.tokenizer.token_to_id(self.config["data"]["eos_token"])
         if self.config["doc_mask"]:
-            assert hasattr(self.model, "doc_mask_eos"), (
+            assert self.model.supports_doc_mask, (
                 f"doc_mask: model {self.config['model']['name']!r} doesn't support document masking"
             )
             # layers.doc_mask is causal, and finds documents by eos in the
@@ -224,7 +224,8 @@ class Trainer:
             },
             step=step,
         )
-
+    
+    @debug_time
     def _build_model(self) -> nn.Module:
         """
         build, initialize and parallelize the model. sets self.parallel,
@@ -298,6 +299,7 @@ class Trainer:
                 param_dtype=_DTYPES[fsdp_cfg["param_dtype"]],
                 reduce_dtype=_DTYPES[fsdp_cfg["reduce_dtype"]],
                 prefetch=fsdp_cfg["prefetch"],
+                reshard_after_forward=fsdp_cfg["reshard_after_forward"],
                 device=self.device,
             )
         else:
@@ -324,11 +326,12 @@ class Trainer:
         """
         if self.ep_size == 1:
             return None
-        assert hasattr(model, "ep_plan"), (
-            f"mesh.ep={self.ep_size} but {type(model).__name__} has no ep_plan(): "
+        banks = model.ep_plan()
+        assert banks, (
+            f"mesh.ep={self.ep_size} but {type(model).__name__} has no expert banks: "
             "expert parallel needs a moe model"
         )
-        return EP(self.mesh, model.ep_plan(), dim="ep")
+        return EP(self.mesh, banks, dim="ep")
 
     def _tensor_parallelize(self, model: nn.Module) -> TP | None:
         """
@@ -356,7 +359,8 @@ class Trainer:
             seq_dim=0 if sp_dim == "batch" else 1,
             overlap=tp_cfg["overlap"] if sequence_parallel else "none",
         )
-
+    
+    @debug_time
     def _compile(self, model: nn.Module) -> None:
         """
         compile each block's forward: identical blocks share one graph, and
@@ -400,10 +404,11 @@ class Trainer:
             # a vlm's image spec, for caption sources
             vision=(
                 (self.model.image_size, self.model.num_image_tokens)
-                if hasattr(self.model, "num_image_tokens") else None
+                if self.model.num_image_tokens is not None else None
             ),
         )
-
+    
+    @debug_time
     def _build_mesh(self) -> Mesh:
         """the config's mesh plus the derived data axis `dp` (core/mesh.py)."""
         return build_mesh(self.config["mesh"])
@@ -642,9 +647,6 @@ class Trainer:
         summed over all data ranks so every rank applies the same update.
         returns balance metrics on device ({} for a dense model).
         """
-        if not hasattr(self.model, "balance_step"):
-            return {}
-
         def reduce(load: torch.Tensor) -> torch.Tensor:
             if self.dp_size > 1:
                 all_reduce(load, self.mesh, "dp", "sum")
@@ -652,11 +654,13 @@ class Trainer:
 
         return self.model.balance_step(reduce)
 
-    def _run_steps(self, start: int, end: int, checkpoint: bool) -> None:
+    def _run_steps(self, start: int, end: int, checkpoint: bool) -> list[tuple[int, int, float]]:
         """
         step loop for train() and the --steps benchmark. metrics stay on the
         gpu until a log point so the cpu can run ahead. step time is averaged
         over the log window and excludes checkpoint saves.
+
+        returns the log windows as (last step, steps, seconds).
         """
         tokens_per_step = self.config["data"]["seq_len"] * self.global_batch_size
         loss_sum = torch.zeros((), device=self.device)
@@ -664,6 +668,7 @@ class Trainer:
         # any other train_step metrics (moe balance)
         extra_sums: dict[str, torch.Tensor] = {}
         window = 0
+        windows: list[tuple[int, int, float]] = []
         t0 = time.perf_counter()
 
         for step in range(start, end):
@@ -688,7 +693,9 @@ class Trainer:
                 loss = loss_sum.item() / window
                 gnorm = gnorm_sum.item() / window
                 extra = {name: total.item() / window for name, total in extra_sums.items()}
-                step_time = (time.perf_counter() - t0) / window
+                elapsed = time.perf_counter() - t0
+                windows.append((done, window, elapsed))
+                step_time = elapsed / window
                 if self.rank == 0:
                     self._log_metrics(loss, gnorm, done, tokens_per_step, step_time, extra)
                     print(
@@ -711,10 +718,32 @@ class Trainer:
 
         if self.rank == 0:
             print(f"peak cuda mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
+        return windows
 
     @debug_time
-    def train_n_step_test(self, n_steps: int) -> None:
-        self._run_steps(0, n_steps, checkpoint=False)
+    def train_n_step_test(self, n_steps: int, warmup_steps: int | None = None) -> None:
+        """
+        benchmark: n_steps without checkpointing, then the mean tok/s over
+        the log windows that start after `warmup_steps` (compile, allocator
+        and clock warmup; default min(20, n_steps // 2)). compare runs on
+        this number, with the same warmup and step count, interleaved
+        (notes/CHANGES.md).
+        """
+        if warmup_steps is None:
+            warmup_steps = min(20, n_steps // 2)
+        windows = self._run_steps(0, n_steps, checkpoint=False)
+        steady = [(steps, secs) for done, steps, secs in windows if done - steps >= warmup_steps]
+        if self.rank != 0:
+            return
+        if not steady:
+            print(f"no log window starts after step {warmup_steps}: no steady-state tps")
+            return
+        steps = sum(s for s, _ in steady)
+        tokens = self.config["data"]["seq_len"] * self.global_batch_size * steps
+        print(
+            f"steady tps (steps {n_steps - steps + 1}-{n_steps}): "
+            f"{tokens / sum(t for _, t in steady):.0f}"
+        )
 
     def train(self) -> None:
         signal.signal(signal.SIGTERM, self._on_sigterm)
