@@ -1,6 +1,7 @@
 # loader throughput vs torch DataLoader, grain, zephon (11/22)
 
-loader-only, cpu only, local files. the torchure loader is the branch
+loader-only, cpu only, local files (torchure also over http, at the end).
+the torchure loader is the branch
 `claude/dataloader-optimizing` at `60fe526` (DATA_LOADING.md's "per-core
 cost" section describes what it changed). this is the repeat of the
 130-core comparison that section says was still to do, on a different box.
@@ -193,8 +194,58 @@ images per second. `pil` was run at n=8 only.
 - **a shared box.** absolute numbers moved with the other users' load;
   compare within a table. per-core rates here are ~3x the laptop's in
   DATA_LOADING.md (220-240k tok/s per core).
-- **n = 8 and 32 only**, one rank, local files: no hub reads, no dp > 1.
+- **n = 8 and 32 only**, one rank, no dp > 1. hub reads: torchure only
+  (the http section).
 - **`fast` pixels differ from `pil`** by a few levels (DATA_LOADING.md).
+
+## torchure over http (11/22)
+
+the same loader and harness, reading from the hub instead of local disk:
+`hf://datasets/OptimalScale/ClimbMix` (all 100 jsonl files, 16MB range
+blocks) and `hf://datasets/jxie/coco_captions`, `data/train-*` (one row
+group per range read). no `HF_TOKEN` (unauthenticated). two runs each,
+both shown; the local column is the median from the tables above.
+
+| text, jsonl | tok/s over http | cores | tok/s per core | first batch | local jsonl / parquet |
+|---|---|---|---|---|---|
+| 8 threads | 1.91M, 2.27M | 3.5-4.0 | 539-564k | 5.2 s | 4.54M (jsonl) |
+| 8 `workers`, pw4 | 2.22M, 2.71M | 4.4-4.7 | 470-618k | 5.1-5.6 s | 6.26M (parquet) |
+| 32 threads | 7.12M, 8.24M | 12.1-13.4 | 587-615k | 13.9-15.4 s | 9.30M (jsonl) |
+| 32 `workers`, pw4 | 9.10M, 9.45M | 14.1-14.7 | 644k | 14.5-14.8 s | 20.45M (parquet) |
+
+| images | img/s over http | cores | img/s per core | first batch | local |
+|---|---|---|---|---|---|
+| 8 threads | 475, 523 | 1.3-1.5 | 349-359 | 3.2-6.6 s | 2,558 |
+| 8 `workers` | 515, 516 | 1.4-1.5 | 356-357 | 3.3-3.8 s | 3,188 |
+| 32 `workers` | 1,444, 1,504 | 4.2-4.4 | 340-343 | 5.5-5.8 s | 11,084 |
+
+- **over http the network is the limit, not the cpu.** the cores column is
+  the tell: 8 fetches keep ~4 cores busy on text and ~1.4 on images; the
+  rest of the time they wait on the socket. cpu per token / image is about
+  what it is locally.
+- **the link.** raw 16MB range reads of `part_0.jsonl` through the loader's
+  `Reader` (`bench/net_probe.py`): 16.6 MB/s on 1 connection, 31.5 on 8,
+  48.9 on 32, 52.2 on 64. so ~50 MB/s from the hub to this box however many
+  connections, and ~4 MB/s per connection at 8. jsonl is 4.3 bytes per
+  token and a coco row 34KB, so the loader's rates are: text 8-12 MB/s at
+  n=8 and ~40 MB/s at 32 workers; images ~17 MB/s at n=8 and ~50 MB/s at 32
+  workers, i.e. the whole link.
+- **text: 2M tok/s per rank at the default 8 threads**, 42-50% of local.
+  a 4-gpu run needs ~60k tok/s per rank (DATA_LOADING.md): 30x headroom,
+  and 4 ranks together would use about a third of the link.
+- **images: ~500 img/s at n=8, ~1,470 at 32 workers, 13-20% of local**, and
+  the 32-worker figure is the link's ceiling for the whole box, not per
+  rank. the 4-gpu vlm run trains at ~1,690 img/s (EXPERIMENTAL_ARCHS.md):
+  on this box, from the hub, the loader would hold it back. the h100 box
+  measured 3,013 img/s from the hub on 11/19, so this is this box's path
+  to the hub; local files, or a copy on closer storage, remove it.
+- 30 s windows are coarse for the text numbers: a window of 4 × 16MB blocks
+  is ~15M tokens, so a run sees only a few arrive. the cores column, which
+  doesn't quantize, agrees between the two runs.
+- seen on the way: `Reader.size()` fails on a hub file
+  ("no size in Content-Range"), which is the path a single-file `hf://`
+  source takes (`open_source`); directory sources get sizes from the tree
+  listing and are fine. not investigated.
 
 ## files
 
@@ -209,5 +260,7 @@ branch with its venv, the data, and
   `sweep_image.sh`: the runs above
 - `bench/summarize.py results/text.jsonl`: the tables, from
   `results/{text,image}.jsonl` (one json line per run)
+- `bench/sweep_http.sh`, `bench/net_probe.py`: the http runs
+  (`results/http.jsonl`) and the raw range-read probe
 - `bench/clean_shm.sh`: removes the semaphores and shared memory that
   killed torch / grain runs leave in `/dev/shm`
