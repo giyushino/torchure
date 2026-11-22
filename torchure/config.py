@@ -35,7 +35,15 @@ SCHEMA = {
     "parallelism": "ddp",
     # reduce_dtype: the dtype grads are all-reduced in ("float32" = as is)
     "ddp": {"bucket_mb": 25, "reduce_dtype": "float32"},
-    "fsdp": {"param_dtype": "bfloat16", "reduce_dtype": "float32", "prefetch": 1},
+    # reshard_after_forward false keeps the gathered weights from forward to
+    # backward: half the all_gathers for one gathered copy of the model in
+    # memory (parallelism/fsdp2.py)
+    "fsdp": {
+        "param_dtype": "bfloat16",
+        "reduce_dtype": "float32",
+        "prefetch": 1,
+        "reshard_after_forward": True,
+    },
     "tp": {
         "vocab_parallel": True,
         "sequence_parallel": True,
@@ -80,8 +88,9 @@ SCHEMA = {
         "fetch_threads": 8,
         # > 0: that many processes fetch / tokenize / decode instead of the
         # threads, keeping the gil free for the training loop. worth it for
-        # images, not for text (notes/DATA_LOADING.md)
-        "workers": 0,
+        # images, not for text (notes/DATA_LOADING.md), so null picks 0 for
+        # text sources and mixture.IMAGE_WORKERS for image sources
+        "workers": None,
     },
     "checkpointing": {
         "save_steps": REQUIRED,
