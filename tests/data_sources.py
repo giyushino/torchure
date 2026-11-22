@@ -207,7 +207,9 @@ def test_captions(root: str) -> None:
         image = Image.open(io.BytesIO(raw))
         image.draft("RGB", (16, 16))
         image = image.convert("RGB").resize((16, 16), Image.Resampling.BICUBIC)
-        assert np.array_equal(pixels[i], np.asarray(image).transpose(2, 0, 1))
+        # the loader resizes with torch: PIL's kernel, rounded differently
+        diff = np.abs(pixels[i].astype(int) - np.asarray(image).transpose(2, 0, 1))
+        assert diff.max() <= 2 and diff.mean() < 0.5, (i, diff.max(), diff.mean())
     try:
         open_source(spec, rows_cfg(seq_len, None), 16, 1)
     except AssertionError as e:
@@ -271,26 +273,88 @@ def test_workers(root: str) -> None:
                     (loader_cfg(source=spec, seq_len=12, global_batch_size=4,
                                 micro_batch_size=2), {"vision": vision})):
         threads = MixtureLoader(cfg, 0, 2, 10, tokenizer=TOK, pin_memory=False, **kw)
-        ref = run(threads, 30)
+        ref = run(threads, 300)
         threads.close()
         procs = MixtureLoader(cfg | {"workers": 2}, 0, 2, 10, tokenizer=TOK, pin_memory=False, **kw)
-        head = run(procs, 11)
+        head = run(procs, 211)
         state = procs.state_dict()
-        workers = list(procs.workers._processes.values())
+        # a cold stream's first window is fetched on threads: get past it
+        assert (state["streams"]["data"]["epoch"], state["streams"]["data"]["window"]) > (0, 0)
+        workers = procs.workers.processes
+        assert len(workers) == 2 and all(p.poll() is None for p in workers)
         procs.close()
-        # killed; is_alive() can lag while the executor's own thread reaps them
-        deadline = time.monotonic() + 10
-        while any(p.is_alive() for p in workers) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert not any(p.is_alive() for p in workers), "close() must stop the workers"
+        assert all(p.poll() is not None for p in workers), "close() must stop the workers"
         resumed = MixtureLoader(cfg | {"workers": 2}, 0, 2, 10, tokenizer=TOK, pin_memory=False,
                                 **kw)
         resumed.load_state_dict(state)
-        tail = run(resumed, 19)
+        tail = run(resumed, 89)
         resumed.close()
         for i, (x, y) in enumerate(zip(head + tail, ref, strict=True)):
             assert x.keys() == y.keys() and all(torch.equal(x[k], y[k]) for k in x), i
     print("ok  workers: process workers match threads batch for batch, through a resume")
+
+
+EXIT_SCRIPT = """
+import sys
+sys.path[:0] = {path!r}
+from tokenizers import Tokenizer
+from torchure.dataloader.mixture import MixtureLoader
+loader = MixtureLoader({cfg!r}, 0, 1, 10, tokenizer=Tokenizer.from_str({tok!r}), pin_memory=False)
+next(loader)
+print(*[p.pid for p in loader.workers.processes], flush=True)
+if {close}:
+    loader.close()
+"""
+
+
+def test_worker_failures(root: str) -> None:
+    """a worker's error or death reaches next(); the trainer exits with or without close()."""
+    import shutil
+    import subprocess
+    import sys
+
+    cfg = loader_cfg(source=f"{root}/gone", workers=1)
+    shutil.copytree(f"{root}/jsonl", f"{root}/gone")
+    loader = MixtureLoader(cfg, 0, 1, 10, tokenizer=TOK, pin_memory=False)
+    next(loader)  # the first window comes from the trainer's own threads
+    shutil.rmtree(f"{root}/gone")
+    try:
+        for _ in range(10**6):  # until a window needs a block that isn't fetched yet
+            next(loader)
+    except FileNotFoundError as e:
+        assert any("in loader worker" in note for note in e.__notes__), e.__notes__
+    else:
+        raise AssertionError("a worker's FileNotFoundError must reach next()")
+    loader.close()
+
+    loader = MixtureLoader(loader_cfg(source=f"{root}/jsonl", workers=1), 0, 1, 10,
+                           tokenizer=TOK, pin_memory=False)
+    next(loader)
+    loader.workers.processes[0].kill()
+    try:
+        for _ in range(10**6):  # until a window needs a block that isn't fetched yet
+            next(loader)
+    except RuntimeError as e:
+        assert "died" in str(e), e
+    else:
+        raise AssertionError("a dead worker must fail next()")
+    loader.close()
+
+    cfg = loader_cfg(source=f"{root}/jsonl", workers=2)
+    for close in (True, False):
+        script = EXIT_SCRIPT.format(path=sys.path, cfg=cfg, tok=TOK.to_str(), close=close)
+        out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                             timeout=60)
+        assert out.returncode == 0, out.stderr
+        pids = [int(pid) for pid in out.stdout.split()]
+        assert len(pids) == 2, out.stdout
+        deadline = time.monotonic() + 10
+        while any(os.path.exists(f"/proc/{pid}") for pid in pids) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not any(os.path.exists(f"/proc/{pid}") for pid in pids), (
+            f"workers outlived the trainer (close={close})"
+        )
+    print("ok  worker failures: errors and deaths surface, and nothing outlives the trainer")
 
 
 def test_ranks_disjoint(root: str) -> None:
@@ -418,6 +482,7 @@ def main() -> None:
         test_captions(root)
         test_mix_resume(root)
         test_workers(root)
+        test_worker_failures(root)
         test_ranks_disjoint(root)
         test_empty_windows(root)
         test_http(root)

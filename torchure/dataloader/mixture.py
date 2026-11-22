@@ -43,25 +43,36 @@ O(1): it refetches the current window and nothing else.
 no torch DataLoader. by default (`workers: 0`) blocks are fetched, tokenized
 and decoded on `fetch_threads` threads in the trainer's process, and the
 trainer's thread only gathers rows into a batch. with `workers: N`, N
-processes do that work instead. that pays off for images, whose decoding
-holds the gil long enough to slow the training loop (notes/DATA_LOADING.md);
-text tokenizing doesn't. either way a block is fetched once, by one rank.
+processes (workers.py) do that work instead. that pays off for images, whose
+decoding holds the gil long enough to slow the training loop
+(notes/DATA_LOADING.md); text tokenizing doesn't. either way a block is
+fetched once, by one rank.
+
+each thread / worker tokenizes its block on one core: the loader turns
+tokenizers' own thread pool off for the process (TOKENIZERS_PARALLELISM),
+except while a cold stream (startup, resume) waits on its first window
+(sources.fetch_block). that window is always fetched on the threads, so the
+first batch doesn't wait for the workers to start.
 """
 
 import importlib.util
 import json
-import multiprocessing
 import os
-import signal
+import threading
 import types
+import weakref
 import zlib
 from collections.abc import Callable
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
 import torch
 
-from torchure.dataloader.sources import RowConfig, Vision, open_source
+from torchure.dataloader.sources import RowConfig, Vision, fetch_block, open_source, parse_spec
+from torchure.dataloader.workers import WorkerPool
+
+# worker processes for image sources when `data.workers` is null
+IMAGE_WORKERS = 8
 
 
 def load_mix(path: str):
@@ -127,7 +138,7 @@ class SourceStream:
     """
 
     def __init__(self, source, name: str, seed: int, dp_rank: int, dp_size: int,
-                 window_blocks: int, submit: Callable[[object], Future],
+                 window_blocks: int, submit: Callable[[object, bool], Future],
                  prefetch_windows: int = 1):
         self.source = source
         self.key = _source_key(name)
@@ -136,8 +147,12 @@ class SourceStream:
         self.dp_size = dp_size
         self.window_blocks = window_blocks
         self.prefetch_windows = prefetch_windows
-        # block -> future of source.fetch(block), on a thread or a worker process
+        # (block, burst) -> future of source.fetch(block), on a thread or a
+        # worker process
         self.submit = submit
+        # nothing loaded since startup / resume: the window being waited on
+        # is fetched with burst=True (MixtureLoader's submitter)
+        self._cold = True
         self.epoch = 0
         self.window = 0
         self.pos = 0
@@ -170,14 +185,20 @@ class SourceStream:
             return epoch + 1, 0
         return epoch, window
 
-    def _submit(self, epoch: int, window: int) -> None:
+    def _submit(self, epoch: int, window: int, burst: bool = False) -> None:
         if (epoch, window) in self._pending:
             return
         blocks = self._my_blocks(epoch)
         mine = blocks[window * self.window_blocks:(window + 1) * self.window_blocks]
         self._pending[(epoch, window)] = [
-            self.submit(self.source.blocks[b]) for b in mine
+            self.submit(self.source.blocks[b], burst) for b in mine
         ]
+
+    def _submit_ahead(self) -> None:
+        ahead = (self.epoch, self.window)
+        for _ in range(self.prefetch_windows):
+            ahead = self._next(*ahead)
+            self._submit(*ahead)
 
     def _load(self) -> None:
         """
@@ -187,13 +208,14 @@ class SourceStream:
         """
         skipped = 0
         while True:
-            self._submit(self.epoch, self.window)
+            self._submit(self.epoch, self.window, burst=self._cold)
             futures = self._pending.pop((self.epoch, self.window))
+            # the windows ahead start alongside this one, unless it's a cold
+            # stream's first: that one gets every core until it has arrived
+            if not self._cold:
+                self._submit_ahead()
             parts = [f.result() for f in futures]
-            ahead = (self.epoch, self.window)
-            for _ in range(self.prefetch_windows):
-                ahead = self._next(*ahead)
-                self._submit(*ahead)
+            self._submit_ahead()
             n = sum(len(p["input_ids"]) for p in parts)
             if n:
                 break
@@ -210,6 +232,7 @@ class SourceStream:
         self._order = _rng(
             self.seed, self.key, self.epoch, self.dp_rank, self.window
         ).permutation(n)
+        self._cold = False
 
     def take(self) -> dict[str, np.ndarray]:
         if self._parts is None:
@@ -233,25 +256,7 @@ class SourceStream:
         self._pending.clear()
         self.epoch, self.window, self.pos = state["epoch"], state["window"], state["pos"]
         self._parts = self._order = self._where = None
-
-
-# a worker process's sources, set once by _worker_init
-_WORKER_SOURCES: dict | None = None
-
-
-def _worker_init(sources: dict) -> None:
-    global _WORKER_SOURCES
-    # the trainer answers a job-wide SIGTERM by checkpointing at its next log
-    # point and needs batches until then; MixtureLoader.close() kills us
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    # parallelism comes from the processes; a rayon pool per worker would be
-    # hundreds of threads each
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    _WORKER_SOURCES = sources
-
-
-def _worker_fetch(name: str, block) -> dict[str, np.ndarray]:
-    return _WORKER_SOURCES[name].fetch(block)
+        self._cold = True
 
 
 def _single_source(step: int, total_steps: int) -> dict[str, float]:
@@ -315,9 +320,28 @@ class MixtureLoader:
 
         rows = RowConfig(self.seq_len, tokenizer, token("eos_token"), token("pad_token"),
                          ignore_index, vision)
+        workers = data_cfg.get("workers", 0)
+        images = any(parse_spec(s).image_field for s in self.mix.SOURCES.values())
+        if workers is None:
+            workers = IMAGE_WORKERS if images else 0
+        # started first: they import while the sources are opened below
+        self.workers = WorkerPool(workers, images) if workers > 0 else None
+        # fetches tokenize on one core each; fetch_block turns the pool back
+        # on for a cold stream's first window
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
         self.pool = ThreadPoolExecutor(
             max_workers=data_cfg["fetch_threads"], thread_name_prefix="mix-fetch"
         )
+        # start every fetch thread now, back to back. glibc hands a new thread
+        # the next malloc arena round-robin once there are about as many
+        # arenas as cores, so threads started together get distinct ones. the
+        # pool's lazy start instead interleaves them with the ~ncores threads
+        # tokenizers spawns for the first window's burst, and fetch threads
+        # then land on each other's arenas: they fight over the arena lock in
+        # every allocation, for the rest of the run, at a third of the speed
+        barrier = threading.Barrier(data_cfg["fetch_threads"])
+        list(self.pool.map(lambda _: (bytes(4096), barrier.wait()),
+                           range(data_cfg["fetch_threads"])))
         # opened in parallel: listing a dataset and reading parquet footers is
         # a few seconds of round trips per source
         opened = self.pool.map(
@@ -331,18 +355,18 @@ class MixtureLoader:
         keys = {src.keys for src in self.sources.values()}
         assert len(keys) == 1, f"sources yield different rows {keys}: can't mix text and images"
         self.keys = keys.pop()
-        self.workers = None
-        if data_cfg.get("workers", 0) > 0:
-            # spawn, not fork: the parent has threads (fetch pool, tokenizers)
-            self.workers = ProcessPoolExecutor(
-                data_cfg["workers"], mp_context=multiprocessing.get_context("spawn"),
-                initializer=_worker_init, initargs=(self.sources,),
-            )
+        if self.workers is not None:
+            self.workers.start(self.sources)
 
-        def submitter(name: str, src) -> Callable[[object], Future]:
-            if self.workers is not None:
-                return lambda block: self.workers.submit(_worker_fetch, name, block)
-            return lambda block: self.pool.submit(src.fetch, block)
+        def submitter(name: str, src) -> Callable[[object, bool], Future]:
+            def submit(block, burst: bool) -> Future:
+                # a cold stream's first window is fetched here even with
+                # workers: they may still be starting, and the trainer is
+                # doing nothing but wait for this window
+                if self.workers is None or burst:
+                    return self.pool.submit(fetch_block, src, block, burst)
+                return self.workers.submit(name, block)
+            return submit
 
         self.streams = {
             name: SourceStream(src, name, self.seed, dp_rank, dp_size,
@@ -350,6 +374,13 @@ class MixtureLoader:
                                submitter(name, src), data_cfg.get("prefetch_windows", 1))
             for name, src in self.sources.items()
         }
+
+        # the interpreter joins every pool thread at exit, before atexit
+        # handlers run, and a pool thread first works off its queue: seconds
+        # of prefetch nobody will read. so close() runs ahead of that join
+        # (the hook concurrent.futures itself uses), if the trainer hasn't
+        ref = weakref.ref(self)
+        threading._register_atexit(lambda: (loader := ref()) and loader.close())
 
         # micro batches this rank has yielded
         self.micro_index = 0
@@ -452,14 +483,11 @@ class MixtureLoader:
                 stream.load_state_dict(state["streams"][name])
 
     def close(self) -> None:
+        # fetches already running on the threads stop at their next chunk
+        # instead of holding up interpreter exit for a block each
+        for source in self.sources.values():
+            source.closed = True
         self.pool.shutdown(wait=False, cancel_futures=True)
         if self.workers is not None:
-            # they ignore SIGTERM (see _worker_init), so kill them outright
-            processes = list((getattr(self.workers, "_processes", None) or {}).values())
-            self.workers.shutdown(wait=False, cancel_futures=True)
-            for process in processes:
-                if process.is_alive():
-                    process.kill()
-            for process in processes:
-                process.join(timeout=5)
+            self.workers.close()
             self.workers = None

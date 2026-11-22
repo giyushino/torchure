@@ -115,7 +115,7 @@ def test_streams_disjoint(tmp: str) -> None:
     seen = []
     for rank in range(4):
         stream = SourceStream(src, "web", 3, rank, 4, 2,
-                              lambda block: pool.submit(src.fetch, block))
+                              lambda block, burst: pool.submit(src.fetch, block))
         while stream.epoch == 0:
             seen.append(int(stream.take()["input_ids"][0]))
     pool.shutdown()

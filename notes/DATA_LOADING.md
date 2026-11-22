@@ -74,7 +74,8 @@ pad…`, labels ignore_index on the image span and padding (identical layout
 to the old hf path's `ImageTextCollator`). images decode on the fetch threads
 (or the `workers` processes) with PIL (it releases the gil: 1 → 16 threads scales 221 → 2,390 img/s);
 jpegs use `draft()` (dct-domain 2/4/8x downscale before the bicubic resize,
-+25%; pixels differ slightly from a full decode). `pixel_values` stay
++25%; pixels differ slightly from a full decode). the resize is torch's
+(11/21, below). `pixel_values` stay
 **uint8** through the loader and the host→device copy; the vision tower
 normalizes (siglip and clip use different constants, so it's the model's
 call): `SiglipVisionTower.forward` casts and applies `/127.5 - 1` when it
@@ -178,12 +179,108 @@ interleaved old/new.
   measures the loader's thread, not what the loader does to a busy one.
   judge loader changes with an end-to-end run.
 
+## per-core cost (11/21)
+
+a comparison against torch's `StatefulDataLoader`, grain and zephon on a
+130-core box put this loader's text at 16-22k tok/s per core against their
+210-230k (it reached 2-3M tok/s by using ~130 cores), and everyone's images
+at 240-270 img/s per core. what was wrong, and what changed
+(branch `claude/dataloader-optimizing`):
+
+- **text: tokenizers' thread pool.** every fetch thread called
+  `encode_batch`, which fans one block out over every core (rayon), 8 of
+  them at once. now each fetch thread (or worker) tokenizes its block on
+  one core with the gil released, `TOKENIZERS_PARALLELISM=false`, which the
+  loader sets for the process. the pool is turned back on only while a
+  cold stream (startup, resume) waits on its first window
+  (`sources.fetch_block`), so the first batch is no slower.
+- **text: `encode_batch` → `encode_batch_fast`** (no offsets, which nothing
+  read). with 8 threads tokenizing at once, offsets more than doubled the
+  cpu per token (7.5 vs 3.4 cpu-s for the same docs with a tokenizer copy
+  per thread; `_fast` is 2.6 either way). in chunks of 256 docs, so a
+  16MB block's Encodings never all exist at once.
+- **text: malloc arenas.** glibc gives each new thread the next arena
+  round-robin once there are about as many arenas as cores. the fetch pool
+  started its threads lazily, some before and some after the ~ncores
+  threads rayon spawns for the first window, so on a small box fetch
+  threads ended up sharing arenas and fought over the arena lock in every
+  allocation for the rest of the run: 25,000 context switches/s per
+  thread, 0.5-1.3M tok/s instead of 1.8M, in about one run in three. the
+  fetch threads are now all started back to back in `__init__`.
+- **images: the resize was half the cost.** per 640×480 coco jpeg, one
+  core: decode with `draft` 2.7 ms (a full decode is 3.0: huffman decoding
+  dominates, so there is little left to take), PIL bicubic resize
+  320×240 → 224×224 2.1 ms, `np.asarray` 0.2 ms. torch's antialiased
+  bicubic on uint8 is the same kernel vectorized: 0.6 ms. its output is
+  within a few levels of PIL's on ~5% of values (max 5, mean 0.05 on coco),
+  so **pixels are not bit-identical to before**. the decoded pixels reach
+  torch without a copy (PIL lends its RGBX memory through arrow), which
+  also removes most of the gil-held python per image.
+- **workers are plain subprocesses** (`workers.py`), not a spawn
+  `ProcessPoolExecutor`. a spawn child re-imports the trainer's `__main__`
+  (torch and everything else) before it can decode anything; these import
+  the source code, start while the parent is still listing files, and a
+  cold stream's first window is fetched on the trainer's threads without
+  waiting for them. rows come back as raw bytes on a pipe, read straight
+  into the array with the gil released, instead of pickle. a worker exits
+  when its pipe closes, so nothing is left to join at interpreter exit
+  (the old pool could hang there after `close()` had killed its workers).
+- **exit.** `close()` is also hooked ahead of the interpreter's thread
+  join, and tells running fetches to stop at their next chunk. before, a
+  trainer that hadn't closed the loader first worked off the queued
+  prefetch at exit: 26 s for the text config on the laptop below.
+
+loader-only, one rank, 8 fetch threads or `workers: 8`, local files, on a
+14-core laptop (i9-13900H on battery, so absolute numbers are low and
+"per core" mixes P and E cores; before/after runs interleaved, 3 each,
+range shown). cores = cpu time of the process tree / wall.
+`tests/bench_dataloader.py` now reports it.
+
+| text, climbmix jsonl, 4 × 4096 | tok/s | cores | tok/s per core | first batch |
+|---|---|---|---|---|
+| threads, before | 1.13-1.22M | 12.1 | 93-104k | 2.0-2.2 s |
+| threads, after | 1.71-1.81M | 7.7 | 221-233k | 1.6-1.9 s |
+| `workers: 8`, before | 1.16-1.22M | 6.9 | 170-178k | 12.1-12.4 s |
+| `workers: 8`, after | 1.37-1.44M | 7.8 | 175-183k | 1.9-2.1 s |
+
+(`block_mb: 2` for these: at 16MB a window is 16M tokens and a 20 s run
+only sees a few arrive. at the default 16MB, one 40 s run each: threads
+1.15M → 1.84M tok/s, 85k → 238k per core, first batch 13.4 → 11.1 s;
+workers first batch 37.5 → 12.7 s.)
+
+| coco captions, 64 × 224px | img/s | cores | img/s per core | first batch |
+|---|---|---|---|---|
+| threads, before | 561-587 | 6.6 | 85-89 | 3.3-3.5 s |
+| threads, after | 749-756 | 6.2 | 121-122 | 2.6 s |
+| `workers: 8`, before | 668-674 | 8.1 | 82-83 | 17.9 s |
+| `workers: 8`, after | 911-985 | 8.0 | 113-122 | 4.6 s |
+
+resume (state saved after 20 batches, restored in a fresh process, time to
+the first batch) is the cold start again: 37.0 → 12.2 s for text with
+workers, 17.6 → 5.3 s for images with workers, unchanged on threads.
+
+what this does not show:
+
+- **no gpu run.** the end-to-end section's lesson stands: these are
+  loader-only numbers, and the vlm-on-threads regression there came from
+  the gil, which a loader-only run doesn't see. the 130-core comparison
+  and a training run are still to be repeated on this branch.
+- **text throughput per rank is now `fetch_threads` × ~220k tok/s**, not
+  "every core": about 1.8M tok/s at the default 8. on the 130-core box
+  that is less than the 2-3M the old loader reached by using all of it.
+  a 4-gpu run needs ~60k tok/s per rank; raise `fetch_threads` (the python
+  share of a block is ~5%, so expect threads to stop scaling somewhere past
+  16; not measured) or use `workers` if a run ever needs more.
+- images on threads still use only ~6 of 8 cores (presumably the gil:
+  PIL's python-side header parsing, pyarrow conversion); that is what
+  `workers` is for.
+
 ## open problems
 
 - **`workers` is opt-in.** image sources want it (the vlm config sets 8);
   a vlm config without it trains 15-30% slower. it could default on for
-  caption sources. results come back by pickle; shared memory would save
-  the parent ~7 ms of copying per 100-image block if that ever shows up.
+  caption sources (`workers: null` already means 8 for image sources and 0
+  for text in `MixtureLoader`; the config default is still 0).
 - **the 4-gpu end-to-end check is still to do** (the box was shared).
 - **resume without loader state** (`resume_dataloader: false`, e.g. after a
   mesh change) reseeds with `seed + step`: a new order, not the remainder

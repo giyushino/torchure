@@ -35,9 +35,9 @@ caption per row, not packed with other rows:
     <|vision_start|> <|image_pad|> x num_image_tokens <|vision_end|> caption eos pad...
 
 labels are ignore_index over the image span and the padding. images are
-decoded and resized here, on the fetch threads. jpegs use PIL's draft mode
-(downscale by 2/4/8 inside the decoder, before the bicubic resize): ~25%
-faster, with pixels slightly different from a full-size decode.
+decoded (PIL) and resized (torch, antialiased bicubic) here, on the fetch
+threads. jpegs use PIL's draft mode (downscale by 2/4/8 inside the decoder,
+before the resize), with pixels slightly different from a full-size decode.
 pixel_values stay uint8 (3, S, S); the model normalizes them on the gpu.
 """
 
@@ -46,7 +46,9 @@ import gzip
 import io
 import json
 import os
+import threading
 import urllib.parse
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -55,6 +57,8 @@ import numpy as np
 from torchure.dataloader.shards import Reader, TokenSource
 
 TEXT_EXTS = (".jsonl", ".jsonl.zst", ".jsonl.gz", ".parquet")
+# docs per encode_batch call
+TOKENIZE_DOCS = 256
 SPEC_KEYS = {"path", "files", "text_field", "image_field", "window_blocks"}
 
 
@@ -95,6 +99,43 @@ class RowConfig:
     pad_id: int | None = None
     ignore_index: int = -100
     vision: Vision | None = None
+
+
+# fetches that asked for a parallel tokenizer and haven't finished
+_bursting = 0
+_burst_lock = threading.Lock()
+
+
+def fetch_block(source, block, burst: bool = False) -> dict[str, np.ndarray]:
+    """
+    source.fetch(block) on a fetch thread.
+
+    the loader keeps tokenizers' own thread pool (rayon, every core) off:
+    each fetch tokenizes its block on one core, with the gil released, so
+    the parallelism is the fetch threads and a token costs the same cpu as
+    in a one-process-per-core loader. with the pool on, 8 threads each
+    fanning a block out over every core cost 2.3x the cpu per token on a
+    14-core laptop, and a 130-core box measured ~10x (notes/DATA_LOADING.md).
+
+    burst=True turns the pool on until this fetch returns: for the window a
+    cold loader (startup, resume) is waiting on, where the wall time to the
+    first batch matters and the cpu doesn't. the switch is tokenizers' env
+    var, read on every encode_batch call, so it is process-wide: other
+    fetches running meanwhile use the pool too.
+    """
+    global _bursting
+    if not burst:
+        return source.fetch(block)
+    with _burst_lock:
+        _bursting += 1
+        os.environ["TOKENIZERS_PARALLELISM"] = "true"
+    try:
+        return source.fetch(block)
+    finally:
+        with _burst_lock:
+            _bursting -= 1
+            if _bursting == 0:
+                os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def _ext(path: str) -> str | None:
@@ -216,6 +257,8 @@ class RawSource:
     rows or caption rows.
     """
     window_blocks: int | None = None
+    # set by the loader's close(): fetches still running give up
+    closed = False
 
     def __init__(self, reader: Reader, files: list[tuple[str, int]], spec: SourceSpec,
                  rows: RowConfig, block_mb: float, min_blocks: int):
@@ -272,15 +315,24 @@ class RawSource:
 
     def tokenize(self, texts: list[str]) -> np.ndarray:
         """docs -> one flat token array, each doc followed by eos."""
-        encodings = self.rows.tokenizer.encode_batch(texts)
-        lengths = np.fromiter((len(e.ids) + 1 for e in encodings), np.int64, len(encodings))
-        flat = np.empty(int(lengths.sum()), dtype=self.dtype)
-        end = 0
-        for enc, n in zip(encodings, lengths, strict=True):
-            flat[end:end + n - 1] = enc.ids
-            end += n
-            flat[end - 1] = self.eos_id
-        return flat
+        # encode_batch_fast: no offsets. tracking them is ~25% of the cpu, and
+        # with several threads tokenizing at once it more than doubles the
+        # cost of a token (notes/DATA_LOADING.md). in chunks, so a block's
+        # Encodings (far bigger than its tokens) never all exist at once, and
+        # a closed loader's fetch threads stop within a chunk
+        parts = []
+        for start in range(0, len(texts), TOKENIZE_DOCS):
+            if self.closed:
+                raise RuntimeError(f"{self.location}: the loader was closed")
+            ids = [e.ids for e in
+                   self.rows.tokenizer.encode_batch_fast(texts[start:start + TOKENIZE_DOCS])]
+            ends = np.cumsum(np.fromiter(map(len, ids), np.int64, len(ids)) + 1)
+            flat = np.empty(int(ends[-1]), dtype=self.dtype)
+            for doc, end in zip(ids, ends, strict=True):
+                flat[end - 1 - len(doc):end - 1] = doc
+            flat[ends - 1] = self.eos_id
+            parts.append(flat)
+        return np.concatenate(parts) if parts else np.empty(0, dtype=self.dtype)
 
     def pack(self, texts: list[str]) -> np.ndarray:
         flat = self.tokenize(texts)
@@ -288,7 +340,9 @@ class RawSource:
         return flat[:n * self.seq_len].reshape(n, self.seq_len)
 
     def _caption_rows(self, captions: list[str], images: list) -> dict[str, np.ndarray]:
+        import torch
         from PIL import Image
+        from torch.nn.functional import interpolate
 
         rows = self.rows
         n, L, P = len(captions), self.seq_len, len(self.prefix)
@@ -301,12 +355,44 @@ class RawSource:
             labels[i, P:len(seq)] = seq[P:]
         S = rows.vision.image_size
         pixels = np.empty((n, 3, S, S), dtype=np.uint8)
+        # _rgb's zero-copy view is read-only, which torch warns about (once)
+        warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
         for i, data in enumerate(images):
             image = Image.open(io.BytesIO(data))
             image.draft("RGB", (S, S))  # jpeg only; a no-op otherwise
-            image = image.convert("RGB").resize((S, S), Image.Resampling.BICUBIC)
-            pixels[i] = np.asarray(image).transpose(2, 0, 1)
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            # torch's antialiased bicubic on uint8 is PIL's resize (same
+            # kernel, within a few levels on ~5% of values) vectorized: 0.6 ms
+            # for what takes PIL 2.1, next to a 2.7 ms decode
+            hwc = torch.from_numpy(_rgb(image))
+            chw = interpolate(hwc.permute(2, 0, 1)[None], size=(S, S), mode="bicubic",
+                              antialias=True)[0, :3]
+            # copied by numpy: a torch copy this size starts an openmp team,
+            # one per fetch thread
+            pixels[i] = chw.numpy()
         return {"input_ids": ids, "labels": labels, "pixel_values": pixels}
+
+
+def _rgb(image) -> np.ndarray:
+    """
+    an RGB PIL image's pixels, (H, W, 3 or 4) uint8. PIL stores RGB as 4
+    bytes a pixel and can lend that memory out through arrow: no copy, and
+    none of the gil-held packing np.array(image) does (~15% of an image's
+    cost, most of what the fetch threads serialize on). the 4th channel is
+    padding. falls back to the copy when PIL can't (an old PIL, or an image
+    too big for one of its memory blocks).
+    """
+    image.load()
+    if hasattr(image, "__arrow_c_array__"):
+        import pyarrow as pa
+
+        try:
+            flat = pa.array(image)
+            return flat.values.to_numpy().reshape(image.height, image.width, flat.type.list_size)
+        except (ValueError, TypeError, NotImplementedError):
+            pass
+    return np.array(image)
 
 
 class JsonlSource(RawSource):

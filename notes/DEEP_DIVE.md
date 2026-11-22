@@ -460,7 +460,7 @@ read. `_span(block)` computes the byte range covering the row group's column
 chunks for just the fields being read.
 
 **Text rows** (`RawSource.tokenize` / `pack`): the block's docs go through
-`tokenizer.encode_batch`, each doc is followed by eos, everything is
+`tokenizer.encode_batch_fast` (one core per fetch thread), each doc is followed by eos, everything is
 concatenated and cut into `seq_len` rows. The block's tail (< `seq_len`
 tokens) is dropped, about 0.1% of a 16 MB block. Token dtype is `uint16` if
 the vocab fits, else `uint32`. Rows are **packed**: a row can hold several
@@ -476,7 +476,7 @@ one caption per row, not packed:
 `labels` are `ignore_index` over the image span and the padding. Images are
 decoded with PIL on the fetch threads (PIL releases the GIL while decoding);
 JPEGs use `draft()` to downscale by 2/4/8 inside the decoder before the
-bicubic resize. `pixel_values` stay **uint8** `(3, S, S)`; normalizing is the
+bicubic resize (torch's antialiased `interpolate` on uint8). `pixel_values` stay **uint8** `(3, S, S)`; normalizing is the
 vision tower's job, on the GPU, after a 4x smaller host-to-device copy.
 
 `RowConfig` carries what a raw source needs (`seq_len`, tokenizer, eos/pad
@@ -559,7 +559,7 @@ own for captions), and uint8 `pixel_values` for caption sources. Labels are
 **Threads vs processes.** By default (`workers: 0`) blocks are fetched,
 tokenized and decoded on `fetch_threads` threads inside the trainer process;
 `tokenizers` and PIL release the GIL for the heavy parts. With `workers: N`,
-N spawned processes each fetch whole blocks and send rows back. That is
+N subprocesses each fetch whole blocks and send rows back. That is
 worth it for images (decoding held the GIL enough to slow the training loop
 15-30%) and not for text. Workers ignore SIGTERM, since the trainer still
 needs batches until its checkpoint; `close()` kills them.

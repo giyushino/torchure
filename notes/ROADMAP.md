@@ -80,8 +80,9 @@ is the direct fix — phase 2 is a throughput lever here, not only a memory one.
 - fixed 11/10: prefetcher one-batch skip on resume. the held batch is saved
   as `prefetcher_dp{c}.pt` and handed back first on resume.
 - 11/19: the loader is threads in the trainer process by default; with
-  `data.workers: N` it uses N spawn processes, which ignore SIGTERM (as the
-  old torch workers did) and are killed by `MixtureLoader.close()` (atexit).
+  `data.workers: N` it uses N subprocesses (`dataloader/workers.py`), which
+  ignore SIGTERM (as the old torch workers did), are killed by
+  `MixtureLoader.close()` and exit by themselves if the trainer dies.
 - fixed 11/19: `resume_dataloader: false` rebuilt the loader with the same
   seed at epoch 0, so the run replayed its own data from the start. it now
   reseeds with `seed + step`: a fresh order, which can still overlap what
