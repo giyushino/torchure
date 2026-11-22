@@ -138,7 +138,8 @@ torchure/
   dataloader/    streaming sources, mixing, packing, prefetch
   checkpoint/    sharded, async, reshardable checkpoints
   loss/          cross entropy and fused linear + cross entropy
-  train/         entrypoint, trainer, overlap profiler
+  train/         entrypoint, trainer
+  profiling/     comm / compute overlap profiler
   inference/     export, perplexity, chat
 configs/         run configs
 mixes/           data mix scripts

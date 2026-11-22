@@ -280,3 +280,51 @@ accounted for.
    same duration under the same box load before attributing the gap to
    all-reduce.
 
+
+---
+
+# Round 3 (2026-11-21): written without gpus, NOT yet measured
+
+Everything here passed the cpu suite; none of it has a tps number. A/B each
+on the h100 box with `--steps 60` (it now prints `steady tps`, the mean past
+`--warmup-steps`, default 20), interleaved.
+
+## On by default
+
+- **bf16 residual stream under ddp** (`layers.to_compute_dtype`, every
+  model). nn.Embedding isn't autocast, so with fp32 weights the embedding
+  output, the residual stream, the block norms and everything saved for
+  backward ran in fp32 under ddp, and in bf16 under fsdp (bf16 gathered
+  weights). The embedding output is now cast to the autocast dtype, so both
+  train the same numerics. Expect less elementwise time and less activation
+  memory on ddp / single gpu; fsdp is unchanged. ddp loss curves will differ
+  slightly from older ddp runs.
+- **fused CE without the fp32 (chunk, V) probs buffer**
+  (`loss/fused_linear_ce.py`, dense and vocab-parallel). The softmax is
+  written straight in the activation dtype; only the target entry is
+  computed in fp32 and rounded once, as before. One (chunk, V) write and one
+  cast pass fewer per chunk; expect ~2.3 GiB less peak at chunk 4096.
+  `tests/fused_linear_ce.py` needs cuda and was not run.
+- **`doc_mask: true`** in the four `qwen3_dense_climbmix_{ddp,fsdp,hsdp,tp}_h100`
+  configs (measured 11/19: +11-12% at 0.6B, TORCHTITAN_COMPARE.md). Loss is
+  not comparable with the causal runs; `_ddp_h100_continue` keeps plain
+  causal because it resumes one.
+- `data.workers` defaults to 8 processes for image sources, 0 for text.
+
+## Opt-in (defaults unchanged)
+
+- `fsdp.reshard_after_forward: false`: units stay gathered from forward to
+  backward, one all_gather per param per microbatch instead of two, for one
+  gathered (param_dtype) copy of the model in memory. Try it at 0.6B first.
+- kimi `model.config.checkpoint_kda: true` with `activation_checkpointing:
+  false`: only the kda scans are recomputed in backward, not the mla / moe
+  sublayers. Memory is unknown: block checkpointing was what made micro 8
+  fit, so start at a small micro batch.
+
+## Not done
+
+- skipping `_foreach_mul_` in `clip_grad_norm` when nothing is clipped
+  (~1.2% of a step): it needs the norm on the host every step, and that sync
+  can cost more than it saves on a single gpu.
+- moving the alloc-conf / tf32 setup out of `trainer.py`'s import: two
+  entrypoints rely on it, and getting the order wrong costs memory or tps.

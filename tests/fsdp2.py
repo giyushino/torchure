@@ -497,6 +497,52 @@ def test_collective_counts(mesh, dim, device):
     )
 
 
+def test_no_reshard_after_forward(mesh, dim, device):
+    """
+    reshard_after_forward=False: same grads, one all_gather per param per
+    backward pass instead of two, nothing left gathered after sync, across
+    two microbatches of two steps.
+    """
+    model = build_model(seed=dist.get_rank(), device=device)
+    fsdp = FSDP(
+        model, mesh, model.blocks, shard_dim=dim, replicate_dim=None,
+        reshard_after_forward=False,
+    )
+    reference = build_model(seed=0, device=device)
+    batch = global_batch(mesh.size(dim), device)
+    loss_fn(reference, batch).backward()
+    local = batch[mesh.coordinate(dim)].unsqueeze(0)
+
+    import torchure.parallelism.fsdp2 as fsdp_mod
+
+    gathers = 0
+    real_ag = C.all_gather
+
+    def counting_ag(*a, **kw):
+        nonlocal gathers
+        gathers += 1
+        return real_ag(*a, **kw)
+
+    errors = []
+    fsdp_mod.all_gather = counting_ag
+    try:
+        for cycle in range(2):
+            for _ in range(2):
+                (loss_fn(model, local) / 2).backward()
+            fsdp.sync()
+            check_grads(errors, model, reference, mesh, dim, tag=f"cycle{cycle} ")
+            assert fsdp.unsharded_bytes_live() == 0, "units left gathered after sync"
+            for p in model.parameters():
+                p.grad = None
+    finally:
+        fsdp_mod.all_gather = real_ag
+    assert gathers == 4 * len(fsdp._states), (
+        f"{gathers} all_gathers over 4 backwards, expected {4 * len(fsdp._states)} "
+        "(one per param per backward)"
+    )
+    finish(errors)
+
+
 def test_prefetch_order(mesh, dim, device):
     """recorded unit order must be module execution order, once."""
     model = build_model(seed=0, device=device)
@@ -581,6 +627,7 @@ TESTS = [
     ("test_hsdp", test_hsdp),
     ("test_storage_actually_freed", test_storage_actually_freed),
     ("test_collective_counts", test_collective_counts),
+    ("test_no_reshard_after_forward", test_no_reshard_after_forward),
     ("test_prefetch_order", test_prefetch_order),
     ("test_noop_at_size_one", test_noop_at_size_one),
     ("test_tied_embedding", test_tied_embedding),

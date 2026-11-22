@@ -149,6 +149,16 @@ def test_kimi():
     plan = model.tp_plan(2)
     assert plan["regions"] == [] and plan["vocab"] == [model.token_emb, model.lm_head]
 
+    # checkpoint_kda recomputes only the scans in backward: same loss and grads
+    ids = torch.randint(0, KIMI_CFG["vocab_size"], (2, SEQ))
+    grads = {}
+    for flag in (False, True):
+        m = build(KimiK31, KIMI_CFG | {"checkpoint_kda": flag})
+        m(ids).float().square().mean().backward()
+        grads[flag] = {n: p.grad for n, p in m.named_parameters()}
+    for n, g in grads[False].items():
+        assert torch.allclose(g, grads[True][n], rtol=1e-4, atol=1e-7), f"checkpoint_kda: {n}"
+
     # attn-res off must also work (plain pre-norm residual path)
     plain = build(KimiK31, {**KIMI_CFG, "attn_res": False}, seed=1)
     assert torch.isfinite(plain(torch.randint(0, 128, (1, SEQ)))).all()

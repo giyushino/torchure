@@ -180,9 +180,8 @@ interleaved old/new.
 
 ## open problems
 
-- **`workers` is opt-in.** image sources want it (the vlm config sets 8);
-  a vlm config without it trains 15-30% slower. it could default on for
-  caption sources. results come back by pickle; shared memory would save
+- **`workers`** now defaults to 8 processes for image sources and 0 for
+  text (`data.workers: null`); a number overrides it. results come back by pickle; shared memory would save
   the parent ~7 ms of copying per 100-image block if that ever shows up.
 - **the 4-gpu end-to-end check is still to do** (the box was shared).
 - **resume without loader state** (`resume_dataloader: false`, e.g. after a
@@ -200,5 +199,5 @@ interleaved old/new.
   tokens (whole-file sources default to 1 per window).
 - **no per-source eval split**; `eval_ppl.py` still reshuffles the
   training data (seed + 1).
-- `packers.py` (stream / best-fit packers) is no longer on the training
-  path; it stays for `tests/dataloader_packing.py`'s comparisons.
+- `packers.py` (stream / best-fit packers) and `tests/dataloader_packing.py`
+  were removed: nothing on the training path used them.

@@ -47,8 +47,6 @@ jobs:
           uv pip install --torch-backend=cpu -e '.[vision]'
       - name: collective ops (gloo, 4 ranks)
         run: uv run --no-sync tests/collective.py --world-size 4
-      - name: packing correctness
-        run: uv run --no-sync tests/dataloader_packing.py --check
       - name: mixture loader (schedule, rank split, resume, http range reads)
         run: uv run --no-sync tests/mixture_loader.py
       - name: "raw sources: jsonl byte ranges, zst/gz, parquet, captions, resume, http"

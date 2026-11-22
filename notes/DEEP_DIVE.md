@@ -587,10 +587,9 @@ exactly once.
 ### 5.7 Leftovers
 
 `dataloader/packers.py` (`ListPacker`, `NumpyPacker`, `TensorPacker`,
-`ListPackerBestFit`) is from the older HF `.map` pipeline. The loader does
-not use it; only `tests/dataloader_packing.py` does. The best-fit packer
-(segment tree over free space, best-fit-decreasing) is a reference
-implementation: it saved only ~0.04% of tokens on ClimbMix.
+`ListPackerBestFit`) was from the older HF `.map` pipeline. The loader did
+not use it, so it and `tests/dataloader_packing.py` have been removed. The
+best-fit packer saved only ~0.04% of tokens on ClimbMix.
 
 ---
 
@@ -1823,7 +1822,6 @@ with the gloo backend and several ranks spawned locally.
 | `checkpointer.py`, `sharded_checkpoint.py` | roundtrip; resharding between grids |
 | `mixture_loader.py` | schedule, rank split, resume, HTTP range reads |
 | `data_sources.py` | JSONL byte ranges, zst/gz, parquet, captions, resume, HTTP |
-| `dataloader_packing.py` | the legacy packers |
 | `doc_mask.py` | a packed row equals each doc alone (Qwen3 + OLMo 3 windows) |
 | `models.py` | model contracts (OLMo 3, Kimi), incl. `_kda_scan` vs `_kda_reference` |
 | `fused_linear_ce.py` | fused loss vs `F.cross_entropy`; **needs CUDA**, not in CI |
@@ -1842,9 +1840,6 @@ affect correctness as far as I can tell.
 
 - `torchure/dataloader/mixing.py` is an empty, untracked file. `scripts/gmn.py`
   (a node-provisioning client) is also untracked.
-- `dataloader/packers.py` is unused by the loader; only
-  `tests/dataloader_packing.py` imports it. The README's layout line still
-  lists "packing" under `dataloader/`.
 - README's layout says `train/` holds the overlap profiler; it moved to
   `profiling/` in `b4d2a62`.
 - `notes/KIMI_MOE_H100.md` says `_kda_chunk` is compiled and
