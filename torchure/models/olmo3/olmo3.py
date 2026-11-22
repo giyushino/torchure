@@ -31,6 +31,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from torchure.models.layers import (
+    LanguageModel,
     RotaryEmbedding,
     SwiGLU,
     apply_rotary,
@@ -38,6 +39,7 @@ from torchure.models.layers import (
     masked_attention,
     positions,
     swiglu_ffn_dim,
+    to_compute_dtype,
 )
 
 
@@ -214,7 +216,9 @@ def _layer_types(num_layers: int, sliding_window: int | None) -> list[bool]:
     return [(i + 1) % 4 != 0 for i in range(num_layers)]
 
 
-class Olmo3(nn.Module):
+class Olmo3(LanguageModel):
+    supports_doc_mask = True
+
     def __init__(
         self,
         num_layers: int = 32,
@@ -249,9 +253,6 @@ class Olmo3(nn.Module):
         self.norm = nn.RMSNorm(emb_dim, eps=norm_eps)
         # olmo 3 does not tie embeddings
         self.lm_head = nn.Linear(emb_dim, vocab_size, bias=False)
-        self.activation_checkpointing = False
-        # eos id: attend within documents only (layers.doc_mask); None = plain causal
-        self.doc_mask_eos: int | None = None
 
     def init_weights(self, std: float = 0.02) -> None:
         """same contract as qwen3: every param/buffer set, elementwise."""
@@ -318,7 +319,7 @@ class Olmo3(nn.Module):
         else:
             position_ids, attention_mask, cacheable = positions(x, attention_mask)
 
-        x = self.token_emb(x)
+        x = to_compute_dtype(self.token_emb(x))
         cos, sin = self.rope(position_ids, cacheable=cacheable)
         hidden_states: list[torch.Tensor] = [x] if return_hidden_states else []
 

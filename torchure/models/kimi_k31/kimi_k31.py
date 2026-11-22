@@ -51,7 +51,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from torchure.models.layers import RotaryEmbedding, apply_rotary, positions
+from torchure.models.layers import (
+    LanguageModel,
+    RotaryEmbedding,
+    apply_rotary,
+    positions,
+    to_compute_dtype,
+)
 from torchure.models.moe import ExpertBank, GroupedLinear, balance_stats, sort_by_expert
 
 
@@ -217,6 +223,15 @@ def _kda_scan(
     return out.transpose(1, 2)
 
 
+@torch.compiler.disable
+def _kda_scan_checkpointed(*args: torch.Tensor) -> torch.Tensor:
+    """
+    _kda_scan with its intermediates recomputed in backward instead of
+    stored. the scan has no params, so this is a plain function checkpoint.
+    """
+    return checkpoint(_kda_scan, *args, use_reentrant=False)
+
+
 class KimiDeltaAttention(nn.Module):
     def __init__(
         self,
@@ -231,6 +246,8 @@ class KimiDeltaAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.gate_lower_bound = gate_lower_bound
+        # set by KimiK31 (`checkpoint_kda`)
+        self.checkpoint_scan = False
         width = num_heads * head_dim
 
         self.q_proj = nn.Linear(emb_dim, width, bias=False)
@@ -286,7 +303,9 @@ class KimiDeltaAttention(nn.Module):
         log_alpha = log_alpha.clamp_min(self.gate_lower_bound)
         beta = torch.sigmoid(self.beta_proj(x))
 
-        out = _kda_scan(q, k, v, log_alpha, beta).to(x.dtype)  # (B, S, H, D)
+        checkpointed = self.checkpoint_scan and torch.is_grad_enabled()
+        scan = _kda_scan_checkpointed if checkpointed else _kda_scan
+        out = scan(q, k, v, log_alpha, beta).to(x.dtype)  # (B, S, H, D)
         out = self.out_norm(out.reshape(B, S, H, D))
         out = out * torch.sigmoid(self.out_gate_proj(x).reshape(B, S, H, D))
         return self.o_proj(out.reshape(B, S, H * D))
@@ -512,7 +531,7 @@ def _is_mla_layer(idx: int, num_layers: int) -> bool:
     return (idx + 1) % 4 == 0 or idx == num_layers - 1
 
 
-class KimiK31(nn.Module):
+class KimiK31(LanguageModel):
     def __init__(
         self,
         num_layers: int = 28,
@@ -541,9 +560,14 @@ class KimiK31(nn.Module):
         attn_res_block_size: int = 6,
         dsa_topk: int | None = None,
         router_bias_rate: float = 1e-3,
+        # checkpoint only the kda scans (most of the activation memory)
+        # instead of whole blocks, so backward doesn't re-run mla and the
+        # moe. use it with activation_checkpointing off; not measured on gpu
+        checkpoint_kda: bool = False,
     ):
         super().__init__()
         self.emb_dim = emb_dim
+        self.checkpoint_kda = checkpoint_kda
         # how far balance_step moves a router bias per optimizer step
         self.router_bias_rate = router_bias_rate
         self.use_attn_res = attn_res
@@ -572,12 +596,14 @@ class KimiK31(nn.Module):
                 )
             blocks.append(KimiK31Block(emb_dim, attn, ffn, attn_res, norm_eps))
         self.blocks = nn.ModuleList(blocks)
+        for block in blocks:
+            if isinstance(block.attn, KimiDeltaAttention):
+                block.attn.checkpoint_scan = checkpoint_kda
         self.norm = nn.RMSNorm(emb_dim, eps=norm_eps)
         self.attn_res_norm = nn.RMSNorm(emb_dim, eps=norm_eps)
         self.attn_res_q_final = nn.Parameter(torch.zeros(emb_dim))
         # kimi does not tie embeddings
         self.lm_head = nn.Linear(emb_dim, vocab_size, bias=False)
-        self.activation_checkpointing = False
 
     def init_weights(self, std: float = 0.02) -> None:
         """same contract as qwen3: every param/buffer set, elementwise."""
@@ -679,10 +705,14 @@ class KimiK31(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         position_ids, attention_mask, cacheable = positions(x, attention_mask)
 
-        emb = self.token_emb(x)
+        emb = to_compute_dtype(self.token_emb(x))
         cos, sin = self.rope(position_ids, cacheable=cacheable)
         hidden_states: list[torch.Tensor] = [emb] if return_hidden_states else []
         use_checkpoint = self.activation_checkpointing and torch.is_grad_enabled()
+        assert not (use_checkpoint and self.checkpoint_kda), (
+            "checkpoint_kda with activation_checkpointing would run every kda "
+            "scan twice in backward; turn activation_checkpointing off"
+        )
 
         if not self.use_attn_res:
             h = emb

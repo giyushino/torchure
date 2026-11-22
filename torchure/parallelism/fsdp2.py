@@ -127,6 +127,11 @@ class FSDP:
     param_dtype       dtype params are gathered and computed in; None = no cast.
     reduce_dtype      dtype grads are reduced in; None = the grad's own.
     prefetch          how many units ahead to start gathering.
+    reshard_after_forward
+                      False keeps every unit gathered from its forward to its
+                      backward: one all_gather per param per microbatch
+                      instead of two, for one gathered copy of the model in
+                      memory.
 
     a `model` on the meta device is materialized sharded on `device`, with
     uninitialized values: run the model's init next, then finish_init(). the
@@ -146,6 +151,7 @@ class FSDP:
         prefetch: int = 1,
         device: torch.device | None = None,
         replicate_dim_of: Callable[[nn.Parameter], str | None] | None = None,
+        reshard_after_forward: bool = True,
     ):
         self.model = model
         self._replicate_dim_of_param = replicate_dim_of
@@ -155,6 +161,7 @@ class FSDP:
         self.param_dtype = param_dtype
         self.reduce_dtype = reduce_dtype
         self.prefetch = prefetch
+        self.reshard_after_forward = reshard_after_forward
         self.group_size = mesh.size(shard_dim)
         self.replicate_size = mesh.size(replicate_dim) if replicate_dim is not None else 1
 
@@ -431,8 +438,9 @@ class FSDP:
     def _make_forward_post(self, unit: _Unit):
         @torch.compiler.disable
         def hook(module, args, output):
-            if unit.in_backward:
-                # the backward that triggered this re-run still needs the weights
+            if unit.in_backward or not self.reshard_after_forward:
+                # the backward that triggered this re-run still needs the
+                # weights; so does the coming one when they are kept gathered
                 return
             self._reshard(unit)
 

@@ -11,6 +11,7 @@ from torch.utils.checkpoint import checkpoint
 
 from torchure.models.layers import (
     BlockMask,
+    LanguageModel,
     RotaryEmbedding,
     SwiGLU,
     apply_rotary,
@@ -18,6 +19,7 @@ from torchure.models.layers import (
     masked_attention,
     positions,
     swiglu_ffn_dim,
+    to_compute_dtype,
 )
 
 
@@ -146,7 +148,9 @@ class Qwen3TransformerBlock(nn.Module):
         return x
 
 
-class Qwen3(nn.Module):
+class Qwen3(LanguageModel):
+    supports_doc_mask = True
+
     def __init__(
         self,
         num_layers: int,
@@ -178,11 +182,6 @@ class Qwen3(nn.Module):
         self.norm = nn.RMSNorm(emb_dim, eps=norm_eps)
         self.lm_head = nn.Linear(emb_dim, vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight
-        # recompute each block's activations in backward instead of storing
-        # them: trades roughly one extra forward for most activation memory
-        self.activation_checkpointing = False
-        # eos id: attend within documents only (layers.doc_mask); None = plain causal
-        self.doc_mask_eos: int | None = None
 
     def init_weights(self, std: float = 0.02) -> None:
         """
@@ -274,7 +273,7 @@ class Qwen3(nn.Module):
         else:
             position_ids, attention_mask, cacheable = positions(x, attention_mask)
 
-        x = self.token_emb(x) if inputs_embeds is None else inputs_embeds
+        x = to_compute_dtype(self.token_emb(x) if inputs_embeds is None else inputs_embeds)
         cos, sin = self.rope(position_ids, cacheable=cacheable)
         hidden_states: list[torch.Tensor] = [x] if return_hidden_states else []
 
