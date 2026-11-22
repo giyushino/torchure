@@ -17,6 +17,63 @@ from torch.nn.attention.flex_attention import (
 )
 
 
+class LanguageModel(nn.Module):
+    """
+    what the trainer, the parallelism engines and the objectives need from a
+    model, in one place. a model also provides:
+
+        blocks          nn.ModuleList: the units fsdp gathers and compile traces
+        norm            the final norm
+        lm_head         nn.Linear; the fused loss reads lm_head.weight directly
+        init_weights()  sets ALL state (buffers too) elementwise, so it also
+                        fills a model built on the meta device or sharded
+        tp_plan()       which modules tensor parallel splits and how
+        forward(ids, ..., return_final_hidden=True) -> the final norm's output
+
+    the attributes below are optional features, off unless a model turns
+    them on.
+    """
+
+    # recompute each block's activations in backward instead of storing them:
+    # trades roughly one extra forward for most activation memory
+    activation_checkpointing: bool = False
+    # document masking (doc_mask below): a model that supports it sets
+    # supports_doc_mask, and the trainer sets doc_mask_eos to the eos id
+    supports_doc_mask: bool = False
+    doc_mask_eos: int | None = None
+    # a vlm's image spec, read by the dataloader for caption sources
+    image_size: int | None = None
+    num_image_tokens: int | None = None
+
+    def init_weights(self) -> None:
+        raise NotImplementedError
+
+    def tp_plan(self, tp_size: int, vocab_parallel: bool = True) -> dict[str, list[nn.Module]]:
+        raise NotImplementedError(f"{type(self).__name__} doesn't support tensor parallel")
+
+    def ep_plan(self) -> list[nn.Module]:
+        """the expert banks expert parallel shards; none for a dense model."""
+        return []
+
+    def balance_step(self, reduce=None) -> dict[str, torch.Tensor]:
+        """moe load balancing, once per optimizer step; a dense model has none."""
+        return {}
+
+
+def to_compute_dtype(x: torch.Tensor) -> torch.Tensor:
+    """
+    `x` in the autocast dtype when autocast is on, else unchanged. for the
+    embedding output: nn.Embedding isn't autocast, so with fp32 weights (ddp)
+    the whole residual stream, the norms on it and everything saved for
+    backward would run in fp32, while under fsdp (bf16 gathered weights) it
+    is bf16. casting here makes both train the same numerics.
+    """
+    device = x.device.type
+    if torch.is_autocast_enabled(device):
+        return x.to(torch.get_autocast_dtype(device))
+    return x
+
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     """[a, b, c, d, e, f, g, h] -> [-e, -f, -g, -h, a, b, c, d]"""
     x1, x2 = x.chunk(2, dim=-1)
