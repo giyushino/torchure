@@ -40,12 +40,13 @@ per step:
 state is a handful of integers per source plus the credits, so resume is
 O(1): it refetches the current window and nothing else.
 
-no torch DataLoader. by default (`workers: 0`) blocks are fetched, tokenized
+no torch DataLoader. for text (`workers: 0`) blocks are fetched, tokenized
 and decoded on `fetch_threads` threads in the trainer's process, and the
 trainer's thread only gathers rows into a batch. with `workers: N`, N
 processes do that work instead. that pays off for images, whose decoding
 holds the gil long enough to slow the training loop (notes/DATA_LOADING.md);
-text tokenizing doesn't. either way a block is fetched once, by one rank.
+text tokenizing doesn't. so the config default (`workers: null`) is 0 for
+text sources and IMAGE_WORKERS for image sources. either way a block is fetched once, by one rank.
 """
 
 import importlib.util
@@ -62,6 +63,10 @@ import numpy as np
 import torch
 
 from torchure.dataloader.sources import RowConfig, Vision, open_source
+
+
+# worker processes for image sources when `data.workers` is left unset
+IMAGE_WORKERS = 8
 
 
 def load_mix(path: str):
@@ -332,10 +337,15 @@ class MixtureLoader:
         assert len(keys) == 1, f"sources yield different rows {keys}: can't mix text and images"
         self.keys = keys.pop()
         self.workers = None
-        if data_cfg.get("workers", 0) > 0:
+        workers = data_cfg.get("workers", 0)
+        if workers is None:
+            # the config default: processes for image sources, whose decoding
+            # on threads slows the training loop 15-30% (notes/DATA_LOADING.md)
+            workers = IMAGE_WORKERS if "pixel_values" in self.keys else 0
+        if workers > 0:
             # spawn, not fork: the parent has threads (fetch pool, tokenizers)
             self.workers = ProcessPoolExecutor(
-                data_cfg["workers"], mp_context=multiprocessing.get_context("spawn"),
+                workers, mp_context=multiprocessing.get_context("spawn"),
                 initializer=_worker_init, initargs=(self.sources,),
             )
 
