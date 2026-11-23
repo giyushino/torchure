@@ -147,7 +147,7 @@ def all_gather(
     else:
         _check_output(output_tensor, tensor, expected_shape, gather_dim)
 
-    work = dist.all_gather_into_tensor(
+    work = dist.all_gather_single(
         output_tensor=output_tensor, input_tensor=input_tensor, group=group, async_op=async_op
     )
     out = output_tensor.movedim(0, gather_dim)
@@ -195,7 +195,7 @@ def reduce_scatter(
     else:
         _check_output(output_tensor, tensor, expected_shape, scatter_dim)
 
-    work = dist.reduce_scatter_tensor(
+    work = dist.reduce_scatter_single(
         output=output_tensor, input=input_tensor, op=_OPS[op], group=group, async_op=async_op
     )
     out = output_tensor.movedim(0, scatter_dim)
