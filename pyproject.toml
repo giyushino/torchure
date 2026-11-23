@@ -10,7 +10,7 @@ requires-python = "==3.14.*"
 keywords = ["pytorch", "training"]
 
 dependencies = [
-    "torch==2.10",
+    "torch==2.14.1",
     "numpy==2.4.6",
     "tokenizers",
     # parquet sources (dataloader/sources.py)
@@ -18,17 +18,18 @@ dependencies = [
 ]
 
 
-# torch comes from pytorch's cuda 13.0 index, not pypi's default cuda 12.8
-# build: same torch, newer cublas/cudnn, +22% tok/s on h100 (0.6B ddp,
-# 195k -> 239k; notes/TORCHTITAN_COMPARE.md). needs nvidia driver >= 580.
+# torch comes from pytorch's cuda 13.2 index, not pypi's default build:
+# cuda 13's cublas/cudnn are +22% tok/s on h100 over cuda 12 (0.6B ddp,
+# 195k -> 238k; notes/TORCHTITAN_COMPARE.md), and b300s need cuda >= 13.1.
+# needs nvidia driver >= 580.
 # for an older driver, delete [tool.uv.sources] below and `uv lock`.
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
+torch = { index = "pytorch-cu132" }
 
 [project.optional-dependencies]
 wandb = ["wandb>=0.16"]

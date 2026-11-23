@@ -37,6 +37,8 @@ try:
 except ImportError:
     wandb = None
 
+# i think we can remove this soon, forgot what version
+# of pytorch this is no longer needed for
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # tf32 for the fp32 matmuls bf16 autocast leaves alone (rope, some reductions)
@@ -44,8 +46,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
-# config dtype names (fsdp param / reduce dtype, ddp reduce dtype).
-# None: no cast
+# config dtype names (fsdp param / reduce dtype, ddp reduce dtype)
 _DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
@@ -238,6 +239,7 @@ class Trainer:
         replicates it (bad for heterogeneous).
         """
         model_cfg = self.config["model"]
+        # plain ddp
         if self.parallelism != "fsdp" and self.tp_size == 1 and self.ep_size == 1:
             model = build_model(model_cfg["name"], model_cfg["config"])
             model.to(self.device)
