@@ -38,10 +38,11 @@ git clone <this repo> && cd torchure
 uv sync                      # or: uv sync --extra wandb
 ```
 
-> **Driver note:** torch is installed from PyTorch's CUDA 13.0 index, which
+> **Driver note:** torch is installed from PyTorch's CUDA 13.2 index, which
 > needs NVIDIA driver ≥ 580. On an older driver, delete the
-> `[tool.uv.sources]` block in `pyproject.toml` and run `uv lock` to get the
-> default CUDA 12.8 build. It works the same, just about 20% slower on H100.
+> `[tool.uv.sources]` block in `pyproject.toml` and run `uv lock` to get
+> PyPI's default build. A CUDA 12 build works the same, just about 20%
+> slower on H100.
 
 Train a 0.6B Qwen3 on one GPU. Data streams from the Hub, so there's
 nothing to download first:
@@ -118,6 +119,21 @@ plain causal attention:
 |---|---|---|---|
 | Qwen3 0.6B | 528k | 1.06M | 41.9% |
 | Qwen3 4B | 119k | 217k | 43.0% |
+
+**8× B300** (one node, Modal), Qwen3 4B with document masking, 40-step
+runs with tok/s averaged over steps 21–40:
+
+| layout | micro batch | tok/s | peak mem / GPU | MFU |
+|---|---|---|---|---|
+| FSDP | 8 | 245k | 141 GiB | 42.8% |
+| FSDP | 12 | 250k | 206 GiB | 43.6% |
+| DDP | 8 | 238k | 188 GiB | 41.5% |
+
+That is about 31k tok/s per GPU, 2.3× an H100 NVL on the same model
+(54.1k on 4 GPUs with document masking). MFU is against 2,250 TFLOP/s dense
+bf16 and counts full causal attention, which document masking partly skips,
+so it reads a little high. Run with `scripts/modal_launch.py` and
+`scripts/sweeps/b300.json`.
 
 **Document masking** (`"doc_mask": true`) stops tokens from attending across
 packed documents. On short-document data it's also faster: 0.6B FSDP goes
